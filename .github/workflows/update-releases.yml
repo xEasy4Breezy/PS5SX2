@@ -1,0 +1,88 @@
+name: Update Swordpdf/PS5SX2 Releases
+
+on:
+  workflow_dispatch: # Manual trigger only
+
+permissions:
+  contents: write
+
+jobs:
+  sync-releases:
+    runs-on: ubuntu-latest
+
+    env:
+      UPSTREAM_REPO: 'Swordpdf/PS5SX2'
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+      - name: Checkout Fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Sync Git Tags
+        run: |
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git" || true
+          git fetch upstream --tags --force
+
+          # Push tags one by one; skip any that GitHub blocks due to workflow file changes
+          for tag in $(git tag -l); do
+            git push origin "refs/tags/$tag:refs/tags/$tag" --force 2>/dev/null || echo "Skipped pushing tag ref for $tag (contains workflow changes or already up to date)"
+          done
+
+      - name: Mirror Releases & Assets
+        run: |
+          set -euo pipefail
+
+          echo "Target repo: $GITHUB_REPOSITORY"
+          echo "Upstream repo: $UPSTREAM_REPO"
+
+          # 1. Fetch tags from upstream releases
+          UPSTREAM_TAGS=$(gh release list -R "$UPSTREAM_REPO" --limit 500 --json tagName -q '.[].tagName')
+
+          # 2. Iterate and copy ONLY releases missing from your fork
+          for tag in $UPSTREAM_TAGS; do
+            # Skip if the release is already published in your fork
+            if gh release view "$tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              echo "[-] Skipping: Release '$tag' already exists in $GITHUB_REPOSITORY."
+              continue
+            fi
+
+            echo "[+] Syncing missing release: $tag"
+            TMP_DIR="release_assets_${tag}"
+            mkdir -p "$TMP_DIR"
+
+            # Download release binaries (ignore failures if only source archives exist)
+            gh release download "$tag" -R "$UPSTREAM_REPO" -D "$TMP_DIR" || echo "No downloadable binary assets found."
+
+            # Fetch release metadata from upstream
+            TITLE=$(gh release view "$tag" -R "$UPSTREAM_REPO" --json name -q '.name')
+            IS_PRERELEASE=$(gh release view "$tag" -R "$UPSTREAM_REPO" --json isPrerelease -q '.isPrerelease')
+            gh release view "$tag" -R "$UPSTREAM_REPO" --json body -q '.body' > "$TMP_DIR/notes.md"
+
+            FLAGS=()
+            if [ "$IS_PRERELEASE" = "true" ]; then
+              FLAGS+=(--prerelease)
+            fi
+
+            # Collect downloaded assets cleanly
+            shopt -s nullglob
+            ASSETS=()
+            for file in "$TMP_DIR"/*; do
+              if [ -f "$file" ] && [ "$(basename "$file")" != "notes.md" ]; then
+                ASSETS+=("$file")
+              fi
+            done
+            shopt -u nullglob
+
+            # Publish the release
+            gh release create "$tag" \
+              -R "$GITHUB_REPOSITORY" \
+              --title "${TITLE:-$tag}" \
+              --notes-file "$TMP_DIR/notes.md" \
+              "${FLAGS[@]}" \
+              "${ASSETS[@]}"
+
+            rm -rf "$TMP_DIR"
+            echo "Successfully mirrored $tag"
+          done
