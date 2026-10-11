@@ -1,4 +1,5 @@
 #include <unistd.h>
+#include <atomic> // vk-285-134: the invalid-unpack warning, once a type
 // SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
 // SPDX-License-Identifier: GPL-3.0+
 
@@ -525,7 +526,18 @@ __ri void _nVifUnpackLoop(const u8* data)
 			// Orbis: SSE unpackers (nVifUpk) now work: the emitter's far
 			// address paths use movabs for the >4GB direct-mapped memory.
 			uint cl3 = std::min(vif.cl, 3);
-			fnbase[cl3](dest, data);
+			// vk-285-134 (AI-assisted): an invalid unpack type (nVifT 0: 3, 7, 11, 15) has no SSE unpacker: nVifGen leaves its
+			// entry NULL, and upstream only gets there through the VIF dynarec, which emits nothing for it ("Vpu/Vif: Invalid
+			// Unpack"). The PS5 runs this loop instead (newVifDynaRec 0), and the NULL call took Splashdown down (build 130's
+			// logs: 4 crashes on the MTVU thread). Nothing is written, as with the dynarec. Needs proper testing.
+			if (const nVifCall fn = fnbase[cl3])
+				fn(dest, data);
+			else
+			{
+				static std::atomic<u32> s_warned{0};
+				if (!(s_warned.fetch_or(1u << (upkNum & 0x0f)) & (1u << (upkNum & 0x0f))))
+					Console.Warning("Vpu/Vif: Invalid Unpack %d on VIF%d: nothing written (as the VIF dynarec does)", upkNum, idx);
+			}
 		}
 
 		vif.tag.addr += 16;

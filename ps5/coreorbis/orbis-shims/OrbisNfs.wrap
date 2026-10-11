@@ -1,0 +1,36 @@
+# PS5 port (vk-285-135, AI-assisted): the C library's calls OrbisNfs.cpp stands in front of, for games on NFS shares
+# (link-vk.sh passes ld.lld --wrap=<name> for each line; ps5/coreorbis/tests/nfs/test-nfs.sh too). OrbisNfs.cpp answers
+# /nfs/ paths and its own FILEs and descriptors, and passes everything else to the real call.
+fopen
+freopen
+fclose
+fread
+fwrite
+fseek
+fseeko
+ftell
+ftello
+rewind
+feof
+ferror
+fileno
+fflush
+fgetc
+fgets
+fputc
+fputs
+fprintf
+vfprintf
+setvbuf
+flockfile
+funlockfile
+open
+close
+read
+pread
+lseek
+fstat
+stat
+lstat
+access
+realpath

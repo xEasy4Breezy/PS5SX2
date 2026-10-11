@@ -12,7 +12,7 @@
 //     itself stays in the middle).
 //   PS5SX2/SaveButton1, SaveButton2, LoadButton1, LoadButton2 = the two buttons held together to save or load the state
 //     (slot 1): L3R3 (both stick clicks) Cross Circle Square Triangle L1 R1 L2 R2 L3 R3 Options Touchpad (its click)
-//     TouchLeft TouchRight (a finger on the touchpad's left or right third) Up Down Left Right, or None. Unset: L3R3 + Up
+//     TouchLeft TouchRight (a finger on the touchpad's left or right third; the combos keep the touch) Up Down Left Right, or None. Unset: L3R3 + Up
 //     saves, L3R3 + Down loads. PS5SX2/StateHold = how long (seconds, 0 to 10) they're held first; 0, the default: at once.
 // PS5SX2's own button combos (save states, the menu, the settings page) read the controller's real buttons before this.
 #pragma once
@@ -66,6 +66,8 @@ enum Source : uint8_t
 	S_R3,
 	S_OPTIONS,
 	S_TOUCHPAD,
+	S_TOUCHLEFT,  // the touchpad clicked on its left half (2.02: a click, not a touch)
+	S_TOUCHRIGHT, // the touchpad clicked on its right half
 	S_UP,
 	S_DOWN,
 	S_LEFT,
@@ -84,7 +86,7 @@ struct SourceInfo
 // ScePad's bits, as orbis_pad_apply always read them. The touchpad's click is 0x00100000; 0x40000000 is the keyboard's
 // Select (Backspace, orbis-shims/ProsperoKbdMap.h PAD_SELECT). vk-285-122 (AI-assisted): ScePad's 0x1, the DualSense's
 // Create button (the old Share, left of the touchpad), presses nothing -- it pressed Select with the touchpad's click
-// until now (Spyros: "unbind select from the share button").
+// until now (swordpdf: "unbind select from the share button").
 inline const SourceInfo& SourceAt(int s)
 {
 	static const SourceInfo k[S_COUNT] = {
@@ -100,6 +102,8 @@ inline const SourceInfo& SourceAt(int s)
 		{"ButtonR3", "R3", 0x00000004u, T_R3},
 		{"ButtonOptions", "Options", 0x00000008u, T_START},
 		{"ButtonTouchpad", "the touchpad's click", 0x40100000u, T_SELECT},
+		{"ButtonTouchLeft", "the touchpad's left side", 0u, T_NONE},
+		{"ButtonTouchRight", "the touchpad's right side", 0u, T_NONE},
 		{"ButtonUp", "D-pad up", 0x00000010u, T_UP},
 		{"ButtonDown", "D-pad down", 0x00000040u, T_DOWN},
 		{"ButtonLeft", "D-pad left", 0x00000080u, T_LEFT},
@@ -258,6 +262,10 @@ struct Config
 	// vk-285-118: the fast forward combo (PS5SX2/FastButton1/2, experimental, to skip videos): it turns fast forward on and
 	// off, after the same hold time. Nothing on both (the default): no combo.
 	ComboButton fast[2] = {CB_NONE, CB_NONE};
+	// vk-285-139: the change disc combo (PS5SX2/DiscButton1/2): the next disc of the game's set ("(Disc 2)" beside it).
+	ComboButton disc[2] = {CB_L3R3, CB_RIGHT};
+	// the open-settings-page combo (PS5SX2/WebButton1/2): opens this game's settings page in the PS5's browser (2 s hold, fixed).
+	ComboButton web[2] = {CB_L2, CB_DOWN};
 
 	Config()
 	{
@@ -276,7 +284,8 @@ struct Config
 		return swap_sticks == o.swap_sticks && left_dpad == o.left_dpad && deadzone_left == o.deadzone_left &&
 		       deadzone_right == o.deadzone_right && invert_left == o.invert_left && invert_right == o.invert_right &&
 		       save[0] == o.save[0] && save[1] == o.save[1] && load[0] == o.load[0] && load[1] == o.load[1] && hold_ms == o.hold_ms &&
-		       fast[0] == o.fast[0] && fast[1] == o.fast[1];
+		       fast[0] == o.fast[0] && fast[1] == o.fast[1] && disc[0] == o.disc[0] && disc[1] == o.disc[1] &&
+		       web[0] == o.web[0] && web[1] == o.web[1];
 	}
 	bool operator!=(const Config& o) const { return !(*this == o); }
 	bool IsDefault() const { return *this == Config(); }
@@ -345,9 +354,11 @@ inline Config FromSettings(Get get)
 	if (get("InvertRight", v))
 		c.invert_right = SmallInt(v, 3);
 	// vk-285-117: the save and load combos; a value that isn't a button leaves that one at its default.
-	static const char* const combo_keys[6] = {"SaveButton1", "SaveButton2", "LoadButton1", "LoadButton2", "FastButton1", "FastButton2"};
-	ComboButton* const combo[6] = {&c.save[0], &c.save[1], &c.load[0], &c.load[1], &c.fast[0], &c.fast[1]};
-	for (int i = 0; i < 6; i++)
+	static const char* const combo_keys[10] = {"SaveButton1", "SaveButton2", "LoadButton1", "LoadButton2", "FastButton1", "FastButton2",
+		"DiscButton1", "DiscButton2", "WebButton1", "WebButton2"};
+	ComboButton* const combo[10] = {&c.save[0], &c.save[1], &c.load[0], &c.load[1], &c.fast[0], &c.fast[1], &c.disc[0], &c.disc[1],
+		&c.web[0], &c.web[1]};
+	for (int i = 0; i < 10; i++)
 	{
 		v.clear();
 		ComboButton b;
@@ -486,6 +497,8 @@ struct State
 	uint32_t buttons = 0;
 	uint8_t l2 = 0, r2 = 0;
 	uint8_t lx = 128, ly = 128, rx = 128, ry = 128;
+	int touch = 0; // 0 no finger or middle third, 1 left third, 2 right third (the combos' touch zones)
+	int half = 0;  // 2.02: the finger's half for a click: 0 no finger, 1 left, 2 right
 };
 
 // What the PS2 controller gets: each input's value (0 released .. 1 fully pressed; the face buttons, the D-pad and the
@@ -543,6 +556,16 @@ inline Out Apply(const Config& c, const State& s)
 			const bool to_trigger = t == T_L2 || t == T_R2;
 			v = (to_trigger || raw >= kTriggerPress) ? raw / 255.0f * c.pressure[src] : 0.0f;
 		}
+		else if (src == S_TOUCHLEFT || src == S_TOUCHRIGHT)
+		{
+			// 2.02 (swordpdf: "click (instead of touch)"): the touchpad's sides press on a click, chosen by the finger's
+			// half, as PS4 and PS5 games read a left or right click. Resting a finger on the pad presses nothing.
+			const bool clicked = (s.buttons & 0x00100000u) != 0;
+			v = (clicked && s.half == (src == S_TOUCHLEFT ? 1 : 2)) ? c.pressure[src] : 0.0f;
+		}
+		else if (src == S_TOUCHPAD && s.half != 0 &&
+		         c.target[s.half == 1 ? S_TOUCHLEFT : S_TOUCHRIGHT] < T_NONE && (s.buttons & 0x00100000u))
+			v = 0.0f; // a click on a side with its own input presses only that side's (the keyboard's Backspace still counts)
 		else
 			v = (s.buttons & SourceAt(src).bits) ? c.pressure[src] : 0.0f;
 		// PCSX2 reads the analog button and the pressure modifier as on or off (it acts when they change).
@@ -627,6 +650,8 @@ inline std::string Describe(const Config& c)
 		states = "save state on " + DescribeCombo(c.save, c.hold_ms) + ", load on " + DescribeCombo(c.load, c.hold_ms);
 	if (c.fast[0] != CB_NONE || c.fast[1] != CB_NONE)
 		states += (states.empty() ? "" : ", ") + std::string("fast forward on ") + DescribeCombo(c.fast, c.hold_ms);
+	if (c.web[0] != def.web[0] || c.web[1] != def.web[1])
+		states += (states.empty() ? "" : ", ") + std::string("settings page on ") + DescribeCombo(c.web, 2000);
 	std::string out = buttons;
 	for (const std::string* part : {&sticks, &states})
 		if (!part->empty())

@@ -7,7 +7,7 @@
 # Each window's eboot buckets are offsets from OrbisEEProfStart at run time; the ELF gives that function's address, so
 # bucket + elf(OrbisEEProfStart) is an ELF address, named with the ELF's symbols (llvm-nm -C). Library callers are named
 # the same way. With --by-game, windows of the same game (the report's "Game:" line) are added up, weighted by samples.
-# Copyright (C) 2026 Spyros
+# Copyright (C) 2026 swordpdf
 # SPDX-License-Identifier: GPL-3.0-or-later
 import argparse, bisect, collections, re, shutil, subprocess, sys
 
@@ -110,6 +110,8 @@ def main():
         groups[(w['game'], w['thread']) if args.by_game else (w['file'], w['thread'])].append(w)
     for key, ws in sorted(groups.items(), key=lambda kv: -sum(w['n'] for w in kv[1])):
         n = sum(w['n'] for w in ws)
+        if n == 0:  # 2026-10-08: a window that logged no samples (none to name)
+            continue
         fn = collections.Counter()
         callers = collections.Counter()
         areas = collections.Counter()

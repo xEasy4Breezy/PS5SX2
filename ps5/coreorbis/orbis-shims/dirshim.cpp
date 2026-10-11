@@ -8,10 +8,13 @@
 // the parent's d_name down as the subfolder's name, the subfolder's first readdir overwrote it, and every
 // path in the subfolder came out as <folder>/<name>/<name>. Texture replacement packs (files in subfolders
 // of textures/<serial>/replacements) were never found.
+// vk-285-135: folders under /nfs (games on NFS shares) are listed by OrbisNfs.cpp.
 #include <sys/dirent.h>
 #include <cstddef>
 #include <cstring>
 #include <fcntl.h>
+
+#include "OrbisNfs.h"
 
 extern "C" int sceKernelOpen(const char*, int, int);
 extern "C" int sceKernelGetdents(int, char*, int);
@@ -33,10 +36,24 @@ struct OrbisDIR
     size_t length;
     bool eof;
     dirent entry; // vk-285-112: this directory's own (see above)
+    void* nfs = nullptr; // vk-285-135: a folder on an NFS share (OrbisNfs.h), listed by OrbisNfs; fd is -1 then
 };
 
 extern "C" DIR* opendir(const char* name)
 {
+    if (OrbisNfs::IsPath(name)) // vk-285-135: /nfs/<host>/... is a share's folder, not the kernel's
+    {
+        void* nfs = OrbisNfs::OpenDir(name);
+        if (!nfs)
+            return nullptr;
+        OrbisDIR* d = new OrbisDIR();
+        d->fd = -1;
+        d->offset = 0;
+        d->length = 0;
+        d->eof = false;
+        d->nfs = nfs;
+        return reinterpret_cast<DIR*>(d);
+    }
     const int flags = O_RDONLY | O_DIRECTORY | O_NOFOLLOW;
     const int fd = sceKernelOpen(name, flags, 0);
     if (fd < 0)
@@ -54,6 +71,8 @@ extern "C" struct dirent* readdir(DIR* dirp)
     OrbisDIR* d = reinterpret_cast<OrbisDIR*>(dirp);
     if (!d || d->eof)
         return nullptr;
+    if (d->nfs)
+        return OrbisNfs::ReadDir(d->nfs, &d->entry) ? &d->entry : nullptr;
 
     // Consume one record from the current buffer.
     if (d->offset + 8 <= d->length)
@@ -121,6 +140,12 @@ extern "C" int closedir(DIR* dirp)
     OrbisDIR* d = reinterpret_cast<OrbisDIR*>(dirp);
     if (!d)
         return -1;
+    if (d->nfs)
+    {
+        OrbisNfs::CloseDir(d->nfs);
+        delete d;
+        return 0;
+    }
     const int rc = sceKernelClose(d->fd);
     delete d;
     return rc;

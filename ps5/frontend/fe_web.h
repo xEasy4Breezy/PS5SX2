@@ -5,15 +5,16 @@
 // at the next vsync (GSRenderer.cpp OrbisLiveTune -> main-boot.cpp orbis_reload_gs_ini_cpu).
 //
 // Plain BSD sockets, one thread, one request per connection; the same code runs on the PC in
-// fe_host for testing. Every /api/ request needs the access token, which the QR code carries.
+// fe_host for testing. Every /api/ request uses the same-site checks; the console address is sufficient.
 //
-// Copyright (C) 2026 Spyros
+// Copyright (C) 2026 swordpdf
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #pragma once
 
 #include "fe_covers.h"
 #include "fe_games.h"
+#include "fe_game_achievements.h"
 
 #include <atomic>
 #include <cstdint>
@@ -42,6 +43,7 @@ struct WebConfig
 	std::string settings_dir;           // settings/<image stem>.ini
 	std::string gs_ini;                 // the settings every game shares
 	std::string patches_dir;            // <serial>_<crc>.pnach
+	std::string cheats_dir;             // 2026-10-08: cheats' <serial>_<crc>.pnach ("" leaves cheats off the page)
 	std::string covers_dir;             // the user's covers: <serial|stem|title>.jpg/.png
 	std::string cache_dir;              // downloaded covers: <serial>.jpg
 	std::string token_path;             // unused since vk-285-118 (no key); kept for the host harness's build of the 1.50 page
@@ -57,7 +59,14 @@ struct WebConfig
 	std::string top_dir;                // /data/PCSX2: gs.ini, live.ini, flags/, settings/, patches/, cheats/
 	std::string memcards_dir;           // vk-285-113: memcards/, the cards PCSX2 uses ("" for none: no cards page)
 	std::string report_header;          // the report's first lines: build, sources, console
+	std::function<GameAchievementsState()> achievements; // Runtime snapshot, no client pointers (AI-assisted).
+	std::function<std::vector<uint8_t>(uint32_t)> achievement_badge;
 	int test_build = 0;                 // names the report file "PS5SX2-test<N>-..."
+	// vk-285-139: changing discs while a game runs (/api/discs, /api/disc). The disc in now and the game's set ("" and empty
+	// in the menu); change_disc asks for one (any image the page lists), false when no game runs.
+	std::function<std::string()> current_disc;
+	std::function<std::vector<std::string>()> disc_set;
+	std::function<bool(const std::string& path)> change_disc;
 };
 
 // vk-285-51: appends "<date time>  <line>" to the settings log (logs/settings.log), which keeps
@@ -128,12 +137,16 @@ private:
 
 	void ApiState(Response& res);
 	void ApiGames(Response& res);
+	void ApiAchievements(Response& res);
+	void ApiAchievementBadge(const Request& req, Response& res);
 	void ApiCover(const Request& req, Response& res);
 	void ApiSettings(const Request& req, Response& res);
 	void ApiSave(const Request& req, Response& res);
 	void ApiRecommended(const Request& req, const GameInfo* g, const std::string& path, Response& res);
 	void ApiReport(const Request& req, Response& res); // test build 1: one text file with the logs
 	void ApiNote(const Request& req, Response& res);   // test build 1: a tester's note, into settings.log
+	void ApiDiscs(Response& res);                      // vk-285-139: the disc in, the game's discs and every image
+	void ApiDisc(const Request& req, Response& res);   // vk-285-139: put one in (the body: its path)
 	void ApiMemcards(Response& res);                   // vk-285-113: the cards in memcards/
 	void ApiMemcardCreate(const Request& req, Response& res); // vk-285-113: "create <8|16|32|64> <name>"
 	void Log(const Request& req, const std::string& what);

@@ -15,13 +15,26 @@
 #include <atomic>
 #include <string>
 #include "common/ProgressCallback.h"
+#ifdef PS5SX2_ACHIEVEMENTS
+#include "ps5/coreorbis/orbis-shims/ProsperoAchievements.h"
+#endif
 
 void Host::CommitBaseSettingChanges()
 {
+#ifdef PS5SX2_ACHIEVEMENTS
+	OrbisAchievementsCommit();
+#endif
 }
 
 void Host::LoadSettings(SettingsInterface& si, std::unique_lock<std::mutex>& lock)
 {
+#ifdef PS5SX2_ACHIEVEMENTS
+	// LoadCoreSettings already ran; enforce the initial port's supported modes.
+	EmuConfig.Achievements.HardcoreMode = false;
+	EmuConfig.Achievements.Overlays = false;
+	EmuConfig.Achievements.LBOverlays = false;
+	EmuConfig.Achievements.SoundEffects = false;
+#endif
 }
 
 void Host::CheckForSettingsChanges(const Pcsx2Config& old_config)
@@ -230,6 +243,7 @@ extern std::atomic<int> g_orbis_rb_auto_request; // vk-285-118 (GSRenderer.cpp O
 void OrbisReadbackAutoCpu(); // vk-285-118 (main-boot.cpp)
 void OrbisOSDLabel(const char* text);
 void OrbisBackToMenuCpu();
+void OrbisChangeDiscCpu(int req); // vk-285-139 (main-boot.cpp): 5 the settings page's disc, 6 the change disc combo
 
 extern std::atomic<int> g_orbis_gsini_reload, g_orbis_pin_request; // eerec-285 (GSRenderer.cpp)
 void orbis_reload_gs_ini_cpu(); // eerec-285 (main-boot.cpp)
@@ -279,6 +293,8 @@ void Host::PumpMessagesOnCPUThread()
 	}
 	else if (req == 3)
 		OrbisBackToMenuCpu();
+	else if (req == 5 || req == 6)
+		OrbisChangeDiscCpu(req);
 	else if (req == 4)
 	{
 		// vk-285-118 (AI-assisted): fast forward on or off (the Controls tab's fast forward combo, experimental: for skipping
@@ -337,10 +353,16 @@ std::string Host::TranslatePluralToString(const char* context, const char* msg, 
 
 void Host::OnAchievementsLoginRequested(Achievements::LoginRequestReason reason)
 {
+#ifdef PS5SX2_ACHIEVEMENTS
+	OrbisAchievementsLoginRequired();
+#endif
 }
 
 void Host::OnAchievementsLoginSuccess(const char* username, u32 points, u32 sc_points, u32 unread_messages)
 {
+#ifdef PS5SX2_ACHIEVEMENTS
+	OrbisAchievementsLoginSuccess(username);
+#endif
 }
 
 void Host::OnAchievementsRefreshed()

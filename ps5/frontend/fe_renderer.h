@@ -5,7 +5,7 @@
 // Written for what the PS5 driver runs: classic render passes, no MSAA (its resolve is a CPU copy),
 // no mip chains, no image queries in shaders, 16-bit indices, push constants of 128 bytes.
 //
-// Copyright (C) 2026 Spyros
+// Copyright (C) 2026 swordpdf
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #pragma once
@@ -55,6 +55,13 @@ struct BgParams
 	float misc[4];
 };
 
+// Texture changes within the UI vertex stream (AI-assisted).
+struct UiImageRange
+{
+	uint32_t first = 0, count = 0;
+	VkDescriptorSet set = VK_NULL_HANDLE;
+};
+
 struct FrameDesc
 {
 	Mat4 view_proj;
@@ -67,6 +74,7 @@ struct FrameDesc
 	std::vector<BoxDraw> boxes;
 	HaloDraw halo;
 	std::vector<UiVertex> ui;
+	std::vector<UiImageRange> ui_images;
 	float fade = 1.0f;
 };
 

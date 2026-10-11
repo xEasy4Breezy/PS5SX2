@@ -5,7 +5,7 @@
 #
 #   ps5/frontend/host/test-settings.sh [<older commit, default 5e1e47b (1.50)>]
 #
-# Copyright (C) 2026 Spyros
+# Copyright (C) 2026 swordpdf
 # SPDX-License-Identifier: GPL-3.0-or-later
 set -euo pipefail
 

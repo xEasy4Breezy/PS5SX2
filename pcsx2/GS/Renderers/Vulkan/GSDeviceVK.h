@@ -616,6 +616,16 @@ public:
 	// Test build 1 (vk-285-55): draws sTex over the frame being presented, blended by its alpha
 	// (the testing watermark). Only between BeginPresent and EndPresent.
 	void OrbisPresentBlend(GSTexture* sTex, const GSVector4& sRect, const GSVector4& dRect);
+	// 2026-10-08 (AI-assisted): frame generation (PS5SX2/FrameGeneration; GSDeviceVK.cpp, "frame generation"). Record: outside
+	// a present, for a frame of the game: draws it as the present would into the interpolator's frame and makes the frame
+	// between it and the last one; returns how many presents of the generated frame should go before the game's (0: none).
+	// Draw: between BeginPresent and EndPresent, the generated frame over the whole screen. Release: before the device goes.
+	// vk-285-133: `vsyncs` since the game's last new frame, the presents `already` made in them, the PS2's rate, the speed
+	// (percent of the target) and the limiter at normal speed, for the pacing (ps5/coreorbis/orbis-shims/OrbisFrameGenPacing.h).
+	u32 OrbisFrameGenRecord(GSTexture* current, const GSVector4& src_uv, const GSVector4& draw_rect, PresentShader shader,
+		float shader_time, Filter filter, u32 vsyncs, u32 already, double ps2_hz, float speed, bool nominal);
+	void OrbisFrameGenDraw();
+	void OrbisFrameGenRelease();
 	// vk-285-94: the GPU profiler (flags/gpuprof; GSDeviceVK.cpp). OrbisGpSecond once a second on the GS thread.
 	void OrbisGpSecond();
 	void OrbisGpDestroy();

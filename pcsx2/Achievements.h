@@ -6,6 +6,9 @@
 #include "common/Pcsx2Types.h"
 
 #include "Config.h"
+#ifdef PS5SX2_ACHIEVEMENTS
+#include "ps5/frontend/fe_game_achievements.h"
+#endif
 
 #include <functional>
 #include <mutex>
@@ -150,6 +153,21 @@ namespace Achievements
 
 	/// Renders the leaderboard list.
 	void DrawLeaderboardsWindow();
+
+#ifdef PS5SX2_ACHIEVEMENTS
+	// Copied runtime data for the in-game web interface (AI-assisted).
+	fe::GameAchievementsState GetPS5GameAchievements();
+	std::vector<u8> GetPS5AchievementBadge(u32 id);
+	/// PS5 (pr9n, AI-assisted): before the app restarts into the shelf, gives an unlock or leaderboard entry still being
+	/// sent up to `max_ms` to reach the server (polled on the calling thread, the CPU thread). False, and the player told,
+	/// when one is still unsent.
+	bool OrbisFlushBeforeExit(int max_ms);
+	/// PS5 (2026-10-08, AI-assisted): the badge files of the challenges active now (an achievement primed: it unlocks if the
+	/// player keeps it up), for the port's own corner icons (GSRenderer.cpp; there is no ImGui to draw PCSX2's indicators).
+	/// The generation changes whenever the list does, so the GS thread asks for the list only then.
+	u32 OrbisChallengeGeneration();
+	std::vector<std::string> OrbisChallengeBadges();
+#endif
 
 #ifdef ENABLE_RAINTEGRATION
 	/// Prevents the internal implementation from being used. Instead, RAIntegration will be

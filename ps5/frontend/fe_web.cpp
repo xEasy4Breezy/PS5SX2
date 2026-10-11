@@ -1,10 +1,11 @@
 // PS5 port frontend: the settings page's web server (see fe_web.h).
 //
-// Copyright (C) 2026 Spyros
+// Copyright (C) 2026 swordpdf
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "fe_web.h"
 #include "fe_settings.h"
+#include "fe_i18n.h"
 
 #include <algorithm>
 #include <arpa/inet.h>
@@ -193,6 +194,8 @@ const char* Reason(int status)
 	switch (status)
 	{
 		case 200: return "OK";
+		case 202:
+			return "Accepted";
 		case 400: return "Bad Request";
 		case 401: return "Unauthorized";
 		case 404: return "Not Found";
@@ -661,6 +664,10 @@ void WebServer::Route(const Request& req, Response& res)
 	}
 	if (req.path == "/api/state" && req.method == "GET")
 		ApiState(res);
+	else if (req.path == "/api/achievements" && req.method == "GET")
+		ApiAchievements(res);
+	else if (req.path == "/api/achievement-badge" && req.method == "GET")
+		ApiAchievementBadge(req, res);
 	else if (req.path == "/api/games" && req.method == "GET")
 		ApiGames(res);
 	else if (req.path == "/api/cover" && req.method == "GET")
@@ -671,6 +678,10 @@ void WebServer::Route(const Request& req, Response& res)
 		ApiSave(req, res);
 	else if (req.path == "/api/report" && (req.method == "GET" || req.method == "HEAD"))
 		ApiReport(req, res);
+	else if (req.path == "/api/discs" && req.method == "GET") // vk-285-139
+		ApiDiscs(res);
+	else if (req.path == "/api/disc" && req.method == "POST")
+		ApiDisc(req, res);
 	else if (req.path == "/api/note" && req.method == "POST")
 		ApiNote(req, res);
 	else if (req.path == "/api/memcards" && req.method == "GET")
@@ -698,7 +709,7 @@ std::vector<GameInfo> WebServer::Games()
 				g.serial = it->second.second;
 			else
 			{
-				g.serial = ReadSerial(g.path);
+				g.serial = ReadSerial(g); // 2.02: the serial cache file too
 				m_serials[g.path] = {g.bytes, g.serial};
 			}
 			ApplyGameDbTitle(g); // vk-285-113: the game's name from the game database, as on the shelf
@@ -731,6 +742,16 @@ const GameInfo* WebServer::FindGame(const std::string& id, std::vector<GameInfo>
 
 void WebServer::ApiState(Response& res)
 {
+	// Share the console catalog and its file overrides with the web browser (AI-assisted).
+	std::string strings = "{";
+	for (int i = static_cast<int>(Str::Achievements); i < static_cast<int>(Str::Count); ++i)
+	{
+		const auto id = static_cast<Str>(i);
+		if (strings.size() > 1)
+			strings += ',';
+		strings += Json(Key(id)) + ":" + Json(Tr(id));
+	}
+	strings += "}";
 	std::string playing;
 	{
 		std::lock_guard<std::mutex> lock(m_mutex);
@@ -746,7 +767,7 @@ void WebServer::ApiState(Response& res)
 			game = "{\"id\":" + Json(playing) + ",\"title\":" + Json(playing) + ",\"serial\":\"\"}";
 	}
 	res.body = "{\"app\":\"PS5SX2\",\"build\":" + Json(m_cfg.build_tag) + ",\"test\":" + std::to_string(m_cfg.test_build) +
-	           ",\"mode\":" + Json(playing.empty() ? "menu" : "game") + ",\"playing\":" + game + "}";
+		       ",\"language\":" + Json(LanguageCode()) + ",\"strings\":" + strings + ",\"mode\":" + Json(playing.empty() ? "menu" : "game") + ",\"playing\":" + game + "}";
 }
 
 void WebServer::ApiGames(Response& res)
@@ -773,6 +794,69 @@ void WebServer::ApiGames(Response& res)
 		       ",\"playing\":" + (g.file == playing ? "true" : "false") + "}";
 	}
 	res.body = out + "]";
+}
+
+// In-game achievements share the settings page's same-site checks (AI-assisted).
+void WebServer::ApiAchievements(Response& res)
+{
+	std::string playing;
+	{
+		std::lock_guard lock(m_mutex);
+		playing = m_now_playing;
+	}
+	GameAchievementsState snapshot;
+	if (playing.empty())
+		snapshot.message = Tr(Str::AchievementStartGame);
+	else if (!m_cfg.achievements)
+		snapshot.message = Tr(Str::AchievementUnavailable);
+	else
+		snapshot = m_cfg.achievements();
+	std::string out = "{\"game_id\":" + std::to_string(snapshot.game_id) + ",\"title\":" + Json(snapshot.title) +
+		              ",\"playing\":" + Json(playing) + ",\"busy\":" + (snapshot.busy ? "true" : "false") +
+		              ",\"message\":" + Json(snapshot.message) + ",\"entries\":[";
+	for (size_t i = 0; i < snapshot.entries.size(); ++i)
+	{
+		const auto& entry = snapshot.entries[i];
+		if (i)
+			out += ',';
+		out += "{\"id\":" + std::to_string(entry.id) + ",\"points\":" + std::to_string(entry.points) +
+			   ",\"unlocked\":" + (entry.unlocked ? "true" : "false") + ",\"title\":" + Json(entry.title) +
+			   ",\"description\":" + Json(entry.description) + "}";
+	}
+	res.body = out + "]}";
+}
+void WebServer::ApiAchievementBadge(const Request& req, Response& res)
+{
+	const std::string id_text = QueryValue(req.query, "id");
+	char* end = nullptr;
+	const unsigned long long id = std::strtoull(id_text.c_str(), &end, 10);
+	if (id_text.empty() || id_text.find_first_not_of("0123456789") != std::string::npos || !end || *end || !id || id > UINT32_MAX)
+	{
+		res.status = 400;
+		res.body = Error("invalid achievement ID");
+		return;
+	}
+	std::string playing;
+	{
+		std::lock_guard lock(m_mutex);
+		playing = m_now_playing;
+	}
+	if (playing.empty() || !m_cfg.achievement_badge)
+	{
+		res.status = 404;
+		res.body = Error("no active achievement image");
+		return;
+	}
+	const auto bytes = m_cfg.achievement_badge(static_cast<uint32_t>(id));
+	if (bytes.size() < 8 || bytes.size() > 256 * 1024 || std::memcmp(bytes.data(), "\x89PNG\r\n\x1a\n", 8) != 0)
+	{
+		res.status = 202;
+		res.body = Error("image is loading or unavailable");
+		return;
+	}
+	res.type = "image/png";
+	res.body.assign(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+	res.cache = "private, max-age=60";
 }
 
 void WebServer::ApiCover(const Request& req, Response& res)
@@ -821,6 +905,7 @@ void WebServer::ApiSettings(const Request& req, Response& res)
 	const bool has_preset = PresetSection(m_cfg.presets, g ? g->serial : std::string("@global"), preset);
 	const IniState rec = ReadState(preset);
 	const std::vector<std::string>& enabled = own.enabled;
+	const std::vector<std::string>& cheats_on = own.cheats; // 2026-10-08
 	std::string out = "{\"id\":" + Json(id) + ",\"title\":" + Json(g ? g->title : "All games") + ",\"serial\":" +
 	                  Json(g ? g->serial : "") + ",\"file\":" + Json(g ? "settings/" + g->stem + ".ini" : "gs.ini") +
 	                  ",\"exists\":" + (Exists(path) ? "true" : "false") + ",\"values\":" + KvJson(own);
@@ -854,7 +939,53 @@ void WebServer::ApiSettings(const Request& req, Response& res)
 			}
 		}
 	}
-	res.body = out + "]}";
+	out += "]";
+	// 2026-10-08 (AI-assisted): the game's cheat groups, the same way (only where the app has a cheats folder, so a page from
+	// before answers as it did).
+	if (!m_cfg.cheats_dir.empty())
+	{
+		out += ",\"cheats\":[";
+		if (g)
+		{
+			bool first = true;
+			const std::vector<PatchGroup> groups = PatchGroups(m_cfg.cheats_dir, g->serial);
+			for (const PatchGroup& c : groups)
+			{
+				const bool on = std::find(cheats_on.begin(), cheats_on.end(), c.name) != cheats_on.end();
+				out += std::string(first ? "" : ",") + "{\"name\":" + Json(c.name) + ",\"file\":" + Json(c.file) +
+				       ",\"description\":" + Json(c.description) + ",\"enabled\":" + (on ? "true" : "false") + "}";
+				first = false;
+			}
+			for (const std::string& e : cheats_on)
+			{
+				bool listed = false;
+				for (const PatchGroup& c : groups)
+					listed = listed || c.name == e;
+				if (!listed)
+				{
+					out += std::string(first ? "" : ",") + "{\"name\":" + Json(e) + ",\"file\":\"\",\"description\":" +
+					       Json("no cheat file has this group") + ",\"enabled\":true}";
+					first = false;
+				}
+			}
+		}
+		out += "]";
+	}
+	// 2026-10-08 (AI-assisted): the game's own hardware-renderer fixes (the game database's), as the settings that set them by
+	// hand (fe_settings.cpp ManualFixSettings): the page's Hardware fixes rows show them while manual fixes are off and write
+	// them when manual fixes go on. Only for a game the database has such fixes for (a page from before answers as it did).
+	if (g)
+	{
+		const std::vector<std::pair<std::string, std::string>> fixes = ManualFixSettings(g->serial);
+		if (!fixes.empty())
+		{
+			out += ",\"gamefixes\":{";
+			for (size_t i = 0; i < fixes.size(); i++)
+				out += std::string(i ? "," : "") + Json(fixes[i].first) + ":" + Json(fixes[i].second);
+			out += "}";
+		}
+	}
+	res.body = out + "}";
 }
 
 // The body is one change a line: "set <key>=<value>", "unset <key>", "patch+ <group>" or
@@ -955,7 +1086,7 @@ void WebServer::ApiSave(const Request& req, Response& res)
 			lines.erase(std::remove_if(lines.begin(), lines.end(), [&](const IniLine& l) { return l.kv && l.key == key; }), lines.end());
 			changes++;
 		}
-		else if ((verb == "patch+" || verb == "patch-") && g)
+		else if ((verb == "patch+" || verb == "patch-" || verb == "cheat+" || verb == "cheat-") && g)
 		{
 			if (arg.empty() || arg.size() > 100 || !SafeValue(arg))
 			{
@@ -963,22 +1094,25 @@ void WebServer::ApiSave(const Request& req, Response& res)
 				res.body = Error("bad patch name");
 				return;
 			}
-			const bool on = verb == "patch+";
+			// 2026-10-08: cheat+/cheat- the same way, on Cheats/Enable lines.
+			const bool cheat = verb[0] == 'c';
+			const std::string list_key = cheat ? "Cheats/Enable" : "Patches/Enable";
+			const bool on = verb.back() == '+';
 			bool present = false;
 			for (const IniLine& l : lines)
-				present = present || (l.kv && l.key == "Patches/Enable" && l.value == arg);
+				present = present || (l.kv && l.key == list_key && l.value == arg);
 			if (on && !present)
 			{
 				IniLine l;
-				l.raw = "Patches/Enable=" + arg;
-				l.key = "Patches/Enable";
+				l.raw = list_key + "=" + arg;
+				l.key = list_key;
 				l.value = arg;
 				l.kv = true;
 				lines.push_back(l);
 			}
 			else if (!on)
 				lines.erase(std::remove_if(lines.begin(), lines.end(),
-								[&](const IniLine& l) { return l.kv && l.key == "Patches/Enable" && l.value == arg; }),
+								[&](const IniLine& l) { return l.kv && l.key == list_key && l.value == arg; }),
 					lines.end());
 			changes++;
 		}
@@ -1194,6 +1328,54 @@ void WebServer::ApiReport(const Request& req, Response& res)
 
 // Test build 1 (vk-285-55): a tester's own words about what happened, on one line of the settings
 // log, beside the app's own lines from the same moment.
+// vk-285-139 (AI-assisted; swordpdf: "multi-disc and disc-change support (to even support gameshark iso)"): while a game runs,
+// the page's Disc row lists the game's discs, then every image on the shelf, and puts the one picked in.
+void WebServer::ApiDiscs(Response& res)
+{
+	const std::string current = m_cfg.current_disc ? m_cfg.current_disc() : std::string();
+	const std::vector<std::string> set = m_cfg.disc_set ? m_cfg.disc_set() : std::vector<std::string>();
+	auto name_of = [](const std::string& p) { return p.substr(p.rfind('/') + 1); };
+	std::string out = "{\"current\":" + Json(current) + ",\"set\":[";
+	for (size_t i = 0; i < set.size(); i++)
+		out += std::string(i ? "," : "") + "{\"path\":" + Json(set[i]) + ",\"name\":" + Json(name_of(set[i])) + "}";
+	out += "],\"games\":[";
+	bool first = true;
+	for (const GameInfo& g : Games())
+	{
+		if (IsElfName(g.file.c_str()))
+			continue;
+		out += std::string(first ? "" : ",") + "{\"path\":" + Json(g.path) + ",\"title\":" + Json(g.title) + "}";
+		first = false;
+	}
+	res.body = out + "]}";
+}
+
+void WebServer::ApiDisc(const Request& req, Response& res)
+{
+	const std::string path = Trim(req.body);
+	bool known = false;
+	if (m_cfg.disc_set)
+		for (const std::string& p : m_cfg.disc_set())
+			known = known || p == path;
+	for (const GameInfo& g : Games())
+		known = known || (g.path == path && !IsElfName(g.file.c_str()));
+	if (path.empty() || !known)
+	{
+		res.status = 400;
+		res.body = Error("not one of the console's disc images");
+		return;
+	}
+	if (!m_cfg.change_disc || !m_cfg.change_disc(path))
+	{
+		res.status = 409;
+		res.body = Error("no game is running");
+		return;
+	}
+	if (!m_cfg.change_log.empty())
+		AppendSettingsLog(m_cfg.change_log, "page: change disc to " + path);
+	res.body = "{\"ok\":true}";
+}
+
 void WebServer::ApiNote(const Request& req, Response& res)
 {
 	std::string text;

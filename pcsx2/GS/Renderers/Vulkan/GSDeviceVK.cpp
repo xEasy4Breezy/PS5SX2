@@ -31,6 +31,8 @@
 #include <sstream>
 #ifdef ORBIS_VULKAN
 #include <unistd.h> // vk-285-14: fsync, _exit (GPU-hang forensics)
+#include <chrono> // 2026-10-08: frame generation's pacing
+#include <string>
 #include "OrbisPaths.h" // vk-285-33 (the port's include-orbis)
 #include "OrbisDriver.h" // vk-285-115: ps5vk or RADV (the same objects link with either)
 #include "OrbisExit.h" // vk-285-115: the app ends through the system (_exit() is a SIGSYS on the console)
@@ -42,6 +44,10 @@
 // PS5 port (vk-285-104): this file's printf/fflush(stdout) go to the deferred log (OrbisDeferredLog.h); the
 // ticker thread writes them out, so the GS thread never waits on /data or on stdout's lock.
 #include "OrbisDeferredLog.h"
+#ifdef ORBIS_VULKAN
+#include "ps5/coreorbis/orbis-shims/ps5_framegen.h" // 2026-10-08: frame generation
+#include "ps5/coreorbis/orbis-shims/OrbisFrameGenPacing.h" // vk-285-133: its pacing
+#endif
 #define printf OrbisDeferredPrintf
 #define fflush OrbisDeferredFlush
 #ifdef ORBIS_VULKAN
@@ -59,7 +65,110 @@ unsigned long long g_orbis_readback_n, g_orbis_readback_bytes, g_orbis_readback_
 // buffers of one vkQueueSubmit into a 2 MiB stream and refuses more than 523,503 words (ps5vk_queue.c); a draw is ~50-90 words (a feedback
 // barrier adds 17), so 3500 draws x 90 = 315k words leaves room for uploads, clears and the present pass. RenderHW submits before a draw
 // that would pass it, SendHWDraw between the groups of one full-barrier draw that is bigger than the whole budget by itself.
-static constexpr u32 ORBIS_SUBMIT_DRAW_BUDGET = 3500;
+// live-8 (AI-assisted): 3500 -> 4400, and live-tunable. R&C1 on the base PS5 (fw 4.03, swordpdf, 2026-10-09): looking at one spot the
+// frame held just over 3500 draws ("3500 draws in this submission and 2 more coming, submitting early"), so every frame became two
+// submissions; on that firmware the second waits for the next vblank, so the game sat at 30 fps / 50% speed while it ran 60 everywhere
+// else (8x or 6x made no difference). 4400 x 107 words (a 90-word draw plus a 17-word feedback barrier, the worst case) is 471k of the
+// 523,503 the driver takes, ~52k left for uploads, clears and the present pass; the typical feedback draw is ~67 words (~295k).
+// flags/vk_drawbudget holding a number (1000..4800) overrides it, read live. Needs proper testing on a console.
+// live-9 (AI-assisted): the game's own default from PS5SX2_DRAW_BUDGET (main-boot.cpp sets 6000 for R&C1 since live-10, where swordpdf's base PS5 held
+// 60 fps at the heavy spot with it, 2026-10-10); the flag still wins.
+static u32 OrbisDefaultDrawBudget()
+{
+	static const u32 s_default = [] {
+		const char* e = getenv("PS5SX2_DRAW_BUDGET");
+		const unsigned long v = e ? std::strtoul(e, nullptr, 10) : 0;
+		return (v >= 1000 && v <= 8000) ? static_cast<u32>(v) : 4400u;
+	}();
+	return s_default;
+}
+// live-10 (AI-assisted): swordpdf on live-8 with 4800, another R&C1 view: "still the same issue in ratchet" -- 30 fps / 50% again, the log
+// "4800 draws in this submission and 1 more coming, submitting early (500 times)", 2 submissions and 1 present a frame. The 4800 cap was a
+// worst-case guess (107 words a draw); vk-285-113 measured ~67 words a feedback draw and ~50 a plain one, so the stream has room for more.
+// So the cap is 8000 now, and the words are measured: after every submission the driver's step sizes (ps5vk_debug_submission_steps, the
+// last submission it queued) are summed, and a submission past 440,000 of the driver's 523,503 words drops the budget to 4400 for 10 s
+// ("[vkwords] ... guard"). Every 600 submissions the largest is logged with its words per draw. Needs proper testing on a console.
+struct OrbisDbgStage
+{
+	void* address;
+	size_t bytes;
+};
+extern "C" uint32_t ps5vk_debug_submission_steps(VkDevice device, OrbisDbgStage* steps, uint32_t capacity) __attribute__((weak));
+static constexpr u32 ORBIS_WORDS_GUARD = 440000;
+static constexpr u32 ORBIS_GUARD_BUDGET = 4400;
+// live-11 (AI-assisted): times on the TSC (~1.6 GHz on the PS5; only rough seconds are needed here), not steady_clock: live-10's
+// autoprof had 36% of the GS thread's samples in clock_gettime (a kernel call) under steady_clock::now(), which the budget asked twice a draw.
+static constexpr u64 ORBIS_TSC_SECOND = 1600000000ull;
+static u64 s_orbis_guard_until_tsc = 0;
+static void OrbisMeasureSubmitWords(VkDevice device, u32 draws)
+{
+	static u32 s_n = 0, s_peak_words = 0, s_peak_draws = 0, s_guards = 0;
+	if (!ps5vk_debug_submission_steps || device == VK_NULL_HANDLE)
+		return;
+	OrbisDbgStage steps[64];
+	const u32 count = std::min<u32>(ps5vk_debug_submission_steps(device, steps, 64), 64);
+	u64 words = 0;
+	for (u32 i = 0; i < count; i++)
+		words += steps[i].bytes / sizeof(u32);
+	if (words > s_peak_words)
+	{
+		s_peak_words = static_cast<u32>(words);
+		s_peak_draws = draws;
+	}
+	if (words > ORBIS_WORDS_GUARD)
+	{
+		const u64 tsc = __builtin_ia32_rdtsc();
+		const bool was = tsc < s_orbis_guard_until_tsc;
+		s_orbis_guard_until_tsc = tsc + 10 * ORBIS_TSC_SECOND;
+		if (!was && (++s_guards <= 5 || (s_guards % 100) == 0))
+		{
+			printf("[vkwords] guard: a submission of %llu words (%u draws) is past %u of the driver's 523,503: draw budget %u for 10 s (%u times)\n",
+				static_cast<unsigned long long>(words), draws, ORBIS_WORDS_GUARD, ORBIS_GUARD_BUDGET, s_guards);
+			fflush(stdout);
+		}
+	}
+	if (++s_n >= 600)
+	{
+		if (s_peak_words >= 100000)
+		{
+			printf("[vkwords] largest of the last 600 submissions: %u words, %u draws (~%u a draw), of the driver's 523,503\n", s_peak_words,
+				s_peak_draws, s_peak_draws ? s_peak_words / s_peak_draws : 0);
+			fflush(stdout);
+		}
+		s_n = s_peak_words = s_peak_draws = 0;
+	}
+}
+static u32 OrbisSubmitDrawBudgetRaw();
+static u32 OrbisSubmitDrawBudget()
+{
+	const u32 b = OrbisSubmitDrawBudgetRaw();
+	return (b > ORBIS_GUARD_BUDGET && s_orbis_guard_until_tsc != 0 && __builtin_ia32_rdtsc() < s_orbis_guard_until_tsc) ? ORBIS_GUARD_BUDGET : b;
+}
+static u32 OrbisSubmitDrawBudgetRaw()
+{
+	static u64 s_checked = 0;
+	static u32 s_budget = OrbisDefaultDrawBudget();
+	const u64 now = __builtin_ia32_rdtsc();
+	if (now - s_checked >= ORBIS_TSC_SECOND)
+	{
+		s_checked = now;
+		u32 budget = OrbisDefaultDrawBudget();
+		std::string text;
+		if (OrbisCachedRead(OrbisFlagPath("vk_drawbudget").c_str(), text))
+		{
+			const unsigned long v = std::strtoul(text.c_str(), nullptr, 10);
+			if (v >= 1000 && v <= 8000) // live-10: 8000 (was 4800), with the words guard above
+				budget = static_cast<u32>(v);
+		}
+		if (budget != s_budget)
+		{
+			Console.WriteLn("VK: submission draw budget %u (was %u)", budget, s_budget);
+			s_budget = budget;
+		}
+	}
+	return s_budget;
+}
+#define ORBIS_SUBMIT_DRAW_BUDGET (OrbisSubmitDrawBudget())
 
 namespace
 {
@@ -68,10 +177,10 @@ namespace
 	// most once a second.
 	bool OrbisCopiesAsImageCopies()
 	{
-		static std::chrono::steady_clock::time_point s_checked;
+		static u64 s_checked = 0; // live-11: the TSC, not steady_clock (a kernel call per copy)
 		static bool s_on = false;
-		const auto now = std::chrono::steady_clock::now();
-		if (now - s_checked >= std::chrono::seconds(1))
+		const u64 now = __builtin_ia32_rdtsc();
+		if (now - s_checked >= ORBIS_TSC_SECOND)
 		{
 			s_checked = now;
 			s_on = OrbisFlag("vk_cputransfer");
@@ -2487,6 +2596,8 @@ void GSDeviceVK::SubmitCommandBuffer(VKSwapChain* present_swap_chain)
 	}
 #ifdef ORBIS_VULKAN
 	OrbisVkSubmitDone(); // vk-285-113
+	if (!OrbisDriverIsRADV())
+		OrbisMeasureSubmitWords(m_device, m_orbis_submit_draws); // live-10
 	s_orbis_submit++;
 	// vk-285-18: `putdata vktrace` asks for the last submits' draws while the game runs. Every
 	// 64th submit (about once a second) checks for the flag file; the dump goes to vktrace.txt.
@@ -3483,6 +3594,9 @@ void GSDeviceVK::Destroy()
 		WaitForGPUIdle();
 	}
 
+#ifdef ORBIS_VULKAN
+	OrbisFrameGenRelease(); // its images and pipelines before the device (2026-10-08)
+#endif
 	m_swap_chain.reset();
 
 	if (m_device != VK_NULL_HANDLE)
@@ -4384,6 +4498,376 @@ void OrbisVkPresentBlend(GSTexture* tex, const GSVector4& sRect, const GSVector4
 {
 	if (GSDeviceVK* dev = GSDeviceVK::GetInstance())
 		dev->OrbisPresentBlend(tex, sRect, dRect);
+}
+
+// ---- Frame generation (2026-10-08, AI-assisted; needs proper testing on the console) -------------------------------------------
+// PS5SX2/FrameGeneration, per game: the frame between two of the game's, made by ps5/coreorbis/orbis-shims/ps5_framegen (AMD FSR3's
+// optical flow and RPCS3-PS5's interpolation, from Swordpdf's RPCS3-PS5 / ps5-framegen), presented before the second one. The game's
+// frame is drawn into the interpolator's frame by the same present pipeline that draws it into the swapchain (the TV shader or the
+// FSR present, the scaling, the black borders), so a generated frame looks like the game's own; PS5SX2's overlays (the FPS box,
+// the watermark, the QR panel) are drawn over both. The TV is in its 120 Hz mode where the console allows it (VKSwapChain.cpp picks
+// the mode, the driver configures VideoOut): a 60 fps game is shown at 120, a 30 fps one gets its generated frame twice. At 60 Hz
+// only a game at 30 fps or less gets frames made. File statics, not members: GSDeviceVK's layout stays as it was.
+// vk-285-133: paced in the PS2's vsyncs (ps5/coreorbis/orbis-shims/OrbisFrameGenPacing.h; vk-285-131's wall-clock pacing slowed
+// a 60 fps game at 60 Hz to 30 fps), with a pause when the game slows while frames are generated; nothing is recorded while there
+// is no room for a generated frame (a 60 fps game at 60 Hz), and the interpolator is only made once there is.
+bool g_orbis_fg_wanted = false; // main-boot.cpp sets it from PS5SX2/FrameGeneration before the GS opens
+std::atomic<bool> g_orbis_fg_active{false}; // frames are being generated (the FPS box says "FG")
+bool g_orbis_fg_engaged = false; // vk-285-133: the pacing has room for generated frames (GSRenderer.cpp skips the repeats then)
+
+// The driver's measured refresh of the output its swapchain presents to (ps5vk's high-frame-rate output, 2026-10-08); a driver
+// without it presents at 59.94 Hz.
+extern "C" uint32_t ps5vk_output_refresh_millihertz(void) __attribute__((weak));
+
+namespace
+{
+	struct OrbisFrameGenState
+	{
+		std::unique_ptr<ps5::framegen::interpolator> fg;
+		std::unique_ptr<GSTextureVK> frames[2]; // the interpolator's two frame images (this frame's and the previous one alternate)
+		VkImage frame_images[2] = {};
+		std::unique_ptr<GSTextureVK> output;    // the generated frame
+		bool failed = false;     // it could not start: not tried again in this game
+		bool prepared = false;   // the wrappers know the images are the interpolator's (GENERAL)
+		bool reset_next = true;  // the interpolator was (re)made: its first frame has no neighbour
+		bool have_output = false;
+		double hz = 59.94;
+		orbis_fg::Pacing pacing; // vk-285-133
+		std::chrono::steady_clock::time_point stat_start{};
+		std::chrono::steady_clock::time_point last_state_log{};
+		int logged_state = -1;   // the pacing's state the log last described
+		u64 stat_frames = 0, stat_engaged = 0, stat_made = 0, stat_presents = 0, stat_counted = 0;
+		double stat_vsyncs = 0.0;
+	};
+
+	OrbisFrameGenState s_orbis_fg;
+
+	double OrbisFrameGenDisplayHz()
+	{
+		if (ps5vk_output_refresh_millihertz)
+		{
+			const uint32_t mhz = ps5vk_output_refresh_millihertz();
+			if (mhz >= 20000 && mhz <= 250000)
+				return mhz / 1000.0;
+		}
+		return 59.94;
+	}
+}
+
+void GSDeviceVK::OrbisFrameGenRelease()
+{
+	OrbisFrameGenState& s = s_orbis_fg;
+
+	if (!s.fg)
+		return;
+
+	EndRenderPass();
+	if (GetCurrentCommandBuffer() != VK_NULL_HANDLE)
+	{
+		ExecuteCommandBuffer(false);
+		WaitForGPUIdle();
+	}
+
+	for (auto& t : s.frames)
+	{
+		if (t)
+			t->Destroy(false);
+		t.reset();
+	}
+	if (s.output)
+		s.output->Destroy(false);
+	s.output.reset();
+
+	printf("[fg] released: %llu game frames, %llu generated\n", static_cast<unsigned long long>(s.fg->frames()),
+		static_cast<unsigned long long>(s.fg->interpolated()));
+	fflush(stdout);
+	s.fg->destroy();
+	s.fg.reset();
+	s.prepared = false;
+	s.reset_next = true;
+	s.have_output = false;
+	g_orbis_fg_active.store(false, std::memory_order_relaxed);
+}
+
+namespace
+{
+	// vk-285-133: the pacing's state, for boot.log, when it changes: at most one line in 5 s (a game at the edge would fill the
+	// log), and the state then is logged when those 5 s are over if it still differs from the last line. The 10 s status line
+	// says where it is anyway.
+	void OrbisFrameGenLogState(OrbisFrameGenState& s, std::chrono::steady_clock::time_point now, double ps2_hz)
+	{
+		const orbis_fg::Pacing& p = s.pacing;
+		const int state = static_cast<int>(p.GetState());
+		if (state == s.logged_state)
+			return;
+		if (s.last_state_log != std::chrono::steady_clock::time_point{} && now - s.last_state_log < std::chrono::seconds(5))
+			return;
+		s.logged_state = state;
+		s.last_state_log = now;
+		switch (p.GetState())
+		{
+			case orbis_fg::State::Generating:
+				printf("[fg] generating: a new frame every %.1f PS2 vsyncs (%.2f Hz) is %.2f refreshes at %.2f Hz; the generated frame "
+					   "presented %u time(s) before the game's\n",
+					p.MedianVsyncs(), ps2_hz, p.Refreshes(), s.hz, p.Repeats());
+				break;
+			case orbis_fg::State::NoRoom:
+				printf("[fg] not generating: a new frame every %.1f PS2 vsyncs (%.2f Hz) is %.2f refreshes at %.2f Hz, no room for "
+					   "another%s\n",
+					p.MedianVsyncs(), ps2_hz, p.Refreshes(), s.hz,
+					s.hz < 90.0 ? " (at 60 Hz only games at 30 fps or less get generated frames; 60 fps ones need the 120 Hz output)" : "");
+				break;
+			case orbis_fg::State::Warming:
+				printf("[fg] not generating yet: %u of %u frames since the start or a load\n", p.WarmFrames(), orbis_fg::Pacing::kWindow);
+				break;
+			case orbis_fg::State::Unsteady: // vk-285-135
+				printf("[fg] not generating: the game's frames aren't of one length (%u of the last %u alike; %u to start, %u to go on), "
+					   "so the game's own frames are shown\n",
+					p.SteadyFrames(), orbis_fg::Pacing::kWindow, orbis_fg::Pacing::kSteadyStart, orbis_fg::Pacing::kSteadyKeep);
+				break;
+			case orbis_fg::State::NotNominal:
+				printf("[fg] not generating: the frame limiter isn't at normal speed (turbo, slow motion, the fast boot) or a video "
+					   "is being captured\n");
+				break;
+			case orbis_fg::State::Paused:
+				break; // its own line, OrbisFrameGenLogEvent's
+		}
+		fflush(stdout);
+	}
+
+	// vk-285-133: the safety net's news, at once.
+	void OrbisFrameGenLogEvent(OrbisFrameGenState& s, orbis_fg::Event event)
+	{
+		const orbis_fg::Pacing& p = s.pacing;
+		switch (event)
+		{
+			case orbis_fg::Event::None:
+				return;
+			case orbis_fg::Event::Paused:
+				printf("[fg] paused for %.0f s: the game ran at %.0f%% of its speed for 3 s while frames were generated (the floor "
+					   "%.0f%%)\n",
+					p.PauseSeconds(), p.SlowSpeed(), p.PauseFloor());
+				s.logged_state = static_cast<int>(orbis_fg::State::Paused);
+				break;
+			case orbis_fg::Event::ResumedCostly:
+				printf("[fg] the pause is over: %.0f%% without generated frames against %.0f%% with them, so they cost speed here; "
+					   "the next pause would be %.0f s\n",
+					p.NoFgSpeed(), p.SlowSpeed(), p.NextPause());
+				break;
+			case orbis_fg::Event::ResumedSlowGame:
+				printf("[fg] the pause is over: %.0f%% without generated frames, about as with them (%.0f%%): the game is slow by "
+					   "itself here, so the floor is %.0f%% for a minute\n",
+					p.NoFgSpeed(), p.SlowSpeed(), p.NoFgSpeed() - orbis_fg::Pacing::kCostly < orbis_fg::Pacing::kSlowSpeed ?
+																  p.NoFgSpeed() - orbis_fg::Pacing::kCostly :
+																  orbis_fg::Pacing::kSlowSpeed);
+				break;
+		}
+		fflush(stdout);
+	}
+}
+
+u32 GSDeviceVK::OrbisFrameGenRecord(GSTexture* current, const GSVector4& src_uv, const GSVector4& draw_rect, PresentShader shader,
+	float shader_time, Filter filter, u32 vsyncs, u32 already, double ps2_hz, float speed, bool nominal)
+{
+	OrbisFrameGenState& s = s_orbis_fg;
+	s.have_output = false;
+
+	if (!g_orbis_fg_wanted || s.failed || !m_swap_chain || !current)
+	{
+		g_orbis_fg_engaged = false;
+		g_orbis_fg_active.store(false, std::memory_order_relaxed);
+		return 0;
+	}
+
+	// The pacing (vk-285-133): the game's frames in PS2 vsyncs against the display's refreshes, and the speed.
+	const auto now = std::chrono::steady_clock::now();
+	const double now_s = std::chrono::duration<double>(now.time_since_epoch()).count();
+	s.hz = OrbisFrameGenDisplayHz(); // the driver's, each frame: the output goes back to 60 Hz before the process ends
+	const orbis_fg::Decision decision = s.pacing.Frame(vsyncs, already, ps2_hz, s.hz, now_s, speed, nominal);
+	OrbisFrameGenLogEvent(s, s.pacing.TakeEvent());
+	OrbisFrameGenLogState(s, now, ps2_hz);
+	g_orbis_fg_engaged = decision.engaged;
+
+	// A status line every 10 s, generating or not.
+	if (s.stat_start == std::chrono::steady_clock::time_point{})
+		s.stat_start = now;
+	s.stat_frames++;
+	if (vsyncs <= orbis_fg::Pacing::kGapVsyncs) // a load's wait isn't a frame interval
+	{
+		s.stat_vsyncs += vsyncs;
+		s.stat_counted++;
+	}
+	s.stat_engaged += decision.engaged ? 1 : 0;
+	if (const double secs = std::chrono::duration<double>(now - s.stat_start).count(); secs >= 10.0)
+	{
+		double gpu_ms = 0.0, gpu_max = 0.0, flow_ms = 0.0;
+		u32 timed = 0;
+		const bool have_gpu = s.fg && s.fg->take_gpu_time(gpu_ms, gpu_max, timed, flow_ms);
+		printf("[fg] %.1f game fps (%.2f PS2 vsyncs a frame at %.2f Hz), %.1f generated frames a second, %.1f presents each, "
+			   "display %.2f Hz, speed %.0f%%, %s%s\n",
+			s.stat_frames / secs, s.stat_counted ? s.stat_vsyncs / s.stat_counted : 0.0, ps2_hz, s.stat_made / secs,
+			s.stat_made ? static_cast<double>(s.stat_presents) / s.stat_made : 0.0, s.hz, speed,
+			s.pacing.Paused() ? "paused (the game slowed)" :
+			s.stat_engaged == 0 ? "not generating" :
+			s.stat_engaged < s.stat_frames ? "generating part of the time" : "generating",
+			have_gpu ? fmt::format("; GPU {:.2f} ms a frame ({:.2f} the optical flow), most {:.2f}", gpu_ms, flow_ms, gpu_max).c_str() : "");
+		fflush(stdout);
+		s.stat_start = now;
+		s.stat_frames = s.stat_engaged = s.stat_made = s.stat_presents = s.stat_counted = 0;
+		s.stat_vsyncs = 0.0;
+	}
+
+	if (!decision.engaged)
+	{
+		g_orbis_fg_active.store(false, std::memory_order_relaxed);
+		return 0;
+	}
+
+	const u32 w = static_cast<u32>(GetWindowWidth());
+	const u32 h = static_cast<u32>(GetWindowHeight());
+	const VkFormat format = m_swap_chain->GetTextureFormat();
+
+	if (!s.fg || s.fg->width() != w || s.fg->height() != h)
+	{
+		OrbisFrameGenRelease();
+		const auto t0 = std::chrono::steady_clock::now();
+		std::string error;
+		s.fg = std::make_unique<ps5::framegen::interpolator>();
+
+		if (!s.fg->create(m_physical_device, m_device, w, h, error, format))
+		{
+			printf("[fg] frame generation could not start at %ux%u: %s; it stays off in this game\n", w, h, error.c_str());
+			fflush(stdout);
+			s.fg.reset();
+			s.failed = true;
+			g_orbis_fg_engaged = false;
+			return 0;
+		}
+
+		// The interpolator's images, as textures PCSX2's present can draw into and read (they stay the interpolator's).
+		s.frame_images[0] = s.fg->frame_image();
+		s.frame_images[1] = s.fg->previous_image();
+
+		for (int i = 0; i < 2; i++)
+		{
+			s.frames[i] = GSTextureVK::Adopt(s.frame_images[i], GSTexture::RenderTarget, GSTexture::Format::Color, static_cast<int>(w),
+				static_cast<int>(h), 1, format);
+		}
+		s.output = GSTextureVK::Adopt(s.fg->output_image(), GSTexture::Texture, GSTexture::Format::Color, static_cast<int>(w),
+			static_cast<int>(h), 1, ps5::framegen::interpolator::k_format);
+
+		if (!s.frames[0] || !s.frames[1] || !s.output)
+		{
+			printf("[fg] the frame images could not be viewed; frame generation stays off in this game\n");
+			fflush(stdout);
+			OrbisFrameGenRelease();
+			s.failed = true;
+			g_orbis_fg_engaged = false;
+			return 0;
+		}
+
+		s.prepared = false;
+		s.reset_next = true;
+		printf("[fg] ready for %ux%u in %.0f ms; the display at %.2f Hz\n", w, h,
+			std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(), s.hz);
+		fflush(stdout);
+	}
+
+	ps5::framegen::interpolator& fg = *s.fg;
+	VkCommandBuffer cmd = GetCurrentCommandBuffer();
+	EndRenderPass();
+
+	fg.prepare(cmd);
+
+	if (!s.prepared)
+	{
+		// prepare() put the images in GENERAL the first time: what the wrappers are told.
+		for (auto& t : s.frames)
+			t->OverrideImageLayout(GSTextureVK::Layout::ComputeReadWriteImage);
+		s.output->OverrideImageLayout(GSTextureVK::Layout::ComputeReadWriteImage);
+		s.prepared = true;
+	}
+
+	// The last frame's presents read the generated frame: back to the interpolator.
+	s.output->TransitionToLayout(cmd, GSTextureVK::Layout::ComputeReadWriteImage);
+
+	GSTextureVK* const target = fg.frame_image() == s.frame_images[0] ? s.frames[0].get() : s.frames[1].get();
+
+	// This frame as the present draws it into the swapchain: a pass of the swapchain's format cleared to black, and the present
+	// pipeline over the same rectangle (PresentRect with no target draws into the pass that is open, as between BeginPresent and
+	// EndPresent).
+	{
+		static_cast<GSTextureVK*>(current)->TransitionToLayout(cmd, GSTextureVK::Layout::ShaderReadOnly);
+		target->TransitionToLayout(cmd, GSTextureVK::Layout::ColorAttachment);
+		const VkFramebuffer fb = target->GetFramebuffer(false);
+
+		if (fb == VK_NULL_HANDLE)
+		{
+			printf("[fg] no framebuffer for the frame image; frame generation stays off in this game\n");
+			fflush(stdout);
+			s.failed = true;
+			g_orbis_fg_engaged = false;
+			g_orbis_fg_active.store(false, std::memory_order_relaxed);
+			return 0;
+		}
+
+		const VkRenderPassBeginInfo rp = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, nullptr,
+			GetRenderPass(format, VK_FORMAT_UNDEFINED, VK_ATTACHMENT_LOAD_OP_CLEAR, VK_ATTACHMENT_STORE_OP_STORE), fb, {{0, 0}, {w, h}}, 1u,
+			&s_present_clear_color};
+		vkCmdBeginRenderPass(cmd, &rp, VK_SUBPASS_CONTENTS_INLINE);
+		const VkViewport vp{0.0f, 0.0f, static_cast<float>(w), static_cast<float>(h), 0.0f, 1.0f};
+		const VkRect2D scissor{{0, 0}, {w, h}};
+		vkCmdSetViewport(cmd, 0, 1, &vp);
+		vkCmdSetScissor(cmd, 0, 1, &scissor);
+		PresentRect(current, src_uv, nullptr, draw_rect, shader, shader_time, filter);
+		vkCmdEndRenderPass(cmd);
+		target->TransitionToLayout(cmd, GSTextureVK::Layout::ComputeReadWriteImage);
+		InvalidateCachedState(); // the pass and the state were set by hand
+	}
+
+	fg.set_generated(1);
+	const bool made = fg.record(cmd, decision.reset || s.reset_next);
+	s.reset_next = false;
+
+	if (made)
+	{
+		s.output->OverrideImageLayout(GSTextureVK::Layout::ComputeReadWriteImage); // record() wrote it in GENERAL
+		s.output->TransitionToLayout(cmd, GSTextureVK::Layout::ShaderReadOnly);  // read in the present pass, which can't transition
+		s.have_output = decision.presents > 0;
+	}
+
+	fg.advance();
+
+	s.stat_made += s.have_output ? 1 : 0;
+	s.stat_presents += s.have_output ? decision.presents : 0;
+	g_orbis_fg_active.store(true, std::memory_order_relaxed); // the box's "FG": generating, even on a frame too short for one
+	return s.have_output ? decision.presents : 0;
+}
+
+void GSDeviceVK::OrbisFrameGenDraw()
+{
+	OrbisFrameGenState& s = s_orbis_fg;
+
+	if (!s.have_output || !s.output)
+		return;
+
+	const float w = static_cast<float>(GetWindowWidth());
+	const float h = static_cast<float>(GetWindowHeight());
+	PresentRect(s.output.get(), GSVector4(0.0f, 0.0f, 1.0f, 1.0f), nullptr, GSVector4(0.0f, 0.0f, w, h), PresentShader::COPY, 0.0f, Nearest);
+}
+
+// For GSRenderer.cpp, which doesn't include this header.
+u32 OrbisVkFrameGenRecord(GSTexture* current, const GSVector4& src_uv, const GSVector4& draw_rect, PresentShader shader, float shader_time,
+	Filter filter, u32 vsyncs, u32 already, double ps2_hz, float speed, bool nominal)
+{
+	GSDeviceVK* const dev = GSDeviceVK::GetInstance();
+	return dev ? dev->OrbisFrameGenRecord(current, src_uv, draw_rect, shader, shader_time, filter, vsyncs, already, ps2_hz, speed, nominal) : 0;
+}
+
+void OrbisVkFrameGenDraw()
+{
+	if (GSDeviceVK* const dev = GSDeviceVK::GetInstance())
+		dev->OrbisFrameGenDraw();
 }
 #endif
 

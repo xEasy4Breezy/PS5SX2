@@ -5,7 +5,7 @@
 // GS." (1.50's logs: 77 starts on 7 consoles, "Failed to read shaders/vulkan/tfx.glsl."). The eboot now carries the
 // same files from bin/resources/shaders (orbis-shims/orbis_gs_shaders.cpp); the folder's own files still come first.
 //
-// Copyright (C) 2026 Spyros
+// Copyright (C) 2026 swordpdf
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #pragma once
@@ -15,6 +15,6 @@
 // The built-in copy of resources/<filename> ("shaders/vulkan/tfx.glsl"); false for a name it doesn't carry.
 bool OrbisBuiltinShaderSource(const char* filename, std::string* out);
 
-// resources/<filename> from the folder, else the built-in copy (with a boot.log line the first time a file comes
-// from the eboot); false when neither has it.
+// The built-in copy of resources/<filename>, else the folder's (vk-285-134: the eboot's first, a boot.log line when the
+// folder holds a different copy; shadeboost.glsl, meant to be edited, the folder's first); false when neither has it.
 bool OrbisReadShaderSource(const std::string& resources_dir, const char* filename, std::string* out);

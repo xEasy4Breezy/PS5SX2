@@ -77,7 +77,7 @@ IPv4, IPv6 and MAC addresses and the settings page's token are removed, and the 
 
 The next report's header counts the sessions left out since the last one. The `send-shelf-logs` switch sends them all.
 
-**The relay.** `worker/` is a Cloudflare Worker that posts each report to a private Discord channel. The webhook URL is a Worker secret, never in the ELF, and the Worker rate-limits per console and per network address. It runs at `https://ps5sx2-logs.ps5sx2.workers.dev` (Spyros's Cloudflare account), and `make ps5` builds that address into the ELF. `make ps5 RELAY_URL=` builds an ELF that only keeps reports in `outbox/`; `upload-url.txt` points one console somewhere else.
+**The relay.** `worker/` is a Cloudflare Worker that posts each report to a private Discord channel. The webhook URL is a Worker secret, never in the ELF, and the Worker rate-limits per console and per network address. It runs at `https://ps5sx2-logs.ps5sx2.workers.dev` (swordpdf's Cloudflare account), and `make ps5` builds that address into the ELF. `make ps5 RELAY_URL=` builds an ELF that only keeps reports in `outbox/`; `upload-url.txt` points one console somewhere else.
 
 To set up a relay:
 

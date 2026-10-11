@@ -7,7 +7,7 @@
 // soft rather than sharp. vk-285-48 made them softer at the user's ask: 5-6 dB less loud, a rounder
 // onset, a smaller and lower click and a darker top (12 dB less above 2.5 kHz).
 //
-// Copyright (C) 2026 Spyros
+// Copyright (C) 2026 swordpdf
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "fe_sound.h"

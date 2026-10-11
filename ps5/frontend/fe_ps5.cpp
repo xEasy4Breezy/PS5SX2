@@ -1,9 +1,10 @@
 // PS5 port frontend: the console side. The shelf runs on its own Vulkan device (the driver linked
 // into the eboot) with a VK_KHR_display swapchain on VideoOut, reads the DualSense, plays its key
 // sounds on an audio port of its own, and downloads missing covers over HTTPS with the console's
-// own libSceHttp2. Everything is torn down again before PCSX2 opens its device, VideoOut and audio.
+// own libSceHttp2 (before the jailbreak) and HD texture packs with our own (fe_https.h). Everything
+// is torn down again before PCSX2 opens its device, VideoOut and audio.
 //
-// Copyright (C) 2026 Spyros
+// Copyright (C) 2026 swordpdf
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "fe_ps5.h"
@@ -15,8 +16,17 @@
 #include "fe_renderer.h"
 #include "fe_sound.h"
 #include "fe_text.h"
+#include "fe_https.h"
+#include "fe_texpacks.h"
+#include "fe_patchdl.h" // 2026-10-08
 #include "fe_vk.h"
 #include "fe_web.h"
+#include "ps5/coreorbis/orbis-shims/ProsperoNotify.h" // 2026-10-05: the texture packs' popup
+#include "OrbisPaths.h" // live-22: OrbisLogPath for the disc-dump progress file the shelf shows
+#ifdef PS5SX2_ACHIEVEMENTS
+#include "ps5/coreorbis/orbis-shims/ProsperoAchievements.h"
+#include "pcsx2/Achievements.h"
+#endif
 #include "third_party/qrcodegen/qrcodegen.h" // vk-285-113: orbis_web_qr
 
 #include <algorithm>
@@ -26,11 +36,14 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <iterator>
 #include <ctime>
 #include <dirent.h>
 #include <mutex>
 #include <string>
 #include <sys/stat.h>
+#include <sys/param.h>
+#include <sys/mount.h> // statfs: the texture packs' free space
 #include <sys/time.h>
 #include <thread>
 #include <time.h>
@@ -60,6 +73,21 @@ int sceUserServiceGetInitialUser(int32_t* userId);
 int sceKernelConvertUtcToLocaltime(time_t utc, time_t* local, KernelTimesec* sec, uint64_t* dst_sec);
 int sceSystemServiceParamGetInt(int param, int* value);
 int sceSystemServiceHideSplashScreen(void);
+int sceKernelGetModuleList(int32_t* handles, size_t count, size_t* actual);
+int sceKernelGetModuleInfo(int32_t handle, void* info);
+int sceKernelLoadStartModule(const char* path, size_t args, const void* argp, uint32_t flags, void* opt, int* res);
+int sceKernelDlsym(int handle, const char* symbol, void** addrp);
+// 2026-10-05: where the texture packs' threads run (libkernel; orbis-shims/orbis_eeprof.cpp uses the same calls).
+int scePthreadGetaffinity(pthread_t thread, unsigned long long* mask);
+int scePthreadSetaffinity(pthread_t thread, unsigned long long mask);
+int scePthreadGetprio(pthread_t thread, int* prio);
+int sceKernelGetCurrentCpu(void);
+#ifdef PS5SX2_IME_IMPORT
+int sceImeDialogInit(void* param, void* extended);
+int sceImeDialogGetStatus(void);
+int sceImeDialogGetResult(void* result);
+int sceImeDialogTerm(void);
+#endif
 
 // libSceNet, libSceSsl and libSceHttp2 as the payload SDK's http2_get sample declares them. The
 // system loads all three into every app already, so linking them adds nothing at start-up.
@@ -132,6 +160,10 @@ FE_INCBIN_ASSET(fe_web_x, "web/x-twitter.svg");
 FE_INCBIN_ASSET(fe_presets, "presets.ini");
 extern "C" const uint8_t fe_font_brands[], fe_font_brands_end[], fe_web_page[], fe_web_page_end[], fe_web_discord[],
 	fe_web_discord_end[], fe_web_x[], fe_web_x_end[], fe_presets[], fe_presets_end[];
+
+// main-boot.cpp (2026-10-05): the folder the emulator would take a game's texture pack from (a USB drive, the settings
+// page's folder, /data), for the HD texture pack row.
+std::string OrbisTexturesGameDir(const std::string& serial, std::string& how);
 
 namespace
 {
@@ -393,6 +425,203 @@ struct Http
 	}
 };
 Http g_http;
+
+// ---- 2026-10-05 (AI-assisted): the HD texture packs' downloads (fe_texpacks.h) -----------------------------------------
+// archive.org's file list and the packs, in ranges of up to 32 MB that the manager asks for one after another, over our
+// own HTTPS (fe_https.h). The console's libSceHttp2 can't do it after the jailbreak: libSceSsl can't reach its certificate
+// store there, and with roots handed to it, it still can't follow archive.org's cross-signed chain (texnet3-5 on the
+// console). mbedTLS checks each server's chain against Mozilla's roots, and its name; texnet6 fetched the list and a whole
+// pack through the download redirect this way on the console. Needs proper testing in the app.
+struct TexHttp
+{
+	explicit TexHttp(const char* name = "pcsx2-texpacks", const char* tag = "texpacks")
+		: pool_name(name)
+		, log_tag(tag)
+	{
+	}
+	const char* pool_name; // 2026-10-08: a second client for the online patches (its own pool and log tag)
+	const char* log_tag;
+	std::mutex mutex; // the client's setup
+	int pool = -1;
+	std::unique_ptr<HttpsClient> client;
+
+	// The client, made once the console is online; null (and tried again next time) when it isn't.
+	HttpsClient* Client()
+	{
+		std::lock_guard<std::mutex> lock(mutex);
+		if (client)
+			return client.get();
+		// NetCtl stays up once started (the covers and DEV9's DNS lookup use it too): no sceNetCtlTerm here.
+		(void)sceNetCtlInit();
+		int state[4] = {-1, 0, 0, 0};
+		const int gs = sceNetCtlGetState(state);
+		if (gs == 0 && state[0] >= 0 && state[0] < 3)
+		{
+			std::printf("[%s] the console is not connected (netctl state %d)\n", log_tag, state[0]);
+			std::fflush(stdout);
+			return nullptr;
+		}
+		sceNetInit();
+		if (pool < 0)
+			pool = sceNetPoolCreate(pool_name, 64 * 1024, 0);
+		if (pool < 0)
+		{
+			std::printf("[%s] no libnet pool (%#x)\n", log_tag, static_cast<unsigned>(pool));
+			std::fflush(stdout);
+			return nullptr;
+		}
+		const char* const tag = log_tag;
+		auto made = std::make_unique<HttpsClient>(MakeConsoleHttpsPlatform(pool, [tag](const std::string& line) {
+			std::printf("[%s] %s\n", tag, line.c_str());
+			std::fflush(stdout);
+		}));
+		std::string error;
+		if (!made->Init(error))
+			return nullptr; // the client said why
+		client = std::move(made);
+		return client.get();
+	}
+
+	void Term()
+	{
+		std::lock_guard<std::mutex> lock(mutex);
+		client.reset();
+		if (pool >= 0)
+			sceNetPoolDestroy(pool);
+		pool = -1;
+	}
+
+	// Fails the request in flight (another thread: Cancel, the shelf's end).
+	void Abort()
+	{
+		std::lock_guard<std::mutex> lock(mutex);
+		if (client)
+			client->Abort();
+	}
+
+	// One GET: the whole answer (ranged false) or bytes [offset, offset + length). The HTTP status, or < 0 (-3: the
+	// server ignored a range after the file's start, and nothing was delivered).
+	int Get(const std::string& url, bool ranged, uint64_t offset, uint64_t length, const std::function<bool(const void*, size_t)>& sink)
+	{
+		HttpsClient* c = Client();
+		if (!c)
+			return -1;
+		// A 32 MB range: 15 minutes at most; the list: a minute.
+		return c->Get(url, ranged, offset, length, sink, ranged ? 900 * 1000 : 60 * 1000);
+	}
+};
+TexHttp g_texhttp;
+TexHttp g_patchhttp("pcsx2-patches", "patches"); // 2026-10-08: the online patches' own client (fe_patchdl.h)
+TexHttp g_coverhttp("pcsx2-covers", "covers");   // 2026-10-10: the shelf's cover downloads (CoverGet)
+
+// 2026-10-10 (AI-assisted): the shelf's cover downloads, after the jailbreak, over our own HTTPS. libSceHttp2 fails there
+// (0x8095F00C; texnet6 fetched raw.githubusercontent.com with this client on the console), so the shelf's first download
+// failed, the network counted as down for the session, and NFS and USB games waited for the prefetch before the
+// jailbreak: 30 s a start, about 85 covers. Needs proper testing on the console.
+int CoverGet(const std::string& url, std::vector<uint8_t>& out)
+{
+	HttpsClient* c = g_coverhttp.Client();
+	if (!c)
+		return -1;
+	out.clear();
+	return c->Get(url, false, 0, 0, [&out](const void* p, size_t n) {
+		const uint8_t* b = static_cast<const uint8_t*>(p);
+		out.insert(out.end(), b, b + n);
+		return out.size() <= (16u << 20);
+	}, 20 * 1000);
+}
+
+// The free space of a folder's disk for the texture packs, or UINT64_MAX when the console won't say (the manager then
+// skips its room check; a full disk still fails the writes, which it reports). Two ways crashed the app on the console:
+// statvfs (pr9f: libSceLibcInternal's jumps through a libkernel import an app doesn't get; klog: SIGSEGV at an address
+// with nothing there) and the SDK libc's statfs stub (pr9g: a system call from outside libkernel; no report at all).
+// This asks libkernel's own _fstatfs, looked up by name in the loaded modules as orbis-shims/ProsperoKbdMouse.cpp does,
+// so a console without it gets a null and an "unknown", never a jump to nowhere. Needs testing on the console.
+// Where a thread runs: "cpu N, priority P, cpus MASK".
+std::string ThreadPlace()
+{
+	unsigned long long mask = 0;
+	int prio = -1;
+	const int got = scePthreadGetaffinity(pthread_self(), &mask);
+	scePthreadGetprio(pthread_self(), &prio);
+	char buf[96];
+	std::snprintf(buf, sizeof(buf), "cpu %d, priority %d, cpus %s%llx", sceKernelGetCurrentCpu(), prio, got == 0 ? "0x" : "? ", mask);
+	return buf;
+}
+
+// The start of each texture-pack thread (TexturePackPlatform::thread_start). A thread takes the CPUs of the thread that
+// made it, and the console's first unpack ran some 25 times slower than the same work in a payload (pr9h: 13,200 files
+// in over 30 minutes; a payload wrote about 190 files a second): if the shelf's thread is held to one CPU, the
+// texture packs' threads share it with a thread that waits for every frame. So they get all 13 of the title's CPUs (0 to
+// 12, as measured for the RPCS3 port). Logged, with what the system answered. Needs testing on the console.
+void TexturePackThreadStart(const char* role)
+{
+	constexpr unsigned long long kTitleCpus = 0x1fffull;
+	unsigned long long mask = 0;
+	const std::string before = ThreadPlace();
+	std::string what;
+	if (scePthreadGetaffinity(pthread_self(), &mask) == 0 && mask != 0 && (mask & kTitleCpus) != kTitleCpus)
+	{
+		const int rc = scePthreadSetaffinity(pthread_self(), kTitleCpus);
+		char buf[64];
+		std::snprintf(buf, sizeof(buf), "; all the title's CPUs: %s", rc == 0 ? "yes" : "refused");
+		what = buf;
+		if (rc != 0)
+		{
+			std::snprintf(buf, sizeof(buf), " (%#x)", static_cast<unsigned>(rc));
+			what += buf;
+		}
+	}
+	std::printf("[texpacks] %s thread: %s%s\n", role, before.c_str(), what.c_str());
+	std::fflush(stdout);
+}
+
+uint64_t TexturePackFreeBytes(const std::string& dir)
+{
+	using FstatfsFn = int (*)(int, struct statfs*);
+	static const FstatfsFn fstatfs_fn = [] {
+		int32_t handles[256];
+		size_t count = 0;
+		FstatfsFn found = nullptr;
+		if (sceKernelGetModuleList(handles, 256, &count) == 0)
+		{
+			for (size_t i = 0; i < count && i < 256 && !found; i++)
+			{
+				void* address = nullptr;
+				if (sceKernelDlsym(handles[i], "_fstatfs", &address) == 0 && address)
+					found = reinterpret_cast<FstatfsFn>(address);
+			}
+		}
+		std::printf("[texpacks] free space: %s\n", found ? "libkernel's _fstatfs" : "no _fstatfs in this process (no room check)");
+		std::fflush(stdout);
+		return found;
+	}();
+	if (!fstatfs_fn)
+		return UINT64_MAX;
+	const int fd = open(dir.c_str(), O_RDONLY);
+	if (fd < 0)
+		return UINT64_MAX;
+	// Room to spare in case the kernel's struct is bigger than the header's.
+	union
+	{
+		struct statfs s;
+		char room[sizeof(struct statfs) + 1024];
+	} v;
+	std::memset(&v, 0, sizeof(v));
+	const int rc = fstatfs_fn(fd, &v.s);
+	close(fd);
+	if (rc != 0 || v.s.f_bsize == 0 || v.s.f_bavail < 0)
+		return UINT64_MAX;
+	const uint64_t bytes = static_cast<uint64_t>(v.s.f_bavail) * v.s.f_bsize;
+	static std::atomic<bool> said{false};
+	if (!said.exchange(true))
+	{
+		std::printf("[texpacks] free space in %s: %llu MB\n", dir.c_str(), static_cast<unsigned long long>(bytes >> 20));
+		std::fflush(stdout);
+	}
+	return bytes;
+}
+
 
 // ---- The display ----
 struct Display
@@ -660,19 +889,20 @@ int CountImages(const std::string& dir)
 
 bool OnUsb(const std::string& path)
 {
-	return path.compare(0, 8, "/mnt/usb") == 0;
+	return path.compare(0, 8, "/mnt/usb") == 0 || path.compare(0, 8, "/mnt/ext") == 0; // 2026-10-08: and the ext/M.2 drives
 }
 
 // cache/usb-games.txt, one "<serial>\t<stem>\t<title>" line per USB game: before the jailbreak,
 // where covers download, the app may not see the drives, so the covers of the games found on them
-// after the jailbreak are fetched at the next start from this list.
+// after the jailbreak are fetched at the next start from this list. vk-285-156: NFS shares' games too
+// (mounted only after the jailbreak; testers: their covers never came).
 void WriteUsbList(const std::string& path, const std::vector<GameInfo>& games)
 {
 	if (path.empty())
 		return;
 	std::string text;
 	for (const GameInfo& g : games)
-		if (OnUsb(g.path) && !g.serial.empty())
+		if ((OnUsb(g.path) || OnNetworkShare(g.path)) && !g.serial.empty())
 			text += g.serial + "\t" + g.stem + "\t" + g.title + "\n";
 	std::string old;
 	if (FILE* f = std::fopen(path.c_str(), "rb"))
@@ -726,19 +956,272 @@ int AddUsbListGames(const std::string& path, std::vector<GameInfo>& games)
 }
 } // namespace
 
+// 2026-10-05 (AI-assisted): the PS5's own keyboard for the account panel (libSceImeDialog), swordpdf: "use the shell
+// keyboard". The parameter block is the PS4 SDK's SceImeDialogParam as shadPS4's reimplementation lays it out (96 bytes);
+// its checks there: a password needs the BasicLatin type, the reserved bytes must be zero, the position is in 1920x1080.
+// This process may not load the library itself: firmware 11.40 refuses libSceNotification, libSceKeyboard and libSceMouse
+// with 0x80020063. So the library is used when it is already in the process (the list of loaded modules is logged once,
+// to boot.log), or when the load is allowed; otherwise TextEntryService::open fails and the panel shows its own keyboard.
+// With PS5SX2_IME_IMPORT the functions are imported instead (the system loads the library at the app's start, if it will):
+// an experiment, since an app whose import is refused doesn't start.
+namespace
+{
+struct ImeDialogParam
+{
+	int32_t user_id;
+	uint32_t type; // 0 default, 1 basic latin, 2 URL, 3 mail, 4 number
+	uint64_t supported_languages;
+	uint32_t enter_label;
+	uint32_t input_method;
+	void* filter;
+	uint32_t option;
+	uint32_t max_text_length;
+	char16_t* input_text_buffer;
+	float posx, posy;
+	uint32_t horizontal_alignment, vertical_alignment; // 0 left/top, 1 centre, 2 right/bottom
+	const char16_t* placeholder;
+	const char16_t* title;
+	int8_t reserved[16];
+};
+static_assert(sizeof(ImeDialogParam) == 96, "SceImeDialogParam is 96 bytes");
+struct ImeDialogResult
+{
+	uint32_t end_status; // 0 OK, 1 cancelled, 2 aborted
+	// The SDKs disagree on the size of what follows (12 bytes, or shadPS4's 12 ints); room for either, so a library
+	// that writes all of it can't write past this on the stack.
+	int32_t reserved[16];
+};
+constexpr uint32_t kImeTypeBasicLatin = 1;
+constexpr uint32_t kImeOptionNoAutoCapitalization = 0x2, kImeOptionPassword = 0x4, kImeOptionNoLearning = 0x20;
+using ImeInitFn = int (*)(ImeDialogParam*, void*);
+using ImeStatusFn = int (*)();
+using ImeResultFn = int (*)(ImeDialogResult*);
+using ImeTermFn = int (*)();
+
+struct SystemKeyboard
+{
+	bool tried = false;
+	ImeInitFn init = nullptr;
+	ImeStatusFn status = nullptr;
+	ImeResultFn result = nullptr;
+	ImeTermFn term = nullptr;
+	bool running = false;
+	int32_t user = -1;
+	char16_t buffer[512 + 1] = {};
+	char16_t title[96] = {};
+};
+SystemKeyboard g_ime;
+
+std::u16string Utf8To16(const std::string& s)
+{
+	std::u16string out;
+	for (size_t i = 0; i < s.size();)
+	{
+		const unsigned char c = static_cast<unsigned char>(s[i]);
+		uint32_t cp = c;
+		size_t n = 1;
+		if (c >= 0xF0 && i + 3 < s.size())
+			cp = ((c & 0x07u) << 18) | ((s[i + 1] & 0x3Fu) << 12) | ((s[i + 2] & 0x3Fu) << 6) | (s[i + 3] & 0x3Fu), n = 4;
+		else if (c >= 0xE0 && i + 2 < s.size())
+			cp = ((c & 0x0Fu) << 12) | ((s[i + 1] & 0x3Fu) << 6) | (s[i + 2] & 0x3Fu), n = 3;
+		else if (c >= 0xC0 && i + 1 < s.size())
+			cp = ((c & 0x1Fu) << 6) | (s[i + 1] & 0x3Fu), n = 2;
+		i += n;
+		if (cp >= 0x10000)
+		{
+			cp -= 0x10000;
+			out += static_cast<char16_t>(0xD800 + (cp >> 10));
+			out += static_cast<char16_t>(0xDC00 + (cp & 0x3FF));
+		}
+		else
+			out += static_cast<char16_t>(cp);
+	}
+	return out;
+}
+
+std::string Utf16To8(const char16_t* s)
+{
+	std::string out;
+	for (size_t i = 0; s[i]; i++)
+	{
+		uint32_t cp = s[i];
+		if (cp >= 0xD800 && cp < 0xDC00 && s[i + 1] >= 0xDC00 && s[i + 1] < 0xE000)
+			cp = 0x10000 + ((cp - 0xD800) << 10) + (s[++i] - 0xDC00);
+		if (cp < 0x80)
+			out += static_cast<char>(cp);
+		else if (cp < 0x800)
+			out += static_cast<char>(0xC0 | (cp >> 6)), out += static_cast<char>(0x80 | (cp & 0x3F));
+		else if (cp < 0x10000)
+			out += static_cast<char>(0xE0 | (cp >> 12)), out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F)),
+				out += static_cast<char>(0x80 | (cp & 0x3F));
+		else
+			out += static_cast<char>(0xF0 | (cp >> 18)), out += static_cast<char>(0x80 | ((cp >> 12) & 0x3F)),
+				out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F)), out += static_cast<char>(0x80 | (cp & 0x3F));
+	}
+	return out;
+}
+
+// The modules in this process, by name (logged once), and the handle of `want` among them (-1 if absent).
+int LoadedModule(const char* want)
+{
+	struct ModuleInfo
+	{
+		uint64_t size;
+		char name[256];
+		struct
+		{
+			uint64_t address;
+			uint32_t size;
+			int32_t prot;
+		} segments[4];
+		uint32_t num_segments;
+		uint8_t fingerprint[20];
+	};
+	int32_t handles[256];
+	size_t count = 0;
+	const int rc = sceKernelGetModuleList(handles, 256, &count);
+	static bool s_logged = false;
+	std::string names;
+	int found = -1;
+	for (size_t i = 0; rc == 0 && i < count && i < 256; i++)
+	{
+		ModuleInfo info = {};
+		info.size = sizeof(info);
+		if (sceKernelGetModuleInfo(handles[i], &info) != 0)
+			continue;
+		info.name[sizeof(info.name) - 1] = '\0';
+		if (!names.empty())
+			names += ' ';
+		names += info.name;
+		if (std::strcmp(info.name, want) == 0)
+			found = handles[i];
+	}
+	if (!s_logged)
+	{
+		s_logged = true;
+		std::printf("[ime] modules in this process (list rc %#x, %zu): %s\n", static_cast<unsigned>(rc), count, names.c_str());
+	}
+	return found;
+}
+
+bool SystemKeyboardReady()
+{
+	SystemKeyboard& k = g_ime;
+	if (k.tried)
+		return k.init != nullptr;
+	k.tried = true;
+#ifdef PS5SX2_IME_IMPORT
+	k.init = reinterpret_cast<ImeInitFn>(&sceImeDialogInit);
+	k.status = reinterpret_cast<ImeStatusFn>(&sceImeDialogGetStatus);
+	k.result = reinterpret_cast<ImeResultFn>(&sceImeDialogGetResult);
+	k.term = reinterpret_cast<ImeTermFn>(&sceImeDialogTerm);
+	std::printf("[ime] libSceImeDialog imported at start\n");
+#else
+	int module = LoadedModule("libSceImeDialog.sprx");
+	if (module >= 0)
+		std::printf("[ime] libSceImeDialog is already loaded (%#x)\n", static_cast<unsigned>(module));
+	else
+	{
+		int res = 0;
+		module = sceKernelLoadStartModule("/system/common/lib/libSceImeDialog.sprx", 0, nullptr, 0, nullptr, &res);
+		std::printf("[ime] /system/common/lib/libSceImeDialog.sprx: load %#x (start result %d)\n", static_cast<unsigned>(module), res);
+	}
+	if (module >= 0)
+	{
+		void* a[4] = {};
+		const char* const names[4] = {"sceImeDialogInit", "sceImeDialogGetStatus", "sceImeDialogGetResult", "sceImeDialogTerm"};
+		bool ok = true;
+		for (int i = 0; i < 4; i++)
+			ok = sceKernelDlsym(module, names[i], &a[i]) == 0 && a[i] && ok;
+		if (ok)
+		{
+			k.init = reinterpret_cast<ImeInitFn>(a[0]);
+			k.status = reinterpret_cast<ImeStatusFn>(a[1]);
+			k.result = reinterpret_cast<ImeResultFn>(a[2]);
+			k.term = reinterpret_cast<ImeTermFn>(a[3]);
+		}
+		else
+			std::printf("[ime] libSceImeDialog: a function is missing\n");
+	}
+#endif
+	std::printf("[ime] the PS5's keyboard is %s\n", k.init ? "available" : "not available: the panel's own keyboard is used");
+	std::fflush(stdout);
+	return k.init != nullptr;
+}
+
+bool SystemKeyboardOpen(const std::string& title, const std::string& text, bool password, unsigned max_length)
+{
+	SystemKeyboard& k = g_ime;
+	if (k.running || k.user < 0 || !SystemKeyboardReady())
+		return false;
+	max_length = std::min<unsigned>(max_length, 512);
+	const std::u16string start = Utf8To16(text), t = Utf8To16(title);
+	std::fill(std::begin(k.buffer), std::end(k.buffer), u'\0');
+	std::copy_n(start.data(), std::min<size_t>(start.size(), max_length), k.buffer);
+	std::fill(std::begin(k.title), std::end(k.title), u'\0');
+	std::copy_n(t.data(), std::min<size_t>(t.size(), 95), k.title);
+	ImeDialogParam p = {};
+	p.user_id = k.user;
+	p.type = kImeTypeBasicLatin; // a password needs it, and RetroAchievements names are plain letters and digits
+	p.option = kImeOptionNoAutoCapitalization | kImeOptionNoLearning | (password ? kImeOptionPassword : 0);
+	p.max_text_length = max_length;
+	p.input_text_buffer = k.buffer;
+	p.posx = 960.0f;
+	p.posy = 300.0f;
+	p.horizontal_alignment = 1;
+	p.vertical_alignment = 1;
+	p.title = k.title;
+	const int rc = k.init(&p, nullptr);
+	std::printf("[ime] keyboard for %s: init %#x\n", password ? "the password" : "the username", static_cast<unsigned>(rc));
+	std::fflush(stdout);
+	if (rc < 0)
+		return false;
+	k.running = true;
+	return true;
+}
+
+int SystemKeyboardPoll(std::string& text)
+{
+	SystemKeyboard& k = g_ime;
+	if (!k.running)
+		return -1;
+	const int status = k.status();
+	if (status == 1)
+		return 0; // still typing
+	ImeDialogResult r = {};
+	const int rrc = status == 2 ? k.result(&r) : -1;
+	const int trc = k.term();
+	k.running = false;
+	const bool ok = status == 2 && rrc == 0 && r.end_status == 0;
+	if (ok)
+		text = Utf16To8(k.buffer);
+	std::fill(std::begin(k.buffer), std::end(k.buffer), u'\0'); // it may hold the password
+	std::printf("[ime] keyboard closed: status %d, result %#x, end %u, term %#x%s\n", status, static_cast<unsigned>(rrc), r.end_status,
+		static_cast<unsigned>(trc), ok ? ", text taken" : "");
+	std::fflush(stdout);
+	return ok ? 1 : -1;
+}
+} // namespace
+
 std::vector<std::string> orbis_usb_game_dirs(const char* when)
 {
 	std::vector<std::string> dirs;
 	int drives = 0;
-	for (int i = 0; i < 8; i++)
+	// 2026-10-08 (AI-assisted; testers: "some people want ext/usb or m2"): the PS5's extended storage and M.2 drives
+	// (/mnt/ext0, /mnt/ext1) the same way as the USB drives, after them.
+	for (int i = 0; i < 10; i++)
 	{
 		char root[16];
-		std::snprintf(root, sizeof(root), "/mnt/usb%d", i);
+		if (i < 8)
+			std::snprintf(root, sizeof(root), "/mnt/usb%d", i);
+		else
+			std::snprintf(root, sizeof(root), "/mnt/ext%d", i - 8);
+		const char* const tag = i < 8 ? "usb" : "drive";
 		DIR* d = opendir(root);
 		if (!d)
 		{
 			if (when && errno != ENOENT)
-				std::printf("[usb] %s: %s: can't open (errno %d)\n", when, root, errno);
+				std::printf("[%s] %s: %s: can't open (errno %d)\n", tag, when, root, errno);
 			continue;
 		}
 		int entries = 0, isos = 0;
@@ -785,10 +1268,10 @@ std::vector<std::string> orbis_usb_game_dirs(const char* when)
 			found += ", " + sub + "/ (" + std::to_string(n) + ")";
 		}
 		if (when)
-			std::printf("[usb] %s: %s: %d entries; disc images in %s\n", when, root, entries, found.c_str());
+			std::printf("[%s] %s: %s: %d entries; disc images in %s\n", tag, when, root, entries, found.c_str());
 	}
 	if (when && drives == 0)
-		std::printf("[usb] %s: no USB drive with files at /mnt/usb0-7\n", when);
+		std::printf("[usb] %s: no USB drive with files at /mnt/usb0-7 (nor at /mnt/ext0-1)\n", when);
 	if (when)
 		std::fflush(stdout);
 	return dirs;
@@ -1004,12 +1487,14 @@ bool orbis_web_start(const OrbisFrontendPaths& paths, const char* build_tag)
 		return true;
 	SetSerialCacheFile(paths.serial_cache); // vk-285-108
 	SetGameDbFile(paths.gamedb_file);       // vk-285-113
+	SetShareRoots(paths.share_roots);       // vk-285-156
 	WebConfig cfg;
 	cfg.game_dirs = {paths.games_dir, paths.top_dir};
 	cfg.game_dirs.insert(cfg.game_dirs.end(), paths.usb_dirs.begin(), paths.usb_dirs.end()); // test build 1
 	cfg.settings_dir = paths.settings_dir;
 	cfg.gs_ini = paths.gs_ini;
 	cfg.patches_dir = paths.patches_dir;
+	cfg.cheats_dir = paths.online_patches ? paths.cheats_dir : std::string(); // 2026-10-08
 	cfg.covers_dir = paths.covers_dir;
 	cfg.cache_dir = paths.cache_dir;
 	cfg.build_tag = build_tag ? build_tag : "";
@@ -1022,6 +1507,13 @@ bool orbis_web_start(const OrbisFrontendPaths& paths, const char* build_tag)
 	cfg.memcards_dir = paths.memcards_dir; // vk-285-113
 	cfg.report_header = paths.report_header;
 	cfg.test_build = paths.test_build;
+	cfg.current_disc = orbis_current_disc; // vk-285-139 (main-boot.cpp)
+	cfg.disc_set = orbis_disc_set;
+	cfg.change_disc = orbis_request_disc;
+#ifdef PS5SX2_ACHIEVEMENTS
+	cfg.achievements = Achievements::GetPS5GameAchievements;
+	cfg.achievement_badge = Achievements::GetPS5AchievementBadge;
+#endif
 	fe::g_utc_to_local = &SettingsLogLocalTime;
 	cfg.assets = {
 		{"/", "text/html; charset=utf-8", fe_web_page, static_cast<size_t>(fe_web_page_end - fe_web_page)},
@@ -1107,7 +1599,7 @@ int orbis_frontend_prefetch_covers(const OrbisFrontendPaths& paths, double budge
 	dirs.insert(dirs.end(), paths.usb_dirs.begin(), paths.usb_dirs.end()); // test build 1: USB drives, when visible here
 	std::vector<GameInfo> games = ScanGames(dirs);
 	for (GameInfo& g : games)
-		g.serial = ReadSerial(g.path);
+		g.serial = ReadSerial(g); // 2.02: through the serial cache, keyed by what ScanGames already has
 	// Test build 1: the USB games seen after the jailbreak last time (the drives may not be visible here).
 	const int listed = AddUsbListGames(paths.usb_list, games);
 	CoverConfig cc;
@@ -1135,24 +1627,61 @@ int orbis_frontend_prefetch_covers(const OrbisFrontendPaths& paths, double budge
 	return saved;
 }
 
+// vk-285-144: a launch asked for from outside the shelf (a disc in the drive), taken by the shelf's loop.
+static std::mutex g_launch_lock;
+static std::string g_launch_request; // under g_launch_lock
+static bool g_shelf_up = false;      // under g_launch_lock
+
+uint64_t orbis_frontend_free_bytes(const std::string& dir)
+{
+	return TexturePackFreeBytes(dir);
+}
+
+bool orbis_frontend_request_launch(const std::string& path)
+{
+	std::lock_guard<std::mutex> lock(g_launch_lock);
+	if (!g_shelf_up)
+		return false;
+	g_launch_request = path;
+	return true;
+}
+
+static std::string TakeLaunchRequest()
+{
+	std::lock_guard<std::mutex> lock(g_launch_lock);
+	std::string r;
+	r.swap(g_launch_request);
+	return r;
+}
+
+static void SetShelfUp(bool up)
+{
+	std::lock_guard<std::mutex> lock(g_launch_lock);
+	g_shelf_up = up;
+	if (!up)
+		g_launch_request.clear();
+}
+
 std::string orbis_frontend_run(const OrbisFrontendPaths& paths, const char* build_tag, bool* ran)
 {
 	*ran = false;
 	const double t0 = Now();
 	SetSerialCacheFile(paths.serial_cache); // vk-285-108
 	SetGameDbFile(paths.gamedb_file);       // vk-285-113
+	SetShareRoots(paths.share_roots);       // vk-285-156
 	std::vector<std::string> dirs = {paths.games_dir, paths.top_dir};
 	dirs.insert(dirs.end(), paths.usb_dirs.begin(), paths.usb_dirs.end()); // test build 1: USB drives
 	std::vector<GameInfo> games = ScanGames(dirs);
-	int on_usb = 0;
+	int on_usb = 0, on_nfs = 0;
 	for (GameInfo& g : games)
 	{
-		g.serial = ReadSerial(g.path);
+		g.serial = ReadSerial(g); // 2.02: through the serial cache, keyed by what ScanGames already has
 		// vk-285-113: a CHD (or an ISO) named after its file shows the game's name from the game database.
 		const std::string file_title = g.title;
 		const bool renamed = ApplyGameDbTitle(g);
 		ReadBadges(g, paths.settings_dir, paths.gs_ini, paths.patches_dir);
 		on_usb += OnUsb(g.path) ? 1 : 0;
+		on_nfs += OnNetworkShare(g.path) ? 1 : 0;
 		if (renamed)
 			std::printf("[frontend] %s: titled \"%s\" (the file name gave \"%s\")\n", g.file.c_str(), g.title.c_str(), file_title.c_str());
 		// Test build 1: the size too (a disc image of an odd size is often a bad dump), and the folder.
@@ -1164,24 +1693,26 @@ std::string orbis_frontend_run(const OrbisFrontendPaths& paths, const char* buil
 			const std::string what = DescribeImage(g.path);
 			if (!what.empty())
 				std::printf("[frontend]   chd: %s\n", what.c_str());
+			// vk-285-134: libchdr's "invalid file/data" (or a version it doesn't read) is a damaged image; a CHD that needs
+			// its parent isn't (PCSX2 finds the parent itself).
+			const std::string cant = "libchdr can't open it: ";
+			if (what.rfind(cant, 0) == 0 && what.find("parent") == std::string::npos)
+				g.damaged = what.substr(cant.size());
 		}
 	}
 	SortGames(games); // vk-285-113: by the titles the game database may have changed
-	std::printf("[frontend] %zu disc image(s), %d on USB, scanned in %.0f ms\n", games.size(), on_usb, (Now() - t0) * 1000.0);
+	std::printf("[frontend] %zu disc image(s), %d on USB, %d on NFS shares, scanned in %.0f ms\n", games.size(), on_usb, on_nfs,
+		(Now() - t0) * 1000.0);
 	std::fflush(stdout);
 	WriteUsbList(paths.usb_list, games);
-	if (games.empty())
-	{
-		*ran = true;
-		return {};
-	}
+	// Keep the shelf available without games too, for settings and account sign-in.
 	const std::string last = ReadLastGame(paths.top_dir);
 	int preselect = 0;
 	for (size_t i = 0; i < games.size(); i++)
 		if (games[i].file == last)
 			preselect = static_cast<int>(i);
 	// vk-285-69: one game opens the shelf too, not the game straight away: the shelf's QR code is how
-	// testers reach the settings page and its Download logs (Spyros, 2026-09-26).
+	// testers reach the settings page and its Download logs (swordpdf, 2026-09-26).
 
 	int32_t user = -1;
 	(void)sceUserServiceInitialize(nullptr);
@@ -1227,7 +1758,7 @@ std::string orbis_frontend_run(const OrbisFrontendPaths& paths, const char* buil
 	cc.url_template = kCoverUrl;
 	cc.allow_download = paths.allow_download;
 	cc.download_usb_only = true; // vk-285-110: the rest came from the prefetch, before the jailbreak
-	covers->Start(games, fonts, cc, [](const std::string& url, std::vector<uint8_t>& out) { return g_http.Get(url, out); });
+	covers->Start(games, fonts, cc, CoverGet); // 2026-10-10: was libSceHttp2 (g_http), which fails after the jailbreak
 
 	// The key sounds (vk-285-47). Without an audio port the shelf is simply quiet.
 	Mixer* mixer = nullptr;
@@ -1252,6 +1783,13 @@ std::string orbis_frontend_run(const OrbisFrontendPaths& paths, const char* buil
 
 	App app;
 	AppConfig acfg;
+#ifdef PS5SX2_ACHIEVEMENTS
+	acfg.achievements = OrbisAchievementsAccountService();
+	acfg.game_achievements = OrbisAchievementsBrowserService();
+	g_ime.user = user;
+	acfg.text_entry.open = SystemKeyboardOpen;
+	acfg.text_entry.poll = SystemKeyboardPoll;
+#endif
 	acfg.build_tag = build_tag ? build_tag : "";
 	acfg.test_build = paths.test_build;   // test build 1: the TESTING watermark
 	acfg.build_label = paths.build_label;
@@ -1272,6 +1810,83 @@ std::string orbis_frontend_run(const OrbisFrontendPaths& paths, const char* buil
 		g.badges.clear();
 		ReadBadges(g, paths.settings_dir, paths.gs_ini, paths.patches_dir);
 	};
+	// 2026-10-05 (AI-assisted): HD texture packs from archive.org, on the sheet's row (fe_texpacks.h). The worker runs while
+	// the shelf is up; a download left unfinished goes on at the next shelf.
+	TexturePackManager* texpacks = nullptr;
+	if (paths.texture_packs && !paths.textures_dir.empty())
+	{
+		TexturePackPlatform tp;
+		tp.get_text = [](const std::string& url, std::string& body) {
+			body.clear();
+			return g_texhttp.Get(url, false, 0, 0, [&body](const void* d, size_t n) {
+				if (body.size() + n > (8u << 20))
+					return false;
+				body.append(static_cast<const char*>(d), n);
+				return true;
+			});
+		};
+		tp.get_range = [](const std::string& url, uint64_t offset, uint64_t length, const std::function<bool(const void*, size_t)>& sink) {
+			return g_texhttp.Get(url, true, offset, length, sink);
+		};
+		tp.abort = [] { g_texhttp.Abort(); };
+		tp.free_bytes = [](const std::string& dir) { return TexturePackFreeBytes(dir); };
+		tp.thread_start = [](const char* role) { TexturePackThreadStart(role); };
+		tp.existing_pack = [](const std::string& serial) {
+			std::string how;
+			return OrbisTexturesGameDir(serial, how);
+		};
+		tp.log = [](const std::string& line) {
+			std::printf("%s\n", line.c_str());
+			std::fflush(stdout);
+		};
+		tp.notify = [](const std::string& game, bool ok, const std::string& detail) {
+			const std::string sub = detail.empty() ? game : game + " \xC2\xB7 " + detail;
+			OrbisNotifyRich(Tr(ok ? Str::HdTexturesReady : Str::HdTexturesFailed), sub.c_str(), "");
+		};
+		tp.now = [] { return Now(); };
+		const std::string textures = paths.textures_dir;
+		texpacks = new TexturePackManager(tp, textures, textures + "/.ps5sx2-downloads", paths.texture_pack_list);
+		texpacks->Start();
+		acfg.texture_packs = texpacks->Service();
+	}
+	// 2026-10-08 (AI-assisted): a game's patches and cheats from GitHub, on the sheet's "Get patches and cheats" row
+	// (fe_patchdl.h), over its own HTTPS client. One small file a source; the worker ends when it has nothing to do.
+	OnlinePatches* online = nullptr;
+	if (paths.online_patches && !paths.patches_dir.empty() && !paths.cheats_dir.empty())
+	{
+		OnlinePatchPlatform op;
+		op.get_text = [](const std::string& url, std::string& body) {
+			body.clear();
+			return g_patchhttp.Get(url, false, 0, 0, [&body](const void* d, size_t n) {
+				if (body.size() + n > (2u << 20))
+					return false;
+				body.append(static_cast<const char*>(d), n);
+				return true;
+			});
+		};
+		op.log = [](const std::string& line) {
+			std::printf("%s\n", line.c_str());
+			std::fflush(stdout);
+		};
+		op.thread_start = [] { TexturePackThreadStart("online patches"); };
+		online = new OnlinePatches(op, paths.patches_dir, paths.cheats_dir, paths.online_patch_manifest);
+		acfg.online_patches = online->Service();
+		acfg.options.cheats_dir = paths.cheats_dir;
+	}
+	acfg.system_menu = true; // 2026-10-08: the sheet for all games offers the PS2 system menu (main-boot.cpp boots it)
+	// vk-285-135: the places the sheet's folder picker starts from (those that are folders when it opens).
+	acfg.folder_places = {{"PS5SX2's folder", "/data/PCSX2"}};
+	for (int i = 0; i < 8; i++)
+		acfg.folder_places.push_back({"USB drive " + std::to_string(i + 1), "/mnt/usb" + std::to_string(i)});
+	acfg.folder_places.push_back({"Extended storage", "/mnt/ext0"});
+	acfg.folder_places.push_back({"Extended storage 2", "/mnt/ext1"});
+	acfg.folder_places.push_back({"NFS shares", "/nfs"}); // OrbisNfs.cpp: a folder while shares are set
+	acfg.bios_present = paths.bios_check; // vk-285-134
+	acfg.bios_problem = paths.bios_problem;
+	acfg.bios_dir = paths.bios_dir;
+	// live-22 (AI-assisted): while a PS2 disc is being copied (orbis-shims/ProsperoDiscDump.cpp), the shelf shows a
+	// spinning-disc entry with the live percentage, read from this file (the same path the dumper writes).
+	acfg.disc_dump_progress = OrbisLogPath("disc-dump-progress.txt");
 	bool ok = app.Init(&renderer, fonts, games, covers, acfg);
 	std::printf("[frontend] up in %.0f ms (%s)\n", (Now() - t0) * 1000.0, ok ? "ok" : renderer.error().c_str());
 	std::fflush(stdout);
@@ -1286,14 +1901,24 @@ std::string orbis_frontend_run(const OrbisFrontendPaths& paths, const char* buil
 		app.SetWebUrl(url, shown);
 	};
 
+	std::printf("[frontend] shelf thread: %s\n", ThreadPlace().c_str()); // 2026-10-05: see TexturePackThreadStart
 	FrameDesc frame;
 	double last_t = Now(), report_t = last_t;
 	unsigned frames = 0, slot = 0;
 	double worst = 0;
 	bool first_shown = false;
+	std::string launch_path; // vk-285-144: a disc's game, asked for from outside
+	SetShelfUp(ok);
 	while (ok && !app.Done())
 	{
 		const double now = Now();
+		launch_path = TakeLaunchRequest();
+		if (!launch_path.empty())
+		{
+			std::printf("[frontend] launch asked for from outside the shelf: %s\n", launch_path.c_str());
+			std::fflush(stdout);
+			break;
+		}
 		refresh_web(now);
 		const double dt = now - last_t;
 		last_t = now;
@@ -1368,22 +1993,61 @@ std::string orbis_frontend_run(const OrbisFrontendPaths& paths, const char* buil
 		}
 		if (now - report_t >= 5.0)
 		{
-			std::printf("[frontend] %u frames in %.1f s, worst %.1f ms\n", frames, now - report_t, worst * 1000.0);
-			std::fflush(stdout);
+			// 2026-10-05: not while a texture pack is being unpacked, installed or removed: its thousands of files keep the
+			// disk busy, and this write from the menu's thread then waited for the file system's commits (frames of up to
+			// 0.95 s during pr9h's unpack, in a pattern that followed a ~20 s commit cycle).
+			bool disk_busy = false;
+			if (texpacks)
+			{
+				const TexturePackActivity a = texpacks->Activity();
+				disk_busy = a.active && (a.state == TexturePackStatus::State::Unpacking || a.state == TexturePackStatus::State::Installing ||
+											a.state == TexturePackStatus::State::Removing);
+			}
+			if (!disk_busy)
+			{
+				std::printf("[frontend] %u frames in %.1f s, worst %.1f ms\n", frames, now - report_t, worst * 1000.0);
+				std::fflush(stdout);
+			}
 			frames = 0;
 			worst = 0;
 			report_t = now;
 		}
 	}
 
+	SetShelfUp(false);
 	const int chosen = app.Chosen();
-	const bool picked = ok && app.Done();
+	const bool picked = ok && (app.Done() || !launch_path.empty());
+	const bool system_menu = app.SystemMenuChosen(); // 2026-10-08
 	renderer.WaitIdle();
 	app.Shutdown();
 	// The worker may be inside a download: stop it from starting another, fail the one in flight,
 	// give it a moment, then leave it behind if need be.
 	covers->RequestStop();
 	g_http.Abort();
+	g_coverhttp.Abort(); // 2026-10-10
+	// 2026-10-05: the texture packs stop with the shelf: a download keeps its part for the next one.
+	if (texpacks)
+	{
+		if (texpacks->Stop(1500))
+		{
+			delete texpacks;
+			g_texhttp.Term();
+		}
+		else
+			std::printf("[frontend] a texture pack job is still stopping; leaving it to end on its own\n");
+	}
+	// 2026-10-08: the online patches stop with the shelf (a request in flight is failed; the job is asked again later).
+	if (online)
+	{
+		g_patchhttp.Abort();
+		if (online->Stop(1500))
+		{
+			delete online;
+			g_patchhttp.Term();
+		}
+		else
+			std::printf("[frontend] an online patch request is still stopping; leaving it to end on its own\n");
+	}
 	const bool stopped = covers->Stop(1500);
 	renderer.Shutdown();
 	display->Destroy();
@@ -1393,6 +2057,7 @@ std::string orbis_frontend_run(const OrbisFrontendPaths& paths, const char* buil
 		delete covers;
 		delete fonts;
 		g_http.Term();
+		g_coverhttp.Term(); // 2026-10-10
 	}
 	else
 		std::printf("[frontend] a cover download is still running; leaving it to finish\n");
@@ -1415,6 +2080,21 @@ std::string orbis_frontend_run(const OrbisFrontendPaths& paths, const char* buil
 		return {};
 	}
 	*ran = true;
+	if (!launch_path.empty())
+	{
+		const size_t slash = launch_path.rfind('/');
+		WriteLastGame(paths.top_dir, slash == std::string::npos ? launch_path : launch_path.substr(slash + 1));
+		std::printf("[frontend] started %s (a disc in the drive)\n", launch_path.c_str());
+		std::fflush(stdout);
+		return launch_path;
+	}
+	if (system_menu)
+	{
+		// 2026-10-08: the PS2's own menu, no disc (main-boot.cpp boots the BIOS for kOrbisSystemMenuPath). The last game stays.
+		std::printf("[frontend] picked the PS2 system menu (no disc)\n");
+		std::fflush(stdout);
+		return kOrbisSystemMenuPath;
+	}
 	const GameInfo& g = games[static_cast<size_t>(chosen)];
 	WriteLastGame(paths.top_dir, g.file);
 	std::printf("[frontend] picked %s (%s)\n", g.file.c_str(), g.serial.c_str());

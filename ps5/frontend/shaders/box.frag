@@ -2,7 +2,7 @@
 #extension GL_GOOGLE_include_directive : require
 // PS5 port frontend: a PS2 case: the cover under a glossy sleeve on the front, the spine on the
 // left, black plastic elsewhere. Reflections (p0.z = 1) fade out below the floor.
-// Copyright (C) 2026 Spyros
+// Copyright (C) 2026 swordpdf
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "common.glsl"
 

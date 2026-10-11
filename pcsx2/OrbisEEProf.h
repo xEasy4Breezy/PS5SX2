@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: 2026 Spyros
+// SPDX-FileCopyrightText: 2026 swordpdf
 // SPDX-License-Identifier: GPL-3.0+
 
 // PS5 port, Vulkan build (vk-285-8): what the EE profiler (the port's orbis_eeprof.cpp) needs

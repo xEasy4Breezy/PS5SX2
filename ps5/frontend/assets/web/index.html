@@ -9,7 +9,7 @@
 <!--
   PS5SX2's settings page (vk-285-50; Recommended button vk-285-51), served by the console itself
   (frontend/fe_web.cpp).
-  Copyright (C) 2026 Spyros. SPDX-License-Identifier: GPL-3.0-or-later.
+  Copyright (C) 2026 swordpdf. SPDX-License-Identifier: GPL-3.0-or-later.
   The Discord and X icons are Font Awesome Free 7.3.1 (CC BY 4.0, https://fontawesome.com);
   the logos are their owners' trademarks and only point to the author's accounts.
 -->
@@ -57,6 +57,10 @@ header { display: flex; align-items: flex-start; justify-content: space-between;
 .icon.x { --src: url("/icons/x-twitter.svg"); width: 13px; }
 .clock { font-size: 22px; color: var(--dim); padding-top: 3px; font-variant-numeric: tabular-nums; }
 
+/* vk-285-139: Now playing's disc row */
+.discrow { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; align-items: center; }
+.discrow .pick { max-width: 100%; flex: 1 1 220px; }
+.discrow.hide { display: none; }
 /* Now playing */
 .now { margin-top: 22px; display: none; align-items: center; gap: 14px; padding: 12px; border-radius: 16px;
        background: var(--card); border: 1px solid var(--card-line); }
@@ -145,7 +149,7 @@ header { display: flex; align-items: flex-start; justify-content: space-between;
 .recbtn:disabled { background: none; color: #5cf2a0; box-shadow: none; cursor: default; padding: 9px 4px 9px 8px; }
 .file { text-align: center; color: var(--faint); font-size: 12px; margin-top: 12px; }
 /* vk-285-116: the Settings and Controls tabs, a group's line under its title, a list row (the remapping). */
-.tabs { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; max-width: 340px; margin: 14px auto 0; padding: 4px;
+.tabs { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 4px; max-width: 480px; margin: 14px auto 0; padding: 4px;
         border-radius: 99px; background: rgba(255,255,255,0.06); border: 1px solid var(--card-line); }
 .tabs button { border: 0; border-radius: 99px; padding: 8px 10px; font: inherit; font-size: 14px; font-weight: 700; cursor: pointer;
                background: none; color: var(--dim); transition: background 0.15s, color 0.15s, box-shadow 0.15s; }
@@ -202,6 +206,19 @@ footer a { color: var(--dim); }
   .wordmark { font-size: 36px; }
 }
 @media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
+/* Runtime achievement cards (AI-assisted). */
+.achievement-summary { padding: 18px; color: #5cf2a0; }
+.achievement-row { display: flex; gap: 16px; padding: 16px; margin-top: 10px; }
+.achievement-icon { width: 72px; height: 72px; flex: 0 0 72px; position: relative; background: rgba(255,255,255,0.08); border-radius: 10px; overflow: hidden; }
+.achievement-icon span { position: absolute; inset: 0; display: grid; place-items: center; color: var(--faint); }
+.achievement-icon img { position: absolute; width: 100%; height: 100%; object-fit: contain; opacity: 0; }
+.achievement-icon img.ready { opacity: 1; }
+.achievement-copy { min-width: 0; }
+.achievement-name { font-weight: 700; overflow-wrap: anywhere; }
+.achievement-status { color: var(--dim); font-size: 13px; margin-top: 8px; }
+.achievement-status.earned { color: #5cf2a0; }
+.btn.active-filter { color: #5cf2a0; border-color: #5cf2a0; }
+@media (max-width: 400px) { .tabs button { font-size: 12px; padding: 8px 4px; } }
 </style>
 </head>
 <body>
@@ -226,6 +243,7 @@ footer a { color: var(--dim); }
         <div class="k"><span class="dot"></span>Now playing</div>
         <div class="t" id="nowtitle"></div>
         <div class="s">Changes to its settings apply live.</div>
+        <div class="discrow hide" id="discrow"><select class="pick" id="discpick" aria-label="Disc"></select><button class="btn" id="discbtn">Put this disc in</button></div>
       </div>
     </div>
 
@@ -233,7 +251,7 @@ footer a { color: var(--dim); }
     <div class="gametitle" id="gtitle"></div>
     <div class="gameinfo" id="ginfo"></div>
     <button class="all" id="allgames">Settings for all games</button>
-    <div class="tabs" id="tabs"><button data-tab="settings">Settings</button><button data-tab="controls">Controls</button></div>
+    <div class="tabs" id="tabs"><button data-tab="settings">Settings</button><button data-tab="controls">Controls</button><button data-tab="achievements">Achievements</button></div>
 
     <div id="settings"></div>
     <div class="file" id="file"></div>
@@ -253,7 +271,7 @@ footer a { color: var(--dim); }
   </main>
 
   <footer>
-    <div><b style="color:var(--dim)">PS5SX2</b> · PCSX2 for jailbroken PS5 · by Spyros · <span id="build"></span></div>
+    <div><b style="color:var(--dim)">PS5SX2</b> · PCSX2 for jailbroken PS5 · by swordpdf · <span id="build"></span></div>
     <div>Based on PCSX2 (GPL-3.0-or-later). Not affiliated with or endorsed by the PCSX2 team or Sony Interactive Entertainment.</div>
     <div>Icons: Font Awesome Free (CC BY 4.0). Covers: xlenore/ps2-covers.</div>
   </footer>
@@ -267,6 +285,10 @@ footer a { color: var(--dim); }
 const CROP_PX = [["0","Off"],["2","2 px"],["4","4 px"],["6","6 px"],["8","8 px"],["10","10 px"],["12","12 px"],["16","16 px"],
                  ["24","24 px"],["32","32 px"]];
 const CROP_HINT = "Cuts this many PS2 pixels off this side of the picture, for games with garbage at a border (Shadow of the Colossus). The picture keeps its proportions.";
+// 2026-10-08 (AI-assisted): PCSX2's texture offsets, in thousandths of a texel, as the sheet's TexOffsetChoices().
+const TC_OFFSETS = [["0","Off"],["100","100"],["200","200"],["250","250"],["300","300"],["400","400"],["500","500"],["525","525"],
+                    ["550","550"],["600","600"],["700","700"],["750","750"],["800","800"],["900","900"],["1000","1000"]];
+const TC_HINT = "Moves where textures are read from, in thousandths of a texel (500 is half a texel): for lines or stray pixels at the edges of textures when upscaled. A tester's Kingdom Hearts fix: X 525, Y 0.";
 // vk-285-116 (AI-assisted): what a controller button can press in games (ps5/coreorbis/orbis-shims/OrbisPadMap.h's names),
 // as the sheet's ButtonChoices() (frontend/fe_options.cpp). Applied while the game runs.
 const BUTTON_TARGETS = [["Cross","Cross"],["Circle","Circle"],["Square","Square"],["Triangle","Triangle"],["L1","L1"],["R1","R1"],
@@ -287,33 +309,65 @@ const COMBO_BUTTONS = [["L3R3","L3 + R3"],["Cross","Cross"],["Circle","Circle"],
 // A save or load combo: two lists in one row on this page ("pair": the row's name; the sheet has a row for each button).
 const combo = (key, label, def, pair) => ({ key: "PS5SX2/" + key, label, type: "pick", def, options: COMBO_BUTTONS, pair });
 const GROUPS = [
+  // 2026-10-08 (AI-assisted; testers: "have users select their bios and games scan path ... ext/usb or m2"): where the shelf
+  // finds games and the BIOS besides /data/PCSX2 and the drives it looks through by itself (USB 0-7, extended storage and
+  // M.2: /mnt/ext0, /mnt/ext1). For all games only (main-boot.cpp reads gs.ini when PS5SX2 starts). vk-285-135b: the Settings
+  // tab's first group, as on the shelf's sheet (swordpdf looked for them at the bottom); the sheet picks these folders with its
+  // own picker (fe_app.cpp), the overlays folder is typed here only.
+  { title: "Folders", global: true, items: [
+    { key: "PS5SX2/GameFolders", label: "More game folders", type: "text", def: "", restart: true, later: "the game folders",
+      placeholder: "/mnt/ext1/PS2;/mnt/usb0/My games",
+      hint: "Folders to list games from, separated by ; (and the folders inside each, one level down). PS5SX2 already looks in /data/PCSX2/games, /data/PCSX2 and every USB, extended storage and M.2 drive (their root, games/, PS2/... and PCSX2/games/). Read when PS5SX2 starts." },
+    // 2026-10-08: the overlay pictures' folder (PS5SX2/Bezel), read live.
+    { key: "PS5SX2/BezelDir", label: "Overlays folder", type: "text", def: "", placeholder: "/mnt/usb0/PS2/overlays",
+      hint: "Optional: where the overlay pictures are looked for first (<game serial>.png, default.png), before /data/PCSX2/overlays." },
+    // vk-285-135 (AI-assisted; testers: "nfs mounting"): games on a PC or NAS share (orbis-shims/OrbisNfs.cpp), mounted
+    // when PS5SX2 starts; each share's games are listed like a drive's.
+    { key: "PS5SX2/NfsShares", label: "NFS shares", type: "text", def: "", restart: true, later: "the NFS shares",
+      placeholder: "nfs://192.168.1.10/volume1/PS2",
+      hint: "Games on a PC or NAS shared over NFS: nfs:// addresses separated by ; (the server, then the shared folder or a folder in it). NFS v3 (Windows: WinNFSd or haneWIN; Linux, Synology, QNAP, TrueNAS), else v4. Add ?version=4, ?nfsport=2049&mountport=1058 or ?uid=1000&gid=1000 when the server needs them. Read-only. Mounted when PS5SX2 starts; boot.log says how it went." },
+    { key: "PS5SX2/BiosFolder", label: "BIOS folder", type: "text", def: "", restart: true, later: "the BIOS folder",
+      placeholder: "/mnt/ext1/PS2/bios",
+      hint: "Where to look for the BIOS first. Without it: /data/PCSX2/bios, then /data/PCSX2 and the drives' bios/ and PCSX2/bios/ folders. Read when PS5SX2 starts." },
+  ]},
+  // vk-285-137 (AI-assisted; swordpdf: "add an option to hide games from the shelf"): a game off the shelf (its own file only;
+  // fe_games.cpp ReadBadges), and the switch for all games that puts hidden games back on it, dimmed. The sheet has the
+  // same two groups (fe_options.cpp); from here they apply the next time the shelf opens.
+  { title: "Shelf", game: true, items: [
+    { key: "PS5SX2/HideGame", label: "Hide from the shelf", type: "toggle", def: "false", short: "Hidden %",
+      hint: "Takes this game off the shelf. Show hidden games (All games) puts hidden games back on the shelf, dimmed, to turn this off again. Set here, it applies the next time the shelf opens; on the shelf's own sheet, when the sheet closes." },
+  ]},
+  { title: "Shelf", global: true, items: [
+    { key: "PS5SX2/ShowHiddenGames", label: "Show hidden games", type: "toggle", def: "false", short: "Hidden games %",
+      hint: "Puts the games hidden from the shelf back on it, dimmed, so you can open one and turn Hide from the shelf off. Set here, it applies the next time the shelf opens." },
+  ]},
+  // vk-285-139: games start from the cheat disc (a GameShark: picked under it, all games), the game's own discs after it.
+  { title: "Discs", items: [
+    { key: "PS5SX2/CheatDiscStart", label: "Start from the cheat disc", type: "toggle", def: "false", short: "Cheat disc %", restart: true, later: "the cheat disc",
+      hint: "Starts the game from the cheat disc (a GameShark, say: Cheat disc, in the settings for all games), as disc 1, with the game's own discs after it. When it asks for the game's disc, hold the change disc buttons (Controls; L3 + R3 + D-pad right by default) or pick the disc under Now playing. Its codes stay on the memory card." },
+  ]},
   { title: "Display", items: [
     { key: "upscale_multiplier", label: "Resolution", type: "seg", def: "1", short: "%",
-      options: [["1","1x"],["2","2x"],["3","3x"],["4","4x"],["5","5x"],["6","6x"]],
-      hint: "Internal resolution. 6x is about 4K." },
+      options: [["1","1x"],["2","2x"],["3","3x"],["4","4x"],["5","5x"],["6","6x"],["8","8x (PS5 Pro)"]],
+      hint: "Internal resolution. 6x is about 4K; 8x draws more than the screen shows (about 5K, made smaller to fit): sharpest, and the heaviest on the GPU." },
     { key: "AspectRatio", label: "Aspect ratio", type: "seg", def: "Auto 4:3/3:2", short: "Aspect %",
       options: [["Auto 4:3/3:2","Auto"],["4:3","4:3"],["16:9","16:9"],["Stretch","Stretch"]] },
     { key: "EmuCore/EnableWideScreenPatches", label: "Widescreen patches", type: "toggle", def: "false", short: "Widescreen %",
       hint: "Uses the game's 16:9 patch when there is one." },
     { key: "TVShader", label: "Display filter", type: "seg", def: "0", short: "%",
-      options: [["6","FSR"],["7","FSR soft"],["0","Classic"],["5","CRT"]] },
-  ]},
-  // vk-285-115: PCSX2's crop (EmuCore/GS/CropLeft, CropTop, CropRight, CropBottom: PS2 pixels cut from each side before the
-  // picture is scaled to the screen, GSRenderer.cpp CalculateDrawSrcRect). Asked for to hide Shadow of the Colossus's
-  // garbage at the borders. Applied while the game runs. The line is on the first row only (the sheet shows it on each).
-  { title: "Crop", items: [
-    { key: "CropLeft", label: "Crop left", type: "seg", def: "0", short: "Crop left %", cols: 5, options: CROP_PX,
-      hint: CROP_HINT },
-    { key: "CropTop", label: "Crop top", type: "seg", def: "0", short: "Crop top %", cols: 5, options: CROP_PX },
-    { key: "CropRight", label: "Crop right", type: "seg", def: "0", short: "Crop right %", cols: 5, options: CROP_PX },
-    { key: "CropBottom", label: "Crop bottom", type: "seg", def: "0", short: "Crop bottom %", cols: 5, options: CROP_PX },
+      options: [["6","FSR"],["7","FSR soft"],["0","Classic"],["5","CRT"],["1","Scanlines"],["2","VHS soft"],["3","VHS"]],
+      hint: "How the picture reaches the TV. FSR sharpens the upscale; CRT is a curved tube with beam lines; Scanlines draws a thin dark line between the 480 lines; VHS soft and VHS look like a tape (VHS: a worn one that wobbles)." },
+    // 2026-10-08 (AI-assisted): frame generation (GSDeviceVK.cpp), read when the game starts.
+    { key: "PS5SX2/FrameGeneration", label: "Frame generation", type: "toggle", def: "false", short: "Frame gen %", restart: true,
+      hint: "Shows a frame made between two of the game's: a 60 fps game at 120 on a TV that takes 120 Hz (the TV switches to 120 Hz for the game), a 30 fps game at 60. Only while the game holds its frame rate (an uneven one shows the game's own frames); the FPS box then counts what the TV gets. A little more input lag, and small smears at the edges of fast movement. Experimental. Takes effect when the game starts." },
   ]},
   { title: "Graphics", items: [
     { key: "PS5SX2/Renderer", label: "Renderer", type: "seg", def: "Hardware", short: "%", restart: true,
       options: [["Hardware","Hardware"],["Software","Software"]],
       hint: "Software draws the game on the CPU, as a PS2 does it: slower, but right in games whose effects the hardware renderer gets wrong. Set it for one game in that game's settings. Takes effect when the game starts." },
     { key: "filter", label: "Texture filtering", type: "seg", def: "2", short: "% filtering",
-      options: [["0","Nearest"],["2","PS2"],["1","Bilinear"],["3","Not sprites"]] },
+      options: [["0","Nearest"],["2","PS2"],["1","Bilinear (forced)"],["3","Not sprites"]],
+      hint: "PS2 smooths what the game asks to be smoothed, as a PS2 does: the right one for nearly every game. Bilinear (forced) smooths everything, full-screen effects too, which can blur, shift or ghost them (PCSX2 calls it unsafe)." },
     { key: "MaxAnisotropy", label: "Anisotropic filtering", type: "seg", def: "0", short: "AF %",
       options: [["0","Off"],["2","2x"],["4","4x"],["8","8x"],["16","16x"]] },
     { key: "accurate_blending_unit", label: "Blending accuracy", type: "seg", def: "1", short: "Blending %",
@@ -348,6 +402,16 @@ const GROUPS = [
       options: [["-1","Auto (PS5)"],["0","Japanese"],["1","English"],["2","French"],["3","Spanish"],["4","German"],["5","Italian"],
                 ["6","Dutch"],["7","Portuguese"]],
       hint: "The language the PS2 tells games. PAL games with several languages start in it; most US games are English only. Auto follows the PS5's language." },
+    // 2026-10-05: the PS2's network adapter (DEV9), on for every game by default (main-boot.cpp).
+    { key: "DEV9/Eth/EthEnable", label: "Network adapter", type: "toggle", def: "true", restart: true, later: "the network adapter",
+      short: "Network %",
+      hint: "The PS2's network adapter, on the PS5's own connection, for online and LAN play (on revival servers such as PS Rewired; their DNS goes in the game's network settings). It costs nothing until a game uses it. Turn it off for a game that misbehaves with it. Takes effect when the game starts." },
+    // 2026-10-08 (AI-assisted; testers: "Enable Host Filesystem"): PCSX2's host: device (EmuCore/HostFs), read when the game starts.
+    { key: "EmuCore/HostFs", label: "Host filesystem", type: "toggle", def: "false", restart: true, later: "the host filesystem", short: "Host files %",
+      hint: "Lets homebrew read and write files in its own folder (host:), as PCSX2's Enable Host Filesystem: the ELF's folder, or the disc image's. Only for homebrew that asks for it." },
+    // 2026-10-08 (AI-assisted; testers asked for the full boot): PCSX2's fast boot (EmuCore/EnableFastBoot), read when the game starts.
+    { key: "EmuCore/EnableFastBoot", label: "Fast boot", type: "toggle", def: "true", restart: true, later: "fast boot", short: "Fast boot %",
+      hint: "Off: the PS2's own start-up first, the towers and the PlayStation 2 logo, as on a PS2 (a few games want it). On goes straight to the game." },
   ]},
   // vk-285-113: the box in the top right corner and its frame-rate graph (main-boot.cpp orbis_ps5opts_from, GSRenderer.cpp).
   { title: "On screen", items: [
@@ -356,11 +420,63 @@ const GROUPS = [
       hint: "The box in the top right corner. Load is how busy the EE, GS and VU threads are." },
     { key: "PS5SX2/FpsGraph", label: "FPS graph", type: "toggle", def: "false", short: "FPS graph %",
       hint: "A blue graph of the last minute's frame rate in the top right corner. It shows with the info box off too." },
+    // 2026-10-08 (AI-assisted; testers: "PNG overlays/bezels"): the overlay picture (GSRenderer.cpp OrbisDrawBezel), live.
+    { key: "PS5SX2/Bezel", label: "Overlay picture", type: "toggle", def: "false", short: "Overlay %",
+      hint: "A bezel or frame drawn over the screen around the game: overlays/<game serial>.png (SLUS-21147.png), else overlays/default.png, in /data/PCSX2 or the Overlays folder below (All games). A 1920x1080 PNG (at most; it is stretched to the screen) with a see-through middle where the game shows; the game keeps its own size (Aspect ratio)." },
+    // 2026-10-08 (AI-assisted): the RetroAchievements challenge icons (GSRenderer.cpp OrbisDrawChallengeIcons), live.
+    { key: "PS5SX2/RAChallengeIcons", label: "Challenge icons", type: "toggle", def: "true", short: "Challenge icons %",
+      hint: "RetroAchievements: the badge of each challenge going on (an achievement that unlocks if you keep it up, such as no damage taken) in the bottom right corner, while it lasts." },
+  ]},
+  // 2026-10-08 (AI-assisted; a tester: "Kingdom Hearts needs HW hacks, texture offset X 525, Y 0"): PCSX2's manual hardware
+  // fixes, for one game only ("game": not on All games). PCSX2 uses the rows while UserHacks is on, and then leaves out the game
+  // database's own fixes for the game unless set the same here (GameDatabase.cpp applyGSHardwareFixes); so turning it on, or
+  // changing a row ("fix"), writes the game's own fixes first (the settings' "gamefixes", fe_settings.cpp ManualFixSettings).
+  // Applied while the game runs (GSRendererHW::UpdateSettings). Needs proper testing on the console.
+  { title: "Hardware fixes", game: true,
+    hint: "For upscaling glitches: lines, ghosting, effects out of place. The rows count while Manual hardware fixes is on, and changing one turns it on, starting from PCSX2's own fixes for this game (shown here while it's off), so nothing changes until a row does. Most do nothing at 1x.",
+    items: [
+    { key: "UserHacks", label: "Manual hardware fixes", type: "toggle", def: "false", short: "Manual fixes %" },
+    { key: "UserHacks_HalfPixelOffset", label: "Half-pixel offset", type: "pick", def: "0", short: "Half-pixel %", fix: true,
+      options: [["0","Off"],["1","Normal (vertex)"],["2","Special (texture)"],["3","Special (aggressive)"],["4","Align to native"],["5","Native + texture offset"]],
+      hint: "Moves the picture by half a pixel to line up effects (bloom, blur, shadows) that sit off when upscaled." },
+    { key: "UserHacks_native_scaling", label: "Native scaling", type: "pick", def: "0", short: "Native scaling %", fix: true,
+      options: [["0","Off"],["1","Normal"],["2","Aggressive"],["3","Normal (keep upscale)"],["4","Aggressive (keep upscale)"]],
+      hint: "Draws post-processing effects at the PS2's own size, then scales them up: for effects that break when upscaled (depth of field, glow). Keep upscale stays sharper." },
+    { key: "UserHacks_round_sprite_offset", label: "Round sprite", type: "seg", def: "0", short: "Round sprite %", fix: true,
+      options: [["0","Off"],["1","Half"],["2","Full"]],
+      hint: "Rounds 2D sprites' texture positions: for lines and blur in 2D pictures and text when upscaled." },
+    { key: "UserHacks_align_sprite_X", label: "Align sprite", type: "toggle", def: "false", short: "Align sprite %", fix: true,
+      hint: "Lines up sprites that leave vertical lines when upscaled." },
+    { key: "UserHacks_merge_pp_sprite", label: "Merge sprite", type: "toggle", def: "false", short: "Merge sprite %", fix: true,
+      hint: "Draws an effect made of many sprites as one: for lines through effects when upscaled." },
+    { key: "UserHacks_BilinearHack", label: "Bilinear upscale", type: "seg", def: "0", short: "Bilinear %", fix: true,
+      options: [["0","Auto"],["1","Bilinear"],["2","Nearest"]],
+      hint: "How textures the PS2 smooths are smoothed when upscaled. Auto: PCSX2 chooses." },
+    { key: "UserHacks_TCOffsetX", label: "Texture offset X", type: "pick", def: "0", short: "Texture offset X %", fix: true, options: TC_OFFSETS,
+      hint: TC_HINT },
+    { key: "UserHacks_TCOffsetY", label: "Texture offset Y", type: "pick", def: "0", short: "Texture offset Y %", fix: true, options: TC_OFFSETS },
+    { key: "UserHacks_AutoFlushLevel", label: "Auto flush", type: "seg", def: "0", short: "Auto flush %", fix: true,
+      options: [["0","Off"],["1","Sprites"],["2","All"]],
+      hint: "Ends a draw when it reads the picture it is drawing on, as the PS2 would: for some missing or broken effects. Costs speed. Sprites: for sprites only." },
+    { key: "UserHacks_TextureInsideRt", label: "Texture inside target", type: "seg", def: "0", short: "Texture in target %", fix: true,
+      options: [["0","Off"],["1","Inside"],["2","Merge"]],
+      hint: "Lets a texture be read from inside a bigger picture the game drew earlier: for some missing or wrong effects. Merge also joins pictures that touch." },
+  ]},
+  // vk-285-115: PCSX2's crop (EmuCore/GS/CropLeft, CropTop, CropRight, CropBottom: PS2 pixels cut from each side before the
+  // picture is scaled to the screen, GSRenderer.cpp CalculateDrawSrcRect). Asked for to hide Shadow of the Colossus's
+  // garbage at the borders. Applied while the game runs. 2026-10-08: the Settings tab's last
+  // group, as testers asked. The line is on the first row only (the sheet shows it on each).
+  { title: "Crop", items: [
+    { key: "CropLeft", label: "Crop left", type: "seg", def: "0", short: "Crop left %", cols: 5, options: CROP_PX,
+      hint: CROP_HINT },
+    { key: "CropTop", label: "Crop top", type: "seg", def: "0", short: "Crop top %", cols: 5, options: CROP_PX },
+    { key: "CropRight", label: "Crop right", type: "seg", def: "0", short: "Crop right %", cols: 5, options: CROP_PX },
+    { key: "CropBottom", label: "Crop bottom", type: "seg", def: "0", short: "Crop bottom %", cols: 5, options: CROP_PX },
   ]},
   // vk-285-116 (AI-assisted): the Controls tab: the remapping, (vk-285-117) the save and load combos and their hold time
   // (main-boot.cpp orbis_ps5opts_from, orbis-shims/OrbisPadMap.h), the sticks, rumble, the keyboard and mouse.
   { title: "Buttons", tab: "controls",
-    hint: "Save and load: hold the two buttons together (slot 1). L3 + R3 is both sticks pressed in; Touchpad left or right is a finger on that side. Fast forward (experimental, for skipping videos): hold its two buttons to speed the game up, and again for full speed; Nothing on both turns it off. Below: what each button presses in games (Light press: the other buttons press at half strength, for Metal Gear Solid 2 and 3). PS5SX2's own combos always use the real buttons.",
+    hint: "Save and load: hold the two buttons together (slot 1). L3 + R3 is both sticks pressed in; Touchpad left or right is a finger on that side. Fast forward (experimental, for skipping videos): hold its two buttons to speed the game up, and again for full speed; Nothing on both turns it off. Change disc: hold its two buttons for the game's next disc (\"(Disc 2)\" beside it, or an .m3u list); any image goes in from the Disc section while you play. Settings page: hold its two buttons for 2 seconds to open this page in the PS5's browser (default: L2 + D-pad down). Below: what each button presses in games (Light press: the other buttons press at half strength, for Metal Gear Solid 2 and 3). Touchpad left and right click: clicking the touchpad on that half; default is Nothing (pick any PS2 button). When a side has a button, a click there presses only that one, not the touchpad click's. PS5SX2's own combos always use the real buttons.",
     items: [
     combo("SaveButton1", "Save: button 1", "L3R3", "Save state"), combo("SaveButton2", "Save: button 2", "Up"),
     combo("LoadButton1", "Load: button 1", "L3R3", "Load state"), combo("LoadButton2", "Load: button 2", "Down"),
@@ -371,10 +487,13 @@ const GROUPS = [
     { key: "PS5SX2/FastSpeed", label: "Fast forward speed", type: "seg", def: "0", cols: 4,
       options: [["0","Max"],["2","2x"],["3","3x"],["4","4x"]],
       hint: "How fast fast forward runs. Max: as fast as the console can. Some games' videos skip only at Max." },
+    combo("DiscButton1", "Change disc: button 1", "L3R3", "Change disc"), combo("DiscButton2", "Change disc: button 2", "Right"),
+    combo("WebButton1", "Settings page: button 1", "L2", "Open settings page"), combo("WebButton2", "Settings page: button 2", "Down"),
     button("Cross", "Cross", "Cross"), button("Circle", "Circle", "Circle"), button("Square", "Square", "Square"),
     button("Triangle", "Triangle", "Triangle"), button("L1", "L1", "L1"), button("R1", "R1", "R1"), button("L2", "L2", "L2"),
     button("R2", "R2", "R2"), button("L3", "L3", "L3"), button("R3", "R3", "R3"), button("Options", "Options", "Start"),
-    button("Touchpad", "Touchpad click", "Select"), button("Up", "D-pad up", "Up"), button("Down", "D-pad down", "Down"),
+    button("Touchpad", "Touchpad click", "Select"), button("TouchLeft", "Touchpad left click", "None"), button("TouchRight", "Touchpad right click", "None"),
+    button("Up", "D-pad up", "Up"), button("Down", "D-pad down", "Down"),
     button("Left", "D-pad left", "Left"), button("Right", "D-pad right", "Right"),
   ]},
   { title: "Button strength", tab: "controls",
@@ -399,13 +518,16 @@ const GROUPS = [
   ]},
   { title: "Controller", tab: "controls", items: [
     { key: "PS5SX2/Rumble", label: "Rumble", type: "toggle", def: "true", short: "Rumble %",
-      hint: "The game's vibration on the controller. In a game, hold L2 and D-pad down for 2 seconds to open this page in the PS5's own web browser; the game keeps running behind it." },
+      hint: "The game's vibration on the controller. In a game, hold the Settings page combo for 2 seconds (default: L2 + D-pad down, configurable above) to open this page in the PS5's own web browser; the game keeps running behind it." },
     { key: "PS5SX2/RumbleStrength", label: "Rumble strength", type: "pick", def: "1",
       options: [["0.25","25%"],["0.5","50%"],["0.75","75%"],["1","100%"],["1.25","125%"],["1.5","150%"],["2","200%"]],
       hint: "How strongly the controller vibrates, as a share of what the game asks for. Above 100% lifts weak rumble; it never goes past the motors' full strength." },
     { key: "PS5SX2/Multitap", label: "Multitap", type: "seg", def: "0", cols: 3, restart: true,
       options: [["0","Off"],["1","Port 1"],["2","Port 2"]],
       hint: "For 4-player games. Players 2 to 4 are the other PS5 users logged in when the game starts, each on their own controller. Port 1 suits most games; a few want the multitap in port 2. Off: player 2 on port 2, as before." },
+    { key: "PS5SX2/Microphone", label: "Microphone", type: "seg", def: "auto", cols: 4, restart: true,
+      options: [["auto","Auto"],["0","Off"],["1","Mic"],["2","Headset"]],
+      hint: "The controller's microphone as a PS2 USB microphone, for games that need one (Lifeline - Voice Action Adventure). Auto turns it on for those games; Headset suits a game that asks for a USB headset. Takes effect when the game starts." },
   ]},
   // vk-285-113: a USB keyboard and mouse plugged into the PS5 (orbis-shims/ProsperoKbdMouse.cpp, main-boot.cpp).
   { title: "Keyboard and mouse", tab: "controls", items: [
@@ -447,7 +569,9 @@ let saveTimer = 0;
 let recArmed = 0;        // the Recommended button's wait for its second tap
 let ctlArmed = 0;        // vk-285-116: the controls' reset button's
 let tab = "settings";    // vk-285-116: the tab shown, "settings" or "controls" (kept in this browser)
-try { if (localStorage.getItem("ps5sx2.tab") === "controls") tab = "controls"; } catch (e) {}
+try { const saved = localStorage.getItem("ps5sx2.tab"); if (["controls", "achievements"].includes(saved)) tab = saved; } catch (e) {}
+let achievementData = null, achievementLoading = false, achievementPage = 0, achievementFilter = "all";
+let achievementImageGeneration = 0;
 
 // vk-285-118: no key any more: the console's address is enough (fe_web.cpp refuses other sites' requests instead). An old
 // bookmark's ?t= is dropped from the address bar.
@@ -564,8 +688,16 @@ async function select(id) {
 function effective(item) {
   const own = data.values[item.key];
   if (own !== undefined) return { v: own, from: "own" };
+  // 2026-10-08: a hardware fix while manual fixes are off: PCSX2 uses the game's own (its database's), so that shows.
+  if (item.fix && data.gamefixes && data.gamefixes[item.key] !== undefined && !manualFixesOn())
+    return { v: data.gamefixes[item.key], from: "game" };
   if (data.id !== "@global" && data.global[item.key] !== undefined) return { v: data.global[item.key], from: "global" };
   return { v: item.def, from: "default" };
+}
+// 2026-10-08: PCSX2's manual hardware fixes (EmuCore/GS/UserHacks), on for this file or for all games.
+function manualFixesOn() {
+  const v = data.values["UserHacks"] !== undefined ? data.values["UserHacks"] : data.id !== "@global" ? data.global["UserHacks"] : undefined;
+  return v === "true" || v === "1";
 }
 const truthy = (v) => v === "true" || v === "1";
 function optLabel(item, v) {
@@ -588,7 +720,128 @@ function recSummary() {
   return bits.length ? bits.join(" · ") : "Follows the settings for all games.";
 }
 
+// Use the console language and catalog overrides, with English fallback (AI-assisted).
+const ACHIEVEMENT_ENGLISH = {
+  "achievements.status_unlocked": "Unlocked",
+  "achievements.status_locked": "Locked",
+  "achievements.title": "Achievements",
+  "achievements.all": "All",
+  "achievements.unlocked": "Unlocked",
+  "achievements.locked": "Locked",
+  "achievements.points": "points",
+  "achievements.refresh": "Refresh",
+  "achievements.previous": "Previous",
+  "achievements.next": "Next",
+  "achievements.loading": "Loading achievements...",
+  "achievements.images": "Loading badge images...",
+  "achievements.empty_filter": "No achievements in this filter.",
+  "achievements.empty": "This game has no published achievements.",
+  "achievements.select_running": "Select the running game to view its achievements.",
+  "achievements.show_running": "Show running game",
+  "achievements.start_game": "Start a game to view its live achievements. Before playing, use the Achievements tab on the game shelf.",
+  "achievements.unavailable": "Achievement browser is unavailable.",
+  "achievements.sign_in": "Sign in to RetroAchievements and start a game.",
+  "achievements.connecting": "Connecting to RetroAchievements...",
+  "achievements.no_data": "No achievement data available for this game.",
+  "achievements.refresh_failed": "Couldn't refresh achievements: ",
+  "achievements.select_game": "Select This game to view its achievements.",
+  "achievements.pending": "Finishing the previous request. Press Triangle to load this game.",
+  "achievements.triangle_refresh": "Triangle: refresh"
+};
+function achievementText(key) {
+  key = "achievements." + key;
+  return state.strings?.[key] || ACHIEVEMENT_ENGLISH[key] || key;
+}
+function applyAchievementLanguage() {
+  document.documentElement.lang = state.language || "en";
+  const button = document.querySelector('[data-tab="achievements"]');
+  if (button) button.textContent = achievementText("title");
+}
+// Live runtime achievements, separate from editable settings (AI-assisted).
+async function refreshAchievements(force = false) {
+  if (tab !== "achievements" || achievementLoading) return;
+  achievementLoading = true;
+  try {
+    const snapshot = await api("/api/achievements");
+    const changed = JSON.stringify(snapshot) !== JSON.stringify(achievementData);
+    achievementData = snapshot;
+    if (tab === "achievements" && data && (changed || force)) renderAchievements();
+  } catch (e) {
+    if (tab === "achievements" && e.message !== "unauthorized") toast(achievementText("refresh_failed") + e.message);
+  } finally { achievementLoading = false; }
+}
+function renderAchievements() {
+  ++achievementImageGeneration;
+  $("file").textContent = "";
+  if (!state.playing || data.id !== state.playing.id) {
+    $("settings").innerHTML = '<div class="sec"><h2>' + esc(achievementText("title")) + '</h2><div class="card empty">' +
+      (state.playing ? esc(achievementText('select_running')) + '<div class="btnrow"><button class="btn" id="achievement-playing">' + esc(achievementText('show_running')) + '</button></div>' :
+        esc(achievementText('start_game'))) + '</div></div>';
+    const button = $("achievement-playing");
+    if (button) button.onclick = () => select(state.playing.id);
+    return;
+  }
+  if (!achievementData || achievementData.playing !== state.playing.id) {
+    $("settings").innerHTML = '<div class="sec"><h2>' + esc(achievementText("title")) + '</h2><div class="card empty">' + esc(achievementText('loading')) + '</div></div>';
+    refreshAchievements(); return;
+  }
+  const all = achievementData.entries;
+  const unlocked = all.filter((entry) => entry.unlocked);
+  const points = all.reduce((sum,entry) => sum + entry.points,0);
+  const earned = unlocked.reduce((sum,entry) => sum + entry.points,0);
+  const entries = all.filter((entry) => achievementFilter === "all" || (achievementFilter === "unlocked") === entry.unlocked);
+  const pages = Math.max(1,Math.ceil(entries.length/12));
+  achievementPage = Math.max(0,Math.min(achievementPage,pages-1));
+  let html = '<div class="sec"><h2>' + esc(achievementData.title || achievementText("title")) + '</h2><div class="card achievement-summary"><div>' +
+    unlocked.length + ' / ' + all.length + ' ' + esc(achievementText('unlocked')) + ' &nbsp; · &nbsp; ' + earned + ' / ' + points + ' ' + esc(achievementText('points')) + '</div>' +
+    '<div class="btnrow"><button class="btn ghost" id="achievement-refresh">' + esc(achievementText('refresh')) + '</button>' +
+    ['all','unlocked','locked'].map((filter) => '<button class="btn ghost' + (filter === achievementFilter ? ' active-filter' : '') +
+      '" data-achievement-filter="' + filter + '">' + esc(achievementText(filter)) + '</button>').join('') + '</div></div>';
+  if (achievementData.message) html += '<div class="empty">' + esc(achievementData.message) + '</div>';
+  if (!entries.length && all.length) html += '<div class="empty">' + esc(achievementText("empty_filter")) + '</div>';
+  for (const entry of entries.slice(achievementPage*12,achievementPage*12+12)) {
+    html += '<div class="card achievement-row"><div class="achievement-icon"><span>RA</span><img alt="" data-achievement-id="' + entry.id +
+      '" data-achievement-unlocked="' + (entry.unlocked ? '1' : '0') + '"></div><div class="achievement-copy"><div class="achievement-name">' + esc(entry.title) +
+      '</div><div class="hint">' + esc(entry.description) + '</div><div class="achievement-status' + (entry.unlocked ? ' earned' : '') + '">' +
+      esc(achievementText(entry.unlocked ? 'status_unlocked' : 'status_locked')) + ' · ' + entry.points + ' ' + esc(achievementText('points')) + '</div></div></div>';
+  }
+  html += '<div class="btnrow center"><button class="btn ghost" id="achievement-prev"' + (achievementPage === 0 ? ' disabled' : '') +
+    '>' + esc(achievementText('previous')) + '</button><span>' + (achievementPage+1) + ' / ' + pages + '</span><button class="btn ghost" id="achievement-next"' +
+    (achievementPage+1 === pages ? ' disabled' : '') + '>' + esc(achievementText('next')) + '</button></div></div>';
+  $("settings").innerHTML = html;
+  $("achievement-refresh").onclick = () => refreshAchievements(true);
+  $("achievement-prev").onclick = () => { --achievementPage; renderAchievements(); };
+  $("achievement-next").onclick = () => { ++achievementPage; renderAchievements(); };
+  document.querySelectorAll('[data-achievement-filter]').forEach((button) => button.onclick = () => {
+    achievementFilter = button.dataset.achievementFilter; achievementPage = 0; renderAchievements();
+  });
+  // Load only the visible page, two images at a time; failed images retain the RA placeholder.
+  const generation = achievementImageGeneration;
+  const images = Array.from(document.querySelectorAll('[data-achievement-id]'));
+  async function nextImage() {
+    const image = images.shift();
+    if (!image || generation !== achievementImageGeneration) return;
+    let advanced = false, attempts = 0;
+    const advance = () => { if (!advanced) { advanced = true; nextImage(); } };
+    image.onload = () => { image.classList.add('ready'); advance(); };
+    image.onerror = () => {
+      if (generation !== achievementImageGeneration) return;
+      image.classList.remove('ready'); advance();
+      setTimeout(() => {
+        if (generation === achievementImageGeneration && image.isConnected) image.src = badgeUrl(image) + '&retry=' + Date.now();
+      },Math.min(5000,1000 * ++attempts));
+    };
+    image.src = badgeUrl(image);
+  }
+  function badgeUrl(image) {
+    return '/api/achievement-badge?id=' + image.dataset.achievementId + '&unlocked=' + image.dataset.achievementUnlocked;
+  }
+  nextImage(); nextImage();
+}
+
 function render() {
+  if (tab === "achievements") { renderAchievements(); return; }
+  ++achievementImageGeneration;
   const isGlobal = data.id === "@global";
   const playingHere = state.playing && state.playing.id === data.id;
   let html = "";
@@ -599,8 +852,35 @@ function render() {
       '</div><div class="rs">' + esc(recSummary()) + '</div></div><button id="recbtn" class="recbtn' + (recArmed ? " armed" : "") + '"' +
       (inUse ? " disabled" : "") + ">" + (inUse ? "\u2713 In use" : recArmed ? "Tap again" : "Use") + "</button></div>";
   }
+  // 2026-10-08 (AI-assisted; testers: "ELF properties: disc path"): an ELF's disc image, one of the shelf's images by its file
+  // name (PS5SX2/ElfDisc; main-boot.cpp finds it in the game folders), as the sheet's Disc image row.
+  if (tab === "settings" && !isGlobal && /\.elf$/i.test(data.id)) {
+    const cur = data.values["PS5SX2/ElfDisc"] || "";
+    let opts = '<option value=""' + (cur ? "" : " selected") + ">No disc</option>";
+    for (const g of games)
+      if (!/\.elf$/i.test(g.id)) opts += '<option value="' + esc(g.id) + '"' + (g.id === cur ? " selected" : "") + ">" + esc(g.title) + "</option>";
+    if (cur && !games.some((g) => g.id === cur)) opts += '<option value="' + esc(cur) + '" selected>' + esc(cur) + "</option>";
+    html += '<div class="sec"><h2>ELF</h2><div class="card"><div class="row prow"><div class="pl"><div class="label">Disc image' +
+      '<span class="tag">next launch</span></div><div class="from" style="margin-top:2px">' + (cur ? "this game" : "none") + "</div>" +
+      '<div class="hint">The disc image this ELF runs with, as PCSX2\'s ELF properties set it: a patched or translated game\'s executable with its own disc, or homebrew that reads one. No disc: the ELF alone.</div></div>' +
+      '<select class="pick' + (cur ? " moved" : " inh") + '" data-elfdisc="1" aria-label="Disc image">' + opts + "</select></div></div></div>";
+  }
+  // vk-285-139: the cheat disc (PS5SX2/CheatDisc in gs.ini), one of the shelf's images by its file name, as the sheet's row.
+  if (tab === "settings" && isGlobal) {
+    const cur = data.values["PS5SX2/CheatDisc"] || "";
+    let opts = '<option value=""' + (cur ? "" : " selected") + ">None</option>";
+    for (const g of games)
+      if (!/\.elf$/i.test(g.id)) opts += '<option value="' + esc(g.id) + '"' + (g.id === cur ? " selected" : "") + ">" + esc(g.title) + "</option>";
+    if (cur && !games.some((g) => g.id === cur)) opts += '<option value="' + esc(cur) + '" selected>' + esc(cur) + "</option>";
+    html += '<div class="sec"><h2>Cheat disc</h2><div class="card"><div class="row prow"><div class="pl"><div class="label">Cheat disc' +
+      '<span class="tag">next launch</span></div><div class="from" style="margin-top:2px">' + (cur ? "set" : "none") + "</div>" +
+      '<div class="hint">A GameShark, Action Replay or CodeBreaker image. Games with Start from the cheat disc on (Discs) start from it as disc 1, with their own discs after it.</div></div>' +
+      '<select class="pick' + (cur ? " moved" : " inh") + '" data-cheatdisc="1" aria-label="Cheat disc">' + opts + "</select></div></div></div>";
+  }
   for (const grp of GROUPS) {
     if ((grp.tab || "settings") !== tab) continue; // vk-285-116
+    if (grp.global && !isGlobal) continue; // 2026-10-08: a group for all games only (Folders)
+    if (grp.game && isGlobal) continue; // 2026-10-08: a group for one game only (Hardware fixes)
     html += '<div class="sec"><h2>' + esc(grp.title) + "</h2>" + (grp.hint ? '<div class="ghint">' + esc(grp.hint) + "</div>" : "") +
       '<div class="card">';
     for (const it of grp.items) {
@@ -609,6 +889,7 @@ function render() {
       if (eff.from === "own" && !isGlobal) from = 'this game <button data-reset="' + esc(it.key) + '">reset</button>';
       else if (eff.from === "own") from = 'set <button data-reset="' + esc(it.key) + '">reset</button>';
       else if (eff.from === "global") from = "all games";
+      else if (eff.from === "game") from = "the game's own fix"; // 2026-10-08
       else from = "default";
       const tag = it.restart ? '<span class="tag">next launch</span>' : "";
       if (it.type === "toggle") {
@@ -644,7 +925,8 @@ function render() {
         for (const o of it.options) opts += '<option value="' + esc(o[0]) + '"' + (same(o[0], eff.v) ? " selected" : "") + ">" + esc(o[1]) + "</option>";
         if (!it.options.some((o) => same(o[0], eff.v))) opts += '<option value="' + esc(eff.v) + '" selected>' + esc(eff.v) + "</option>";
         html += '<div class="row prow"><div class="pl"><div class="label">' + esc(it.label) + tag + '</div><div class="from" style="margin-top:2px">' +
-          from + '</div></div><select class="pick' + (same(eff.v, it.def) ? "" : " moved") + (eff.from === "own" ? "" : " inh") +
+          from + "</div>" + (it.hint ? '<div class="hint">' + esc(it.hint) + "</div>" : "") + // 2026-10-08: the hardware fixes' lists have one
+          '</div><select class="pick' + (same(eff.v, it.def) ? "" : " moved") + (eff.from === "own" ? "" : " inh") +
           '" data-pickkey="' + esc(it.key) + '" aria-label="' + esc(it.label) + '">' + opts + "</select></div>";
       } else if (it.type === "text") {
         html += '<div class="row"><div class="head"><div class="label">' + esc(it.label) + tag + '</div><div class="from">' + from + '</div></div>';
@@ -681,6 +963,18 @@ function render() {
     }
     html += "</div></div>";
   }
+  // 2026-10-08 (AI-assisted): the game's cheats (cheats/<serial>_<crc>.pnach; the shelf's sheet fetches them with "Get patches
+  // and cheats"). A cheat on turns on the game's cheats (EmuCore/EnableCheats); the last one off takes that out again.
+  if (!isGlobal && tab === "settings" && data.cheats && data.cheats.length) {
+    html += '<div class="sec"><h2>Cheats</h2><div class="card">';
+    for (const c of data.cheats) {
+      html += '<div class="row"><div class="toggle"><div><div class="label">' + esc(c.name) + "</div>" +
+        (c.description ? '<div class="hint">' + esc(c.description) + "</div>" : "") +
+        '<div class="hint" style="font-size:11px">' + esc(c.file) + '</div></div><button class="sw' + (c.enabled ? " on" : "") +
+        '" data-cheat="' + esc(c.name) + '" data-on="' + (c.enabled ? "0" : "1") + '" aria-label="' + esc(c.name) + '"></button></div></div>';
+    }
+    html += "</div></div>";
+  }
   $("settings").innerHTML = html;
   $("file").innerHTML = esc(data.file) + (data.exists ? "" : " (made on the first change)") +
     (playingHere ? " · applied live in the running game" : "");
@@ -690,12 +984,15 @@ function render() {
     change(b.dataset.reset, null);
   }));
   $("settings").querySelectorAll("[data-patch]").forEach((b) => b.addEventListener("click", () => patch(b.dataset.patch, b.dataset.on === "1")));
+  $("settings").querySelectorAll("[data-cheat]").forEach((b) => b.addEventListener("click", () => cheat(b.dataset.cheat, b.dataset.on === "1")));
   $("settings").querySelectorAll("[data-textkey]").forEach((el) => el.addEventListener("change", () => {
     const v = el.value.trim();
     if (v.includes("#")) { toast("A # can't be in a path here"); render(); return; }
     change(el.dataset.textkey, v === "" ? null : v);
   }));
   $("settings").querySelectorAll("[data-pickkey]").forEach((el) => el.addEventListener("change", () => change(el.dataset.pickkey, el.value)));
+  $("settings").querySelectorAll("[data-elfdisc]").forEach((el) => el.addEventListener("change", () => change("PS5SX2/ElfDisc", el.value || null)));
+  $("settings").querySelectorAll("[data-cheatdisc]").forEach((el) => el.addEventListener("change", () => change("PS5SX2/CheatDisc", el.value || null)));
   $("settings").querySelectorAll("[data-mcd]").forEach((el) => el.addEventListener("change", () => mcdChoose(SLOTS[+el.dataset.mcd - 1], el.value)));
   $("settings").querySelectorAll("[data-mcdreset]").forEach((b) => b.addEventListener("click", () => mcdChoose(SLOTS[+b.dataset.mcdreset - 1], "")));
   $("settings").querySelectorAll("[data-mcdsize]").forEach((b) => b.addEventListener("click", () => { mcdSize = +b.dataset.mcdsize; render(); }));
@@ -811,8 +1108,17 @@ async function useRecommended() {
 
 // Changes show at once and go to the console after a short pause, so a few taps make one write.
 function change(key, value) {
+  // 2026-10-08: a hardware fix changed, or manual fixes turned on, for a game while they were off: on, and the game's own
+  // fixes written too (the ones this file doesn't set), so PCSX2 keeps them; as the sheet does.
+  const it = GROUPS.flatMap((g) => g.items).find((x) => x.key === key);
+  const manualStarts = value !== null && data.id !== "@global" && it && (it.fix || (key === "UserHacks" && truthy(value))) && !manualFixesOn();
   if (value === null) delete data.values[key]; else data.values[key] = value;
   pending.set(key, value);
+  if (manualStarts) {
+    if (key !== "UserHacks") { data.values["UserHacks"] = "true"; pending.set("UserHacks", "true"); }
+    for (const [k, v] of Object.entries(data.gamefixes || {}))
+      if (k !== key && data.values[k] === undefined) { data.values[k] = v; pending.set(k, v); }
+  }
   render();
   queueSave();
 }
@@ -823,6 +1129,16 @@ function patch(name, on) {
   render();
   queueSave();
 }
+// 2026-10-08: a cheat group; PCSX2's cheats for the game follow (EmuCore/EnableCheats on with the first, out with the last).
+function cheat(name, on) {
+  const c = data.cheats.find((x) => x.name === name);
+  if (c) c.enabled = on;
+  pending.set("cheat:" + name, on);
+  if (on) { data.values["EmuCore/EnableCheats"] = "true"; pending.set("EmuCore/EnableCheats", "true"); }
+  else if (!data.cheats.some((x) => x.enabled)) { delete data.values["EmuCore/EnableCheats"]; pending.set("EmuCore/EnableCheats", null); }
+  render();
+  queueSave();
+}
 function queueSave() { clearTimeout(saveTimer); saveTimer = setTimeout(save, 350); }
 async function save() {
   if (!pending.size) return;
@@ -830,6 +1146,7 @@ async function save() {
   const later = []; // what applies at the next launch (vk-285-110: not only MTVU)
   for (const [k, v] of pending) {
     if (k.startsWith("patch:")) lines.push((v ? "patch+ " : "patch- ") + k.slice(6));
+    else if (k.startsWith("cheat:")) lines.push((v ? "cheat+ " : "cheat- ") + k.slice(6)); // 2026-10-08
     else if (v === null) lines.push("unset " + k);
     else lines.push("set " + k + "=" + v);
     const it = GROUPS.flatMap((g) => g.items).find((x) => x.key === k);
@@ -853,14 +1170,47 @@ async function refreshGames() {
   } catch (e) {}
 }
 
+// vk-285-139 (AI-assisted): Now playing's disc row: the game's discs, then every image on the console (a GameShark's game).
+let discsLoaded = false;
+async function refreshDiscs() {
+  const row = $("discrow"), pick = $("discpick");
+  if (!state.playing) { row.classList.add("hide"); discsLoaded = false; return; }
+  try {
+    const d = await api("/api/discs");
+    discsLoaded = true;
+    let html = "";
+    if (d.set.length > 1) {
+      html += '<optgroup label="This game\'s discs">';
+      d.set.forEach((s, i) => { html += '<option value="' + esc(s.path) + '"' + (s.path === d.current ? " selected" : "") + ">Disc " + (i + 1) + (s.path === d.current ? " (in now)" : "") + " · " + esc(s.name) + "</option>"; });
+      html += "</optgroup>";
+    }
+    html += '<optgroup label="Any image">';
+    for (const g of d.games) html += '<option value="' + esc(g.path) + '"' + (d.set.length <= 1 && g.path === d.current ? " selected" : "") + ">" + esc(g.title) + (g.path === d.current ? " (in now)" : "") + "</option>";
+    html += "</optgroup>";
+    pick.innerHTML = html;
+    row.classList.remove("hide");
+  } catch (e) { row.classList.add("hide"); }
+}
+$("discbtn").addEventListener("click", async () => {
+  const path = $("discpick").value;
+  if (!path) return;
+  try {
+    await api("/api/disc", { method: "POST", headers: { "Content-Type": "text/plain" }, body: path });
+    toast("Disc changed");
+    setTimeout(refreshDiscs, 1500);
+  } catch (e) { toast(e.message); }
+});
+
 async function refreshState() {
   try {
     const s = await api("/api/state");
     const changed = JSON.stringify(s.playing) !== JSON.stringify(state.playing);
     state = s;
+    applyAchievementLanguage();
     $("build").textContent = s.build;
     if (s.playing) { $("now").classList.add("show"); $("nowtitle").textContent = s.playing.title; $("nowcover").src = cover(s.playing.id); }
     else $("now").classList.remove("show");
+    if (changed || !discsLoaded) refreshDiscs();
     if (changed && games.length) {
       games = await api("/api/games");
       buildFlow();
@@ -881,6 +1231,7 @@ document.querySelectorAll("#tabs button").forEach((b) => b.addEventListener("cli
   clearTimeout(ctlArmed); ctlArmed = 0;
   showTab();
   if (data) render();
+  if (tab === "achievements") refreshAchievements(true);
 }));
 showTab();
 
@@ -927,6 +1278,7 @@ $("discord").addEventListener("click", async () => {
   try {
     const s = await api("/api/state");
     state = s;
+    applyAchievementLanguage();
     $("build").textContent = s.build;
     showTesting(s);
     games = await api("/api/games");
@@ -938,6 +1290,7 @@ $("discord").addEventListener("click", async () => {
   if (i < 0) i = 0;
   requestAnimationFrame(() => { scrollToGame(i, false); if (games[i]) select(games[i].id); else select("@global"); });
   setInterval(refreshState, 5000);
+  setInterval(() => refreshAchievements(), 5000);
 })();
 </script>
 </body>

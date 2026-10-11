@@ -1,6 +1,6 @@
 // PS5 port frontend: small vector and matrix helpers (column-major, Vulkan clip space).
 //
-// Copyright (C) 2026 Spyros
+// Copyright (C) 2026 swordpdf
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #pragma once

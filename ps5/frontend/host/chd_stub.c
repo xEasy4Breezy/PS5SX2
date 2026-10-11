@@ -1,7 +1,7 @@
 /* PS5 port frontend, PC harness only: libchdr's calls fe_games.cpp makes, answering "no CHD here" (the harness's
  * games are made up, and libchdr's own build is not worth it for the preview).
  *
- * Copyright (C) 2026 Spyros
+ * Copyright (C) 2026 swordpdf
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "libchdr/chd.h"

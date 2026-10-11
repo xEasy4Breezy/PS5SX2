@@ -16,7 +16,7 @@
 // Each folder is used when it exists; without it the top folder is, as in the old flat layout, so
 // an older console setup keeps working and a new build can go on before the files move.
 //
-// Copyright (C) 2026 Spyros
+// Copyright (C) 2026 swordpdf
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #pragma once

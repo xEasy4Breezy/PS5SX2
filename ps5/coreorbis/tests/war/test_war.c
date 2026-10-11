@@ -6,7 +6,7 @@
 // note_draw_samples, the WAR check for render targets, the drains that clear the list (the inlined
 // forget_samples), lists of 0 to 600 images -- one through the driver's functions, one through the shim; every
 // field the two touch must stay equal after every step. Then a timing at the list size Ratchet & Clank had.
-// Copyright (C) 2026 Spyros
+// Copyright (C) 2026 swordpdf
 // SPDX-License-Identifier: GPL-3.0-or-later
 #define _POSIX_C_SOURCE 200112L
 #include <stdbool.h>

@@ -9,7 +9,7 @@
 // 1.0 for Vulkan 1.0 out -- the target PCSX2 asks for (shaderc_target_env_vulkan,
 // version 0).
 //
-// Copyright (C) 2026 Spyros
+// Copyright (C) 2026 swordpdf
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <shaderc/shaderc.h>

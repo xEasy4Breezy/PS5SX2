@@ -2,7 +2,7 @@
 // plain coverage rasterization for the textures the frontend paints on the CPU (spines and
 // placeholder covers).
 //
-// Copyright (C) 2026 Spyros
+// Copyright (C) 2026 swordpdf
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #pragma once

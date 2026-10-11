@@ -5,7 +5,7 @@
 // pointers live in fe::Vk instead and are loaded from whatever vkGetInstanceProcAddr the platform
 // hands it (the statically linked driver's vk_icdGetInstanceProcAddr on the PS5, libvulkan's on a PC).
 //
-// Copyright (C) 2026 Spyros
+// Copyright (C) 2026 swordpdf
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #pragma once

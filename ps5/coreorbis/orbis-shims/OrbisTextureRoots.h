@@ -134,13 +134,14 @@ inline std::string FindGameDir(const std::vector<std::string>& drive_roots, cons
 	return std::string();
 }
 
-// The mounted USB drives' roots: /mnt/usb0 to /mnt/usb7 that hold anything.
+// The mounted USB drives' roots: /mnt/usb0 to /mnt/usb7 that hold anything (2026-10-08: then /mnt/ext0 and /mnt/ext1, the
+// extended storage and M.2 drives).
 inline std::vector<std::string> UsbRoots(const std::string& mount_dir = "/mnt")
 {
 	std::vector<std::string> out;
-	for (int i = 0; i < 8; i++)
+	for (int i = 0; i < 10; i++)
 	{
-		const std::string root = mount_dir + "/usb" + std::to_string(i);
+		const std::string root = i < 8 ? mount_dir + "/usb" + std::to_string(i) : mount_dir + "/ext" + std::to_string(i - 8);
 		DIR* d = opendir(root.c_str());
 		if (!d)
 			continue;

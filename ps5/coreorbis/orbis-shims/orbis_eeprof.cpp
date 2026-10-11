@@ -33,7 +33,7 @@
 // start, starts it on that thread's first wake (OrbisVUProfStart, MTVU.cpp); its ring waits are
 // skipped, the samples go to /data/PCSX2/vuprof.bin with "[vuprof] n=" marks.
 //
-// Copyright (C) 2026 Spyros
+// Copyright (C) 2026 swordpdf
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "Memory.h"

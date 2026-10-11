@@ -21,7 +21,7 @@
 //   0x1900 uint64_t draw_sampled[16] (PS5VK_DRAW_SAMPLED_MAX)
 //   0x1980 uint32_t draw_sampled_count
 // tests/war/run.sh (test_war.c) runs these against the release's own object code.
-// Copyright (C) 2026 Spyros
+// Copyright (C) 2026 swordpdf
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <immintrin.h>

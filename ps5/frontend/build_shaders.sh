@@ -1,7 +1,7 @@
 #!/bin/bash
 # PS5 port frontend: compiles shaders/*.vert|*.frag to SPIR-V and writes fe_shaders.inc, the
 # words as uint32_t arrays (fe_spv_<name>_<stage>).
-# Copyright (C) 2026 Spyros
+# Copyright (C) 2026 swordpdf
 # SPDX-License-Identifier: GPL-3.0-or-later
 set -euo pipefail
 cd "$(dirname "$0")"

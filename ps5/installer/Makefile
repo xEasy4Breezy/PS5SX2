@@ -8,7 +8,7 @@
 #
 # Dependencies (see fetch-deps.sh): Mbed TLS 3.6.7 and miniz 3.1.1 in $(DEPS); the PS5 payload SDK in
 # $(PS5_PAYLOAD_SDK). RELAY_URL is the log relay built into the PS5 ELF (the Cloudflare Worker in worker/,
-# deployed on Spyros's account 2026-09-28); `make ps5 RELAY_URL=` builds an ELF that only keeps reports in
+# deployed on swordpdf's account 2026-09-28); `make ps5 RELAY_URL=` builds an ELF that only keeps reports in
 # outbox/. Host builds never have one built in: the tests pass theirs in PS5SX2_TEST_RELAY_URL.
 
 PS5_PAYLOAD_SDK ?= /home/claude/ps5deps/sdk285

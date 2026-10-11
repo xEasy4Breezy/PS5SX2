@@ -5,7 +5,7 @@
 //   I <key> | <label> | <default> | <restart> | <value>=<label>, ...
 // The sheet's button symbols ("<glyph>  Cross") are left out of the labels; the hints may differ (the sheet's are shorter).
 //
-// Copyright (C) 2026 Spyros
+// Copyright (C) 2026 swordpdf
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "../fe_options.h"
@@ -31,7 +31,8 @@ int main()
 {
 	for (const fe::OptionGroup& g : fe::OptionGroups())
 	{
-		std::printf("G %s %s\n", g.tab == fe::kTabControls ? "controls" : "settings", g.title.c_str());
+		std::printf("G %s %s%s\n", g.tab == fe::kTabControls ? "controls" : "settings", g.title.c_str(),
+			g.game_only ? " [one game]" : g.global_only ? " [all games]" : ""); // 2026-10-08: Hardware fixes; vk-285-137: Shelf
 		for (const fe::OptionDef& d : g.items)
 		{
 			std::string choices;

@@ -419,7 +419,7 @@ int logger_run(void) {
   } else if (r == 0 && pid > 0 && started > 0 && now_utc() - started < 24 * 3600) {
     report_session(pid, started, 0, "", &last); /* ended while we weren't running (or with the last boot) */
   }
-  /* 1.3: no notice on the screen (Spyros: less clutter); the testers are told when they get the ELF */
+  /* 1.3: no notice on the screen (swordpdf: less clutter); the testers are told when they get the ELF */
   const int relay = logger_relay_url()[0] != '\0';
   log_line("logger: running (relay %s): the logs of game sessions and problems are %s when PS5SX2 closes",
            relay ? logger_relay_url() : "not set", relay ? "sent" : "kept in outbox/");

@@ -3,7 +3,7 @@
 // The files are bin/resources/shaders of the tree the eboot is built from, embedded with .incbin (as the frontend's
 // fonts are, fe_ps5.cpp), so they match the renderer's code: the same text the release's resources folder holds.
 //
-// Copyright (C) 2026 Spyros
+// Copyright (C) 2026 swordpdf
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "OrbisGSShaders.h"
@@ -97,20 +97,38 @@ bool OrbisBuiltinShaderSource(const char* filename, std::string* out)
 	return false;
 }
 
+// vk-285-134 (AI-assisted): the eboot's copy first. A folder copy from another release doesn't match this build's renderer:
+// build 130's logs had a console whose every game failed with "Failed to initialize GS" ("Missing entry point" compiling a
+// utility shader: 17 starts), its /data/PCSX2/resources holding older shader files. Only shadeboost.glsl, the present's
+// sharpening that is there to be edited, still comes from the folder first; a file the eboot doesn't carry comes from the
+// folder as before.
 bool OrbisReadShaderSource(const std::string& resources_dir, const char* filename, std::string* out)
 {
-	if (ReadFile(resources_dir + "/" + filename, out))
+	const std::string path = resources_dir + "/" + filename;
+	const bool editable = std::strcmp(filename, "shaders/vulkan/shadeboost.glsl") == 0;
+	if (editable && ReadFile(path, out))
 		return true;
-	if (!OrbisBuiltinShaderSource(filename, out))
-		return false;
+	std::string builtin;
+	if (!OrbisBuiltinShaderSource(filename, &builtin))
+		return ReadFile(path, out);
+	std::string folder;
+	const bool have_folder = !editable && ReadFile(path, &folder);
 	static std::mutex s_mutex;
 	static std::set<std::string> s_noted;
-	std::lock_guard<std::mutex> lock(s_mutex);
-	if (s_noted.insert(filename).second)
 	{
-		std::printf("[gs] %s isn't in %s: the eboot's built-in copy (%zu bytes)\n", filename, resources_dir.c_str(),
-			out->size());
-		std::fflush(stdout);
+		std::lock_guard<std::mutex> lock(s_mutex);
+		if (s_noted.insert(filename).second)
+		{
+			if (!have_folder)
+				std::printf("[gs] %s isn't in %s: the eboot's built-in copy (%zu bytes)\n", filename, resources_dir.c_str(),
+					builtin.size());
+			else if (folder != builtin)
+				std::printf("[gs] %s in %s differs from this build's (%zu bytes, the build's %zu): the build's own is used (a copy "
+							"from another release breaks the GS)\n",
+					filename, resources_dir.c_str(), folder.size(), builtin.size());
+			std::fflush(stdout);
+		}
 	}
+	*out = std::move(builtin);
 	return true;
 }

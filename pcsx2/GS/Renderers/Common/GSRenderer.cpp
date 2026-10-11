@@ -21,6 +21,9 @@ extern "C" int sceKernelAvailableFlexibleMemorySize(unsigned long long* size); /
 #include "PerformanceMetrics.h"
 #include "pcsx2/Config.h"
 #include "VMManager.h"
+#ifdef PS5SX2_ACHIEVEMENTS
+#include "Achievements.h" // 2026-10-08: the challenge icons (OrbisDrawChallengeIcons)
+#endif
 
 #include "common/FileSystem.h"
 #include "common/Image.h"
@@ -35,6 +38,7 @@ extern "C" int sceKernelAvailableFlexibleMemorySize(unsigned long long* size); /
 #include <array>
 #include <chrono>
 #include <deque>
+#include <memory> // 2026-10-08: the panels' picture reads (std::shared_ptr)
 #include <thread>
 #include <mutex>
 #include <atomic>
@@ -421,7 +425,7 @@ bool OrbisFlag(const char* name);
 // games above read back 2 to 3.4 times a frame.
 std::atomic<int> g_orbis_rb_auto_kind{0}; // 1: each wait 10 ms or more (old firmware), 2: many short waits (main-boot.cpp)
 // vk-285-128 (AI-assisted): games that build textures from what they read back. With GPU readbacks on Don't wait
-// TimeSplitters: Future Perfect's textures didn't load and its input lagged (Spyros's Pro, 2026-10-04, set by hand): it
+// TimeSplitters: Future Perfect's textures didn't load and its input lagged (swordpdf's Pro, 2026-10-04, set by hand): it
 // reads back once a frame, 5-14 ms each at 6x on the Pro, so a slower console or a heavier scene could trip the rule
 // below and switch it. These games keep Accurate unless their own file or gs.ini says otherwise.
 static bool OrbisReadbackMustWait(std::string* name)
@@ -523,6 +527,26 @@ extern unsigned long long g_orbis_sw_sync_n[8], g_orbis_sw_sync_ticks[8]; // vk-
 extern std::atomic<u64> g_orbis_vu1_cycles, g_orbis_vu1_runs; // vk-285-74 (MTVU.cpp)
 extern std::atomic<int> g_orbis_vu1_dump_request;
 static OrbisLoadMeasure s_orbis_load_measure;
+extern std::atomic<u64> g_orbis_vu_wait_since; // vk-285-140 (MTVU.cpp)
+extern std::atomic<u32> g_orbis_vu_idle_seq;
+
+// vk-285-140: the VU thread's idle ticks up to tsc, the wait in progress included (MTVU.cpp adds a wait to
+// g_orbis_vu_idle_ticks only when it ends, which made a sleeping VU thread read as 100% busy).
+static unsigned long long OrbisVUIdleNow(unsigned long long tsc)
+{
+	for (;;)
+	{
+		const u32 seq = g_orbis_vu_idle_seq.load(std::memory_order_acquire);
+		if (seq & 1)
+			continue;
+		const unsigned long long idle = *static_cast<volatile unsigned long long*>(&g_orbis_vu_idle_ticks);
+		const u64 since = g_orbis_vu_wait_since.load(std::memory_order_relaxed);
+		std::atomic_thread_fence(std::memory_order_acquire);
+		if (g_orbis_vu_idle_seq.load(std::memory_order_relaxed) != seq)
+			continue;
+		return idle + ((since != 0 && tsc > since) ? (tsc - since) : 0);
+	}
+}
 
 static void OrbisMeasureLoad()
 {
@@ -533,7 +557,7 @@ static void OrbisMeasureLoad()
 	const double sec = std::chrono::duration<double>(now - s_t).count();
 	const unsigned long long cur[10] = {g_orbis_ee_waitgs_ticks, g_orbis_ee_stall_ticks, g_orbis_ee_vsyncq_ticks,
 		g_orbis_ee_waitvu_ticks, g_orbis_ee_vuring_ticks, g_orbis_ee_throttle_ticks, g_orbis_gs_idle_ticks,
-		g_orbis_gs_swsync_ticks, g_orbis_vu_idle_ticks, 0};
+		g_orbis_gs_swsync_ticks, OrbisVUIdleNow(tsc), 0};
 	OrbisLoadMeasure& m = s_orbis_load_measure;
 	OrbisTickerWatch(); // vk-285-108
 	m.nsw = std::min<u32>(PerformanceMetrics::GetGSSWThreadCount(), 16);
@@ -765,9 +789,19 @@ namespace
 		{"FSR SOFT", 7, 0, 0},
 		{"CLASSIC", 0, 60, 0},
 		{"CRT", 5, 0, 0},
+		// live-20: present.glsl ORBIS_TVFX filters in PCSX2's scanline/diagonal/triangular slots.
+		{"SCANLINES", 1, 0, 0},
+		{"VHS SOFT", 2, 0, 0},
+		{"VHS", 3, 0, 0},
 	};
 	constexpr int ORBIS_NUM_MODES = static_cast<int>(sizeof(s_orbis_modes) / sizeof(s_orbis_modes[0]));
 	int s_orbis_mode = 0;
+	// vk-285-135: what OrbisApplyMode last put in GSConfig. A GSConfig that holds something else was replaced by the
+	// settings (VMManager::ApplySettings after a change on the settings page): the mode then follows their TVShader.
+	int s_orbis_applied_tv = -1;
+	bool s_orbis_applied_sb = false;
+	u8 s_orbis_applied_sat = 0;
+	int s_orbis_settings_tv = -1; // the settings' own TVShader, as the last GSConfig from them had it
 	int s_orbis_label_frames = 0;
 	bool s_orbis_fps_box = true;
 	bool s_orbis_gl = false;
@@ -809,11 +843,25 @@ static void OrbisApplyMode(int m, bool announce)
 		GSConfig.ShadeBoost = false;
 #endif
 	g_orbis_present_param[0] = static_cast<float>(pm.sharp) / 100.0f;
+	s_orbis_applied_tv = static_cast<int>(GSConfig.TVShader);
+	s_orbis_applied_sb = GSConfig.ShadeBoost;
+	s_orbis_applied_sat = GSConfig.ShadeBoost_Saturation;
 	if (announce)
 		s_orbis_label_frames = 120;
 	printf("[present] mode=%d %s tv=%d presharp=%d sharp=%d split=%.0f aspect=%d\n", m, pm.name, pm.tv_shader,
 		pm.presharp, pm.sharp, g_orbis_present_param[1], static_cast<int>(EmuConfig.CurrentAspectRatio));
 	fflush(stdout);
+}
+
+// vk-285-135: the present mode with this display filter (TVShader), or -1.
+static int OrbisModeOfTvShader(int tv_shader)
+{
+	for (int i = 0; i < ORBIS_NUM_MODES; i++)
+	{
+		if (s_orbis_modes[i].tv_shader == tv_shader)
+			return i;
+	}
+	return -1;
 }
 
 static void OrbisLiveTune()
@@ -845,6 +893,7 @@ static void OrbisLiveTune()
 				break;
 			}
 		}
+		s_orbis_settings_tv = static_cast<int>(GSConfig.TVShader); // vk-285-135
 		s_orbis_fps_box = !OrbisFlag("nofps");
 #ifdef ORBIS_VULKAN
 		// vk-285-12: on Vulkan the driver's queue submit waits for the GPU, so GPU time is
@@ -860,6 +909,38 @@ static void OrbisLiveTune()
 	{
 		s_seen_cycle = cyc;
 		OrbisApplyMode(s_orbis_mode + 1, true);
+	}
+	// vk-285-135 (swordpdf: "applying a filter live through the browser ui only applies it for a sec and then switches back
+	// to what was on before that. it only gets applied if i restart the game"): the page's Display filter is TVShader in
+	// gs.ini or the game's settings. VMManager::ApplySettings gives this thread a new GSConfig with it, and the live.ini
+	// re-apply that follows (g_orbis_live_reapply) put the old present mode back, its TVShader and pre-sharpen with it.
+	// Now a GSConfig that doesn't hold what the present mode set is a new one from the settings, whenever it lands: when
+	// its TVShader is a new one, the mode follows it; else (another setting changed) the mode stays, a filter picked with
+	// L3+R3 too. Either way the mode's pre-sharpen (the ShadeBoost slot, which the settings reset) comes back. A TVShader
+	// no mode has (set in an ini by hand) is left as it is.
+	if (static_cast<int>(GSConfig.TVShader) != s_orbis_applied_tv || GSConfig.ShadeBoost != s_orbis_applied_sb ||
+		GSConfig.ShadeBoost_Saturation != s_orbis_applied_sat)
+	{
+		const int tv = static_cast<int>(GSConfig.TVShader);
+		int m = s_orbis_mode;
+		if (tv != s_orbis_settings_tv)
+		{
+			s_orbis_settings_tv = tv;
+			m = OrbisModeOfTvShader(tv);
+			if (m >= 0)
+			{
+				printf("[present] the settings changed the display filter: TVShader %d\n", tv);
+				fflush(stdout);
+			}
+		}
+		if (m >= 0)
+			OrbisApplyMode(m, false);
+		else
+		{
+			s_orbis_applied_tv = tv;
+			s_orbis_applied_sb = GSConfig.ShadeBoost;
+			s_orbis_applied_sat = GSConfig.ShadeBoost_Saturation;
+		}
 	}
 
 	static unsigned s_poll = 0;
@@ -913,18 +994,43 @@ static void OrbisLiveTune()
 	}
 	static std::string s_last;
 	std::string cur;
-	if (g_orbis_live_reapply.exchange(0, std::memory_order_acq_rel))
-		s_last = "\x01"; // eerec-285: gs.ini was applied, so apply live.ini again (present mode, pin)
+	// eerec-285: gs.ini was applied, so apply live.ini again (present mode, pin).
+	const bool reapply = g_orbis_live_reapply.exchange(0, std::memory_order_acq_rel) != 0;
 	{
 		std::string b; // vk-285-105: as the ticker last read it (see gs.ini above)
 		if (OrbisCachedRead("/data/PCSX2/live.ini", b))
 			cur.assign(b, 0, std::min<size_t>(b.size(), 1024));
 	}
-	if (cur == s_last)
+	// live-9 (AI-assisted): a game's own thread layout (main-boot.cpp's PS5SX2_PIN_LAYOUT, "ee gs vu rec queue" CPUs: R&C1 gets
+	// pin=3's 2 6 4 8 10, the layout swordpdf's base PS5 held 60 fps at R&C1's heavy spot with, 2026-10-10) when live.ini names no
+	// pin key of its own; any pin key in live.ini replaces it.
+	static int s_pin_default = -1; // -1 not looked at yet, 0 none, 1 in use
+	if (s_pin_default < 0)
+	{
+		s_pin_default = 0;
+		int c[ORBIS_PIN_COUNT];
+		const char* layout = getenv("PS5SX2_PIN_LAYOUT");
+		if (layout && cur.find("pin") == std::string::npos &&
+			sscanf(layout, "%d %d %d %d %d", &c[ORBIS_PIN_EE], &c[ORBIS_PIN_GS], &c[ORBIS_PIN_VU], &c[ORBIS_PIN_REC], &c[ORBIS_PIN_QUEUE]) == 5)
+		{
+			for (int i = 0; i < ORBIS_PIN_COUNT; i++)
+				s_orbis_pin_cpu[i].store(c[i], std::memory_order_release);
+			s_pin_default = 1;
+			g_orbis_pin_request.store(3, std::memory_order_release);
+			printf("[present] the game's thread layout (no pin key in live.ini): EE %d GS %d VU %d recorder %d queue %d\n",
+				c[ORBIS_PIN_EE], c[ORBIS_PIN_GS], c[ORBIS_PIN_VU], c[ORBIS_PIN_REC], c[ORBIS_PIN_QUEUE]);
+		}
+	}
+	const bool changed = cur != s_last;
+	if (!changed && !reapply)
 		return;
 	s_last = cur;
 	int mode = -1;
 	int pin_request = -1; // vk-285-87: issued once every key is read
+	if (s_pin_default == 1 && cur.find("pin") == std::string::npos)
+		pin_request = 3; // live-9: the game's layout again (gs.ini re-applied, or live.ini changed without pin keys)
+	else if (cur.find("pin") != std::string::npos)
+		s_pin_default = 0; // live-9: live.ini's own pinning from now on
 	size_t pos = 0;
 	while (pos < cur.size())
 	{
@@ -999,6 +1105,10 @@ static void OrbisLiveTune()
 		static_cast<int>(GSConfig.InterlaceMode), static_cast<int>(GSConfig.FXAA), static_cast<int>(GSConfig.PCRTCAntiBlur));
 	printf("[present] swtex=%d testpat=%d upload=%d diag=%d perf=%d\n", g_orbis_swtex, g_orbis_testpat, g_orbis_upload_mode,
 		g_orbis_diag, g_orbis_perf); // eerec-280
+	// vk-285-135: live.ini's mode= counts when live.ini itself changed; re-applied after the settings (live.ini as it was),
+	// a mode= in it would undo the page's display filter. The current mode follows the settings (above).
+	if (!changed)
+		mode = -1;
 	OrbisApplyMode(mode >= 0 ? mode : s_orbis_mode, mode >= 0);
 }
 
@@ -1063,6 +1173,16 @@ static void OrbisPerfMinute(unsigned fps, float speed, float ee, float gs, float
 
 #ifdef ORBIS_VULKAN
 void OrbisVkPresentBlend(GSTexture* tex, const GSVector4& sRect, const GSVector4& dRect); // GSDeviceVK.cpp
+// 2026-10-08 (AI-assisted): frame generation (GSDeviceVK.cpp, "frame generation").
+extern bool g_orbis_fg_wanted;
+extern bool g_orbis_fg_engaged; // vk-285-133: generated frames have room (the repeats of the game's last frame present nothing then)
+u32 OrbisVkFrameGenRecord(GSTexture* current, const GSVector4& src_uv, const GSVector4& draw_rect, PresentShader shader, float shader_time,
+	Filter filter, u32 vsyncs, u32 already, double ps2_hz, float speed, bool nominal);
+void OrbisVkFrameGenDraw();
+// vk-285-133: the PS2 vsyncs since the game's last new frame (what frame generation's pacing counts in), and the presents made
+// since then besides the generated ones (the game's last frame, a repeat presented after it), GS thread only.
+static u32 s_orbis_fg_vsyncs = 0;
+static u32 s_orbis_fg_presents = 0;
 
 // Test build 1: the TESTING watermark in the middle of the game's picture, faint (its opacity is in
 // the image), sized for the display's height. The texture is made once per GS device.
@@ -1180,32 +1300,363 @@ static void OrbisDrawQrPanel()
 	g_gs_device->PresentRect(s_tex, GSVector4(0.0f, 0.0f, 1.0f, 1.0f), nullptr, GSVector4(x0, y0, x1, y1), PresentShader::COPY, 0.0f, Nearest);
 }
 
-static void OrbisGLOSD()
+// ---- 2026-10-08 (AI-assisted): the RetroAchievements challenge icons and the overlay picture ----
+// Their PNG files are read and decoded on a thread of their own (the GS thread makes no calls on /data, where an open can
+// take 30 ms or more: orbis_paths.cpp, vk-285-105), uploaded once a vsync before the present begins (OrbisPreparePanels,
+// outside the swapchain's render pass), and only drawn during the present (OrbisDrawChallengeIcons, OrbisDrawBezel).
+// Needs proper testing on the console.
+bool OrbisLoadPng(const std::string& path, int max_w, int max_h, std::vector<u32>& rgba, int& w, int& h, std::string& why); // ProsperoGS.cpp
+
+namespace
+{
+// One picture being read: the first of `candidates` that exists and decodes (no bigger than max_w x max_h).
+struct OrbisImageJob
+{
+	std::vector<std::string> candidates;
+	int max_w = 0, max_h = 0;
+	std::atomic<bool> done{false};
+	bool ok = false;
+	std::string path, why; // the file used / why none was
+	std::vector<u32> rgba;
+	int w = 0, h = 0;
+};
+
+void* OrbisImageJobRun(void* arg)
+{
+	std::shared_ptr<OrbisImageJob>* holder = static_cast<std::shared_ptr<OrbisImageJob>*>(arg);
+	OrbisImageJob& job = **holder;
+	for (const std::string& path : job.candidates)
+	{
+		if (!FileSystem::FileExists(path.c_str()))
+			continue;
+		std::string why;
+		if (OrbisLoadPng(path, job.max_w, job.max_h, job.rgba, job.w, job.h, why))
+		{
+			job.ok = true;
+			job.path = path;
+			break;
+		}
+		job.why += (job.why.empty() ? "" : "; ") + path + ": " + why;
+	}
+	if (!job.ok && job.why.empty())
+		job.why = "not there";
+	job.done.store(true, std::memory_order_release);
+	delete holder;
+	return nullptr;
+}
+
+// Starts reading on a thread of its own; null when the thread couldn't start (try again later).
+std::shared_ptr<OrbisImageJob> OrbisLoadImageAsync(std::vector<std::string> candidates, int max_w, int max_h)
+{
+	auto job = std::make_shared<OrbisImageJob>();
+	job->candidates = std::move(candidates);
+	job->max_w = max_w;
+	job->max_h = max_h;
+	auto* holder = new std::shared_ptr<OrbisImageJob>(job);
+	pthread_attr_t attr;
+	pthread_attr_init(&attr);
+	pthread_attr_setstacksize(&attr, 512 * 1024); // stb_image's inflate tables live on the stack
+	pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+	pthread_t thread;
+	const int rc = pthread_create(&thread, &attr, OrbisImageJobRun, holder);
+	pthread_attr_destroy(&attr);
+	if (rc != 0)
+	{
+		delete holder;
+		return nullptr;
+	}
+	return job;
+}
+
+double OrbisPanelNow()
+{
+	return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+// A finished job's pixels as a texture (null when it failed or there's no texture).
+GSTexture* OrbisImageTexture(GSDevice* dev, OrbisImageJob& job)
+{
+	if (!job.ok || job.w <= 0 || job.h <= 0)
+		return nullptr;
+	GSTexture* tex = dev->CreateTexture(job.w, job.h, 1, GSTexture::Format::Color);
+	if (tex)
+		tex->Update(GSVector4i(0, 0, job.w, job.h), job.rgba.data(), job.w * 4);
+	std::vector<u32>().swap(job.rgba);
+	return tex;
+}
+} // namespace
+
+// The challenge icons (a tester: "RA challenge indicator icon bottom-right with an on/off"): the badges of the
+// RetroAchievements challenges active now (an achievement primed: it unlocks if the player keeps it up), in the bottom right
+// corner, newest on the left, as PCSX2 draws them with ImGui (Achievements.cpp DrawGameOverlays), which this port hasn't.
+// PS5SX2/RAChallengeIcons (main-boot.cpp, on by default as PCSX2's) turns them off. A badge still downloading is tried again
+// every 2 seconds for 30 seconds.
+std::atomic<int> g_orbis_ra_challenge{1};
+namespace
+{
+struct OrbisIcon
+{
+	std::string path;
+	GSTexture* tex = nullptr;
+	std::shared_ptr<OrbisImageJob> job;
+	int tries = 0;
+	double retry_at = 0;
+	bool given_up = false;
+};
+std::vector<OrbisIcon> s_orbis_icons;
+GSDevice* s_orbis_icons_dev = nullptr;
+} // namespace
+
+static void OrbisPrepareChallengeIcons()
+{
+#ifdef PS5SX2_ACHIEVEMENTS
+	static u32 s_gen = 0;
+	static bool s_on = false, s_listed = false;
+	if (s_orbis_icons_dev != g_gs_device.get())
+	{
+		for (OrbisIcon& icon : s_orbis_icons)
+			icon.tex = nullptr; // the textures went with the old device
+		s_orbis_icons_dev = g_gs_device.get();
+	}
+	const bool on = g_orbis_ra_challenge.load(std::memory_order_relaxed) != 0;
+	const u32 gen = Achievements::OrbisChallengeGeneration();
+	if (!s_listed || gen != s_gen || on != s_on)
+	{
+		s_listed = true;
+		s_gen = gen;
+		s_on = on;
+		const std::vector<std::string> badges = on ? Achievements::OrbisChallengeBadges() : std::vector<std::string>();
+		std::vector<OrbisIcon> next;
+		for (const std::string& path : badges)
+		{
+			OrbisIcon icon;
+			icon.path = path;
+			for (OrbisIcon& old : s_orbis_icons)
+				if (old.path == path && (old.tex || old.job || old.given_up))
+				{
+					icon = std::move(old); // keeps its texture, its read in flight, or that it gave up
+					old = OrbisIcon();
+					break;
+				}
+			next.push_back(std::move(icon));
+		}
+		for (OrbisIcon& old : s_orbis_icons)
+			if (old.tex)
+				s_orbis_icons_dev->Recycle(old.tex);
+		if (next.size() != s_orbis_icons.size())
+		{
+			printf("[present] RetroAchievements challenge icons: %zu%s\n", next.size(), on ? "" : " (PS5SX2/RAChallengeIcons off)");
+			fflush(stdout);
+		}
+		s_orbis_icons = std::move(next);
+	}
+	const double now = OrbisPanelNow();
+	for (OrbisIcon& icon : s_orbis_icons)
+	{
+		if (icon.tex || icon.given_up)
+			continue;
+		if (icon.job && icon.job->done.load(std::memory_order_acquire))
+		{
+			icon.tex = OrbisImageTexture(s_orbis_icons_dev, *icon.job);
+			if (!icon.tex && ++icon.tries >= 15)
+			{
+				icon.given_up = true;
+				printf("[present] challenge icon %s: %s; not tried again\n", icon.path.c_str(), icon.job->why.c_str());
+				fflush(stdout);
+			}
+			icon.job.reset();
+			icon.retry_at = now + 2.0; // most likely still downloading (Achievements.cpp GetAchievementBadgePath)
+		}
+		else if (!icon.job && now >= icon.retry_at)
+			icon.job = OrbisLoadImageAsync({icon.path}, 512, 512);
+	}
+#endif
+}
+
+static void OrbisDrawChallengeIcons()
+{
+#ifdef PS5SX2_ACHIEVEMENTS
+	if (!g_gs_device || s_orbis_icons_dev != g_gs_device.get() || s_orbis_icons.empty())
+		return;
+	const float ww = static_cast<float>(g_gs_device->GetWindowWidth());
+	const float wh = static_cast<float>(g_gs_device->GetWindowHeight());
+	const float k = wh / 2160.0f;
+	const float size = std::floor(112.0f * k), gap = std::floor(16.0f * k), margin = std::floor(48.0f * k);
+#ifdef ORBIS_VULKAN
+	const float y1 = wh - margin, y0 = y1 - size; // Vulkan's window origin is the top-left corner
+#else
+	const float y0 = margin, y1 = y0 + size; // GL's is the bottom-left one
+#endif
+	float x1 = ww - margin;
+	for (const OrbisIcon& icon : s_orbis_icons)
+	{
+		if (!icon.tex)
+			continue;
+		g_gs_device->PresentRect(icon.tex, GSVector4(0.0f, 0.0f, 1.0f, 1.0f), nullptr, GSVector4(x1 - size, y0, x1, y1),
+			PresentShader::COPY, 0.0f, Biln);
+		x1 -= size + gap;
+	}
+#endif
+}
+
+// The overlay picture (testers: "PNG overlays/bezels, /data/PCSX2/overlays/default.png and <serial>.png, on for all games or
+// per game, a folder of our own"): a picture over the whole screen, alpha-blended (OrbisVkPresentBlend), over the game and
+// under the watermark and the box. PS5SX2/Bezel (main-boot.cpp, live, per game or for all) turns it on; the picture is
+// <serial>.png, else default.png, in PS5SX2/BezelDir when that is set, then in /data/PCSX2/overlays. It is meant to be the
+// screen's size with a see-through middle where the game shows: the game keeps its own size and place (Aspect ratio), and the
+// picture is stretched to the screen. At most 1920x1080 (a 4K one decodes to 33 MB, too much for the app's memory).
+std::atomic<int> g_orbis_bezel{0};
+std::atomic<u32> g_orbis_bezel_gen{0}; // main-boot.cpp: PS5SX2/Bezel or BezelDir changed
+std::string OrbisBezelDirectory();     // main-boot.cpp: PS5SX2/BezelDir ("" when unset)
+static std::string s_orbis_bezel_serial; // the GS thread's copy of the game's serial
+static bool s_orbis_bezel_serial_new = false;
+static GSTexture* s_orbis_bezel_tex = nullptr;
+static GSDevice* s_orbis_bezel_dev = nullptr;
+
+// GS.cpp GSGameChanged, on the GS thread when the game (its serial) changes while the GS is open.
+void OrbisBezelGameChanged(const std::string& serial)
+{
+	if (serial == s_orbis_bezel_serial)
+		return;
+	s_orbis_bezel_serial = serial;
+	s_orbis_bezel_serial_new = true;
+}
+
+static void OrbisPrepareBezel()
+{
+#ifdef ORBIS_VULKAN
+	static u32 s_gen = 0;
+	static bool s_asked = false; // a read was started (or done) since the last change
+	static std::shared_ptr<OrbisImageJob> s_job;
+	if (g_gs_device->GetRenderAPI() != RenderAPI::Vulkan)
+		return;
+	if (s_orbis_bezel_dev != g_gs_device.get())
+	{
+		s_orbis_bezel_tex = nullptr; // the texture went with the old device
+		s_orbis_bezel_dev = g_gs_device.get();
+		s_asked = false;
+	}
+	const u32 gen = g_orbis_bezel_gen.load(std::memory_order_acquire);
+	if (gen != s_gen || s_orbis_bezel_serial_new)
+	{
+		s_gen = gen;
+		s_orbis_bezel_serial_new = false;
+		s_asked = false;
+		s_job.reset(); // a read in flight finishes on its own and is dropped
+		if (s_orbis_bezel_tex)
+		{
+			s_orbis_bezel_dev->Recycle(s_orbis_bezel_tex);
+			s_orbis_bezel_tex = nullptr;
+		}
+	}
+	if (!g_orbis_bezel.load(std::memory_order_relaxed))
+		return;
+	if (!s_asked)
+	{
+		s_asked = true;
+		// The game's serial: GSGameChanged doesn't run for the game the GS opened with (VMManager learns it before).
+		if (s_orbis_bezel_serial.empty())
+			s_orbis_bezel_serial = VMManager::GetDiscSerial();
+		std::vector<std::string> dirs;
+		std::string dir = OrbisBezelDirectory();
+		while (dir.size() > 1 && dir.back() == '/')
+			dir.pop_back();
+		if (!dir.empty())
+			dirs.push_back(dir);
+		dirs.push_back("/data/PCSX2/overlays");
+		std::vector<std::string> candidates;
+		for (const std::string& d : dirs)
+		{
+			if (!s_orbis_bezel_serial.empty())
+				candidates.push_back(d + "/" + s_orbis_bezel_serial + ".png");
+			candidates.push_back(d + "/default.png");
+		}
+		s_job = OrbisLoadImageAsync(std::move(candidates), 1920, 1080);
+		if (!s_job)
+			s_asked = false; // no thread now: next vsync
+	}
+	if (s_job && s_job->done.load(std::memory_order_acquire))
+	{
+		s_orbis_bezel_tex = OrbisImageTexture(s_orbis_bezel_dev, *s_job);
+		if (s_orbis_bezel_tex)
+			printf("[present] overlay %s (%dx%d)\n", s_job->path.c_str(), s_job->w, s_job->h);
+		else
+			printf("[present] overlay for %s: none (%s)\n", s_orbis_bezel_serial.empty() ? "no serial" : s_orbis_bezel_serial.c_str(),
+				s_job->why.c_str());
+		fflush(stdout);
+		s_job.reset();
+	}
+#endif
+}
+
+#ifdef ORBIS_VULKAN
+static void OrbisDrawBezel()
+{
+	if (!s_orbis_bezel_tex || !g_gs_device || s_orbis_bezel_dev != g_gs_device.get() || !g_orbis_bezel.load(std::memory_order_relaxed))
+		return;
+	const float ww = static_cast<float>(g_gs_device->GetWindowWidth());
+	const float wh = static_cast<float>(g_gs_device->GetWindowHeight());
+	OrbisVkPresentBlend(s_orbis_bezel_tex, GSVector4(0.0f, 0.0f, 1.0f, 1.0f), GSVector4(0.0f, 0.0f, ww, wh));
+}
+#endif
+
+// Once a vsync, before the present begins (the frame generation's presents too): the pictures' uploads.
+static void OrbisPreparePanels()
+{
+	if (!g_gs_device)
+		return;
+	OrbisPrepareChallengeIcons();
+	OrbisPrepareBezel();
+}
+
+// The panels drawn over the game besides the box: the challenge icons, then the settings QR code over everything.
+static void OrbisDrawPanels()
+{
+	OrbisDrawChallengeIcons();
+	OrbisDrawQrPanel();
+}
+
+// 2026-10-08 (AI-assisted): frame generation (GSDeviceVK.cpp): `generated` draws the box over a generated frame, the same as over
+// the game's last one, without counting it (the box's FPS is the game's; "FG" says frames are generated between them).
+#ifdef ORBIS_VULKAN
+extern std::atomic<bool> g_orbis_fg_active; // GSDeviceVK.cpp
+#endif
+
+static void OrbisGLOSD(bool generated = false)
 {
 	if (!s_orbis_gl || !g_gs_device)
 		return;
-	static u64 s_count = 0;
+	static u64 s_count = 0, s_generated = 0;
 	static auto s_t0 = std::chrono::steady_clock::now();
 	static unsigned s_fps = 0;
-	s_count++;
+	static unsigned s_out_fps = 0; // vk-285-135: the game's frames and the generated ones, as the TV gets them
+	if (!generated)
+		s_count++;
+	else
+		s_generated++;
 	const auto now = std::chrono::steady_clock::now();
 	const double dt = std::chrono::duration<double>(now - s_t0).count();
 	if (dt >= 1.0)
 	{
 		s_fps = static_cast<unsigned>(static_cast<double>(s_count) / dt + 0.5);
+		s_out_fps = static_cast<unsigned>(static_cast<double>(s_count + s_generated) / dt + 0.5);
 		// vk-285-72: the loads come from the [load] line's counters (s_orbis_load_*), measured first; the
 		// line itself still prints after [perf].
 		const bool print = g_orbis_perf || g_orbis_test_build > 0; // eerec-280; test build 1: always in testing builds
 		OrbisMeasureLoad();
-		const float ee = s_orbis_load_valid ? s_orbis_load_ee : static_cast<float>(PerformanceMetrics::GetCPUThreadUsage());
-		const float gs = s_orbis_load_valid ? s_orbis_load_gs : PerformanceMetrics::GetGSThreadUsage();
-		const float vu = s_orbis_load_valid ? s_orbis_load_vu : PerformanceMetrics::GetVUThreadUsage();
+		// vk-285-134: each load kept to 0..100%: the [load] counters can come out negative or huge for a second (build
+		// 130's minute lines had "EE 57138930034%"), which spoiled the minute's average.
+		const auto load = [](float v) { return std::isfinite(v) ? std::clamp(v, 0.0f, 100.0f) : 0.0f; };
+		const float ee = load(s_orbis_load_valid ? s_orbis_load_ee : static_cast<float>(PerformanceMetrics::GetCPUThreadUsage()));
+		const float gs = load(s_orbis_load_valid ? s_orbis_load_gs : PerformanceMetrics::GetGSThreadUsage());
+		const float vu = load(s_orbis_load_valid ? s_orbis_load_vu : PerformanceMetrics::GetVUThreadUsage());
 		OrbisPerfMinute(s_fps, PerformanceMetrics::GetSpeed(), ee, gs, vu); // test build 1
 		OrbisAutoProfSecond(PerformanceMetrics::GetSpeed(), ee, gs, vu); // vk-285-118: a slow stretch samples the busy thread
 		OrbisReadbackAutoSecond(PerformanceMetrics::GetSpeed(), s_fps); // vk-285-118: older firmware's readback stall
 		if (print)
 		{
-			printf("[perf] fps=%u vfreq=%.2f speed=%.0f ee=%.0f gs=%.0f vu=%.0f ft=%.1f/%.1f/%.1f sw=", s_fps,
+			// vk-285-135: out= the frames the TV got, the generated ones with the game's (frame generation).
+			printf("[perf] fps=%u out=%u vfreq=%.2f speed=%.0f ee=%.0f gs=%.0f vu=%.0f ft=%.1f/%.1f/%.1f sw=", s_fps, s_out_fps,
 				GetVerticalFrequency(), PerformanceMetrics::GetSpeed(), ee, gs, vu,
 				PerformanceMetrics::GetMinimumFrameTime(), PerformanceMetrics::GetAverageFrameTime(),
 				PerformanceMetrics::GetMaximumFrameTime());
@@ -1220,6 +1671,7 @@ static void OrbisGLOSD()
 		if (print)
 			fflush(stdout);
 		s_count = 0;
+		s_generated = 0;
 		s_t0 = now;
 	}
 	// vk-285-113: the frame rate four times a second for the graph: 240 samples, a minute, two pixels each.
@@ -1229,7 +1681,8 @@ static void OrbisGLOSD()
 	static u64 s_q_count = 0;
 	static auto s_q_t0 = now;
 	static bool s_hist_dirty = false;
-	s_q_count++;
+	if (!generated)
+		s_q_count++;
 	{
 		const double qdt = std::chrono::duration<double>(now - s_q_t0).count();
 		if (qdt >= 0.25)
@@ -1256,28 +1709,46 @@ static void OrbisGLOSD()
 
 	char text[48] = {};
 	bool have_text = true;
+#ifdef ORBIS_VULKAN
+	const char* const fg_mark = g_orbis_fg_active.load(std::memory_order_relaxed) ? " FG" : "";
+#else
+	const char* const fg_mark = "";
+#endif
 	if (g_orbis_osd_text_frames.load(std::memory_order_acquire) > 0) // eerec-282
 	{
-		g_orbis_osd_text_frames.fetch_sub(1, std::memory_order_relaxed);
+		if (!generated)
+			g_orbis_osd_text_frames.fetch_sub(1, std::memory_order_relaxed);
 		snprintf(text, sizeof(text), "%s", g_orbis_osd_text);
 	}
 	else if (s_orbis_label_frames > 0)
 	{
-		s_orbis_label_frames--;
+		if (!generated)
+			s_orbis_label_frames--;
 		snprintf(text, sizeof(text), "%s", s_orbis_modes[s_orbis_mode].name);
 	}
+	// vk-285-135 (swordpdf: "frame gen doesnt get me to 120 in any game, it actually gets me less fps than normal"): while frames are
+	// generated, the box counts what the TV gets, the generated frames with the game's: it counted the game's only, and with
+	// frame generation's skip of the game's repeated frames (a 50 fps stretch of Ratchet & Clank shows its 50, not the 60
+	// vsyncs a repeat fills) that read as fewer frames than without it. The game's own count follows in brackets.
+	else if (show_fps && show_loads && *fg_mark) // eerec-280; vk-285-72: the [load] line's loads
+		snprintf(text, sizeof(text), "%u FPS FG EE%u GS%u VU%u", s_out_fps,
+			static_cast<unsigned>((s_orbis_load_valid ? s_orbis_load_ee : PerformanceMetrics::GetCPUThreadUsage()) + 0.5),
+			static_cast<unsigned>((s_orbis_load_valid ? s_orbis_load_gs : PerformanceMetrics::GetGSThreadUsage()) + 0.5f),
+			static_cast<unsigned>((s_orbis_load_valid ? s_orbis_load_vu : PerformanceMetrics::GetVUThreadUsage()) + 0.5f));
+	else if (show_fps && *fg_mark)
+		snprintf(text, sizeof(text), "FPS %u (game %u)", s_out_fps, s_fps);
 	else if (show_fps && show_loads) // eerec-280; vk-285-72: the [load] line's loads
-		snprintf(text, sizeof(text), "%u FPS EE%u GS%u VU%u", s_fps,
+		snprintf(text, sizeof(text), "%u FPS%s EE%u GS%u VU%u", s_fps, fg_mark,
 			static_cast<unsigned>((s_orbis_load_valid ? s_orbis_load_ee : PerformanceMetrics::GetCPUThreadUsage()) + 0.5),
 			static_cast<unsigned>((s_orbis_load_valid ? s_orbis_load_gs : PerformanceMetrics::GetGSThreadUsage()) + 0.5f),
 			static_cast<unsigned>((s_orbis_load_valid ? s_orbis_load_vu : PerformanceMetrics::GetVUThreadUsage()) + 0.5f));
 	else if (show_fps)
-		snprintf(text, sizeof(text), "FPS %u", s_fps);
+		snprintf(text, sizeof(text), "FPS %u%s", s_fps, fg_mark);
 	else
 		have_text = false;
 	if (!have_text && !graph)
 	{
-		OrbisDrawQrPanel();
+		OrbisDrawPanels();
 		return;
 	}
 
@@ -1373,7 +1844,7 @@ static void OrbisGLOSD()
 #endif
 	g_gs_device->PresentRect(s_tex, GSVector4(0.0f, 0.0f, static_cast<float>(s_box_w) / TW, static_cast<float>(s_box_h) / TH),
 		nullptr, GSVector4(x0, y0, x1, y1), PresentShader::COPY, 0.0f, Nearest);
-	OrbisDrawQrPanel();
+	OrbisDrawPanels();
 }
 // ---- end eerec-278 ----
 
@@ -2294,8 +2765,19 @@ void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
 	const int fb_sprite_blits = g_perfmon.GetDisplayFramebufferSpriteBlits();
 	const bool fb_sprite_frame = (fb_sprite_blits > 0);
 
+#ifdef ORBIS_VULKAN
+	// vk-285-133: frame generation's clock, a PS2 vsync each call. While generated frames have room (g_orbis_fg_engaged), a
+	// vsync that only repeats the game's last frame presents nothing, whatever "Skip duplicate frames" says: the generated
+	// frame was presented in its place, and a repeat on top would ask the display for more refreshes than the PS2 gives
+	// (vk-285-131 at 60 Hz: two presents a vsync, half speed).
+	s_orbis_fg_vsyncs++;
+	const bool fg_skips_repeats = g_orbis_fg_wanted && g_orbis_fg_engaged;
+#else
+	constexpr bool fg_skips_repeats = false;
+#endif
+
 	bool skip_frame = false;
-	if (GSConfig.SkipDuplicateFrames && !GSCapture::IsCapturingVideo())
+	if ((GSConfig.SkipDuplicateFrames || fg_skips_repeats) && !GSCapture::IsCapturingVideo())
 	{
 		bool is_unique_frame;
 		switch (PerformanceMetrics::GetInternalFPSMethod())
@@ -2340,8 +2822,10 @@ void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
 		unsigned long long n = vs++;
 		if (n < 3 || (n % 100) == 0)
 		{
-			printf("[gsvs] #%llu skip=%d throttle_skip=%d blank=%d current=%p win=%dx%d\n", n,
-				(int)skip_frame, (int)g_gs_device->ShouldSkipPresentingFrame(), (int)blank_frame,
+			// vk-285-135: the throttle's state, not ShouldSkipPresentingFrame(): asking it takes this frame's turn, so every
+			// 100th vsync the frame right after this line was dropped while the throttle was on.
+			printf("[gsvs] #%llu skip=%d throttle=%d blank=%d current=%p win=%dx%d\n", n,
+				(int)skip_frame, (int)g_gs_device->IsPresentThrottleAllowed(), (int)blank_frame,
 				(void*)g_gs_device->GetCurrent(), (int)g_gs_device->GetWindowWidth(), (int)g_gs_device->GetWindowHeight());
 			fflush(stdout);
 		}
@@ -2413,6 +2897,57 @@ void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
 		}
 
 		ORBIS_VS_MARK(ORBIS_VS_PREP);
+		OrbisPreparePanels(); // 2026-10-08: the challenge icons' and the overlay picture's uploads, outside the present's pass
+#ifdef ORBIS_VULKAN
+		// 2026-10-08 (AI-assisted): frame generation (PS5SX2/FrameGeneration; GSDeviceVK.cpp): the frame between the last one and
+		// this one, presented first (as many times as the pacing asks), PS5SX2's overlays over it as over the game's own frames.
+		// Only for a new frame of the game, as the internal FPS counts them (what "Skip duplicate frames" skips): a vsync that
+		// shows the last frame again (a 30 fps game with the skip off, or after 3 skips) presents it as before, and the
+		// interpolator keeps its two frames. Needs proper testing.
+		bool fg_new_frame = true;
+		switch (PerformanceMetrics::GetInternalFPSMethod())
+		{
+			case PerformanceMetrics::InternalFPSMethod::GSPrivilegedRegister:
+				fg_new_frame = registers_written;
+				break;
+			case PerformanceMetrics::InternalFPSMethod::DISPFBBlit:
+				fg_new_frame = fb_sprite_frame;
+				break;
+			default:
+				break;
+		}
+		if (current && !blank_frame && g_orbis_fg_wanted && fg_new_frame)
+		{
+			const float fg_time = static_cast<float>(
+				Common::Timer::ConvertValueToSeconds(Common::Timer::GetCurrentValue() - m_shader_time_start));
+			// vk-285-133: the pacing's inputs: the vsyncs this frame took, the presents already made in them, the PS2's rate, the
+			// speed (of the target: a NominalScalar under 100% isn't a slowdown), and the limiter (turbo, slow motion and the fast
+			// boot get no generated frames; nor does a video capture, which presents every repeat).
+			const u32 fg_vsyncs = s_orbis_fg_vsyncs;
+			const u32 fg_already = s_orbis_fg_presents;
+			s_orbis_fg_vsyncs = 0;
+			s_orbis_fg_presents = 0;
+			const float fg_target = VMManager::GetTargetSpeed();
+			const bool fg_nominal = VMManager::GetLimiterMode() == LimiterModeType::Nominal && fg_target > 0.5f && fg_target < 1.05f &&
+			                        !GSCapture::IsCapturingVideo();
+			const float fg_speed = fg_target > 0.0f ? PerformanceMetrics::GetSpeed() / fg_target : PerformanceMetrics::GetSpeed();
+			const u32 generated_presents = OrbisVkFrameGenRecord(current, src_uv, draw_rect, s_tv_shader_indices[GSConfig.TVShader],
+				fg_time, BilnIf(GSConfig.LinearPresent != GSPostBilinearMode::Off), fg_vsyncs, fg_already, GetVerticalFrequency(),
+				fg_speed, fg_nominal);
+
+			for (u32 i = 0; i < generated_presents; i++)
+			{
+				if (!BeginPresentFrame(false))
+					break;
+
+				OrbisVkFrameGenDraw();
+				OrbisDrawBezel(); // 2026-10-08
+				OrbisWatermark();
+				OrbisGLOSD(true);
+				EndPresentFrame();
+			}
+		}
+#endif
 		const bool began = BeginPresentFrame(false);
 		ORBIS_VS_MARK(ORBIS_VS_BEGIN);
 		if (began)
@@ -2429,6 +2964,7 @@ void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
 			ORBIS_VS_MARK(ORBIS_VS_RECT);
 
 #ifdef ORBIS_VULKAN
+			OrbisDrawBezel(); // 2026-10-08: the overlay picture over the game
 			OrbisWatermark(); // test build 1 (vk-285-55): under the FPS box
 #endif
 			OrbisGLOSD(); // eerec-278
@@ -2437,6 +2973,9 @@ void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
 			ORBIS_VS_MARK(ORBIS_VS_OSD);
 			EndPresentFrame();
 			ORBIS_VS_MARK(ORBIS_VS_END);
+#ifdef ORBIS_VULKAN
+			s_orbis_fg_presents++; // vk-285-133: a refresh of this interval used (frame generation's budget)
+#endif
 
 			const float gpu_time = g_gs_device->GetAndResetAccumulatedGPUTime();
 			GPUPipelineStatistics gpu_stats = g_gs_device->GetAndResetAccumulatedGPUPipelineStatistics();

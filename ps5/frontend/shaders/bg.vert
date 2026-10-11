@@ -1,6 +1,6 @@
 #version 450
 // PS5 port frontend: a full-screen triangle (its three corners come from a vertex buffer).
-// Copyright (C) 2026 Spyros
+// Copyright (C) 2026 swordpdf
 // SPDX-License-Identifier: GPL-3.0-or-later
 layout(location = 0) in vec2 a_p;
 layout(location = 0) out vec2 v_uv;

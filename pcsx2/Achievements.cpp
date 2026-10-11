@@ -2,6 +2,15 @@
 // SPDX-License-Identifier: GPL-3.0+
 
 #include "Achievements.h"
+#ifdef PS5SX2_ACHIEVEMENTS
+#include "ps5/coreorbis/orbis-shims/ProsperoAchievements.h"
+#include "ps5/coreorbis/orbis-shims/ProsperoNotify.h"
+#include "ps5/frontend/fe_i18n.h"
+#include <atomic>
+#include <chrono>
+#include <cstring>
+#include <unordered_map>
+#endif
 #include "BuildVersion.h"
 #include "CDVD/CDVD.h"
 #include "Elfheader.h"
@@ -54,12 +63,23 @@
 
 namespace Achievements
 {
+	static bool CanShowNotifications()
+	{
+#ifdef PS5SX2_ACHIEVEMENTS
+		// Native notifications need no ImGui context or render backend.
+		return true;
+#else
+		return ImGuiManager::InitializeFullscreenUI();
+#endif
+	}
+
 	static constexpr u32 LEADERBOARD_NEARBY_ENTRIES_TO_FETCH = 10;
 	static constexpr u32 LEADERBOARD_ALL_FETCH_SIZE = 20;
 
-	static constexpr float LOGIN_NOTIFICATION_TIME = 5.0f;
-	static constexpr float ACHIEVEMENT_SUMMARY_NOTIFICATION_TIME = 5.0f;
-	static constexpr float GAME_COMPLETE_NOTIFICATION_TIME = 20.0f;
+	// [[maybe_unused]]: the PS5 build sends these popups as system toasts, which time themselves (PS5Toast).
+	[[maybe_unused]] static constexpr float LOGIN_NOTIFICATION_TIME = 5.0f;
+	[[maybe_unused]] static constexpr float ACHIEVEMENT_SUMMARY_NOTIFICATION_TIME = 5.0f;
+	[[maybe_unused]] static constexpr float GAME_COMPLETE_NOTIFICATION_TIME = 20.0f;
 	static constexpr float LEADERBOARD_STARTED_NOTIFICATION_TIME = 3.0f;
 	static constexpr float LEADERBOARD_FAILED_NOTIFICATION_TIME = 3.0f;
 
@@ -75,8 +95,13 @@ namespace Achievements
 	// Some API calls are really slow. Set a longer timeout.
 	static constexpr float SERVER_CALL_TIMEOUT = 60.0f;
 
+#ifdef PS5SX2_ACHIEVEMENTS
+	// The PS5 transport runs 4 at once (ProsperoHTTPDownloader.cpp; PR #9 review item 7). (AI-assisted)
+	static constexpr u32 MAX_CONCURRENT_SERVER_CALLS = 4;
+#else
 	// Chrome uses 10 server calls per domain, seems reasonable.
 	static constexpr u32 MAX_CONCURRENT_SERVER_CALLS = 10;
+#endif
 
 	namespace
 	{
@@ -172,6 +197,22 @@ namespace Achievements
 	static void DisplayAchievementSummary();
 	static void UpdateRichPresence(std::unique_lock<std::recursive_mutex>& lock);
 	static void UpdateNotificationPosition();
+#ifdef PS5SX2_ACHIEVEMENTS
+	// pr9n (AI-assisted): what OrbisFlushBeforeExit waits for. Unlocks and leaderboard entries being sent (counted in
+	// ClientServerCall), and the ones rcheevos keeps retrying between RC_CLIENT_EVENT_DISCONNECTED and _RECONNECTED.
+	static std::atomic<int> s_orbis_submissions{0};
+	static bool s_orbis_unlocks_pending = false; // under the achievements lock
+	static void OrbisWaitForGameLoad(int max_ms);
+	static void OrbisTokenLoginUnreachable(int result, const char* error_message);
+	enum class PS5ToastKind : u8
+	{
+		Info, // the login and the game summary: the system's usual notification sound
+		Unlock, // the PS5 trophy ding
+		Mastery, // the PS5 platinum trophy sound
+	};
+	static void PS5Toast(PS5ToastKind kind, const std::string& title, const std::string& text, const std::string& image_path,
+		const std::string& image_url);
+#endif
 
 	static std::string GetAchievementBadgePath(const rc_client_achievement_t* achievement, int state);
 	static std::string GetSubsetBadgePath(const rc_client_subset_t* subset);
@@ -245,6 +286,14 @@ namespace Achievements
 	static std::vector<LeaderboardTrackerIndicator> s_active_leaderboard_trackers;
 	static std::vector<AchievementChallengeIndicator> s_active_challenge_indicators;
 	static std::optional<AchievementProgressIndicator> s_active_progress_indicator;
+#ifdef PS5SX2_ACHIEVEMENTS
+	// 2026-10-08 (AI-assisted): the active challenges' badges for the GS thread (OrbisChallengeBadges), copied under a lock of
+	// their own so the GS thread never waits on the achievements lock; the generation says when they changed.
+	static std::mutex s_orbis_challenge_mutex;
+	static std::vector<std::string> s_orbis_challenge_badges;
+	static std::atomic<u32> s_orbis_challenge_generation{0};
+	static void OrbisChallengesChanged();
+#endif
 } // namespace Achievements
 
 
@@ -350,11 +399,24 @@ void Achievements::DownloadImage(std::string url, std::string cache_filename)
 		if (status_code != HTTPDownloader::HTTP_STATUS_OK)
 			return;
 
+#ifdef PS5SX2_ACHIEVEMENTS
+		// Written under a temporary name and renamed into place: the PS5's toast reads these files itself, and a
+		// half-written one left by a crash would never be downloaded again. (AI-assisted)
+		const std::string part = cache_filename + ".part";
+		if (!FileSystem::WriteBinaryFile(part.c_str(), data.data(), data.size()) ||
+			!FileSystem::RenamePath(part.c_str(), cache_filename.c_str()))
+		{
+			FileSystem::DeleteFilePath(part.c_str());
+			Console.Error("Failed to write badge image to '%s'", cache_filename.c_str());
+			return;
+		}
+#else
 		if (!FileSystem::WriteBinaryFile(cache_filename.c_str(), data.data(), data.size()))
 		{
 			Console.Error("Failed to write badge image to '%s'", cache_filename.c_str());
 			return;
 		}
+#endif
 
 		ImGuiFullscreen::InvalidateCachedTexture(cache_filename);
 	};
@@ -538,9 +600,12 @@ bool Achievements::CreateClient(rc_client_t** client, std::unique_ptr<HTTPDownlo
 
 void Achievements::DestroyClient(rc_client_t** client, std::unique_ptr<HTTPDownloader>* http)
 {
-	(*http)->WaitForAllRequests();
+	// Client creation can fail before either resource exists. (AI-assisted)
+	if (*http)
+		(*http)->WaitForAllRequests();
 
-	rc_client_destroy(*client);
+	if (*client)
+		rc_client_destroy(*client);
 	*client = nullptr;
 
 	http->reset();
@@ -749,8 +814,20 @@ uint32_t Achievements::ClientReadMemory(uint32_t address, uint8_t* buffer, uint3
 void Achievements::ClientServerCall(
 	const rc_api_request_t* request, rc_client_server_callback_t callback, void* callback_data, rc_client_t* client)
 {
+#ifdef PS5SX2_ACHIEVEMENTS
+	// An unlock or a leaderboard entry: OrbisFlushBeforeExit waits for these. The callback always runs exactly once.
+	const bool submission = request->post_data &&
+							(std::strstr(request->post_data, "r=awardachievement") || std::strstr(request->post_data, "r=submitlbentry"));
+	if (submission)
+		s_orbis_submissions++;
+	HTTPDownloader::Request::Callback hd_callback = [callback, callback_data, submission](s32 status_code, const std::string& content_type, HTTPDownloader::Request::Data data)
+	{
+		if (submission)
+			s_orbis_submissions--;
+#else
 	HTTPDownloader::Request::Callback hd_callback = [callback, callback_data](s32 status_code, const std::string& content_type, HTTPDownloader::Request::Data data)
 	{
+#endif
 		const bool is_error = (status_code <= 0);
 		const bool is_retryable =
 			is_error && (status_code == HTTPDownloader::HTTP_STATUS_TIMEOUT);
@@ -1113,6 +1190,9 @@ void Achievements::ClearGameInfo()
 
 	s_active_leaderboard_trackers = {};
 	s_active_challenge_indicators = {};
+#ifdef PS5SX2_ACHIEVEMENTS
+	OrbisChallengesChanged(); // 2026-10-08: no corner icons once the game is gone
+#endif
 	s_active_progress_indicator.reset();
 	s_game_id = 0;
 	s_game_title = {};
@@ -1160,13 +1240,19 @@ void Achievements::DisplayAchievementSummary()
 			summary = TRANSLATE_STR("Achievements", "This game has no achievements.");
 		}
 
+#ifdef PS5SX2_ACHIEVEMENTS
+		// The game's icon is usually still downloading here the first time a game is played: the toast takes it
+		// from RetroAchievements' server then.
+		PS5Toast(PS5ToastKind::Info, title, summary, s_game_icon, s_game_icon_url);
+#else
 		MTGS::RunOnGSThread([title = std::move(title), summary = std::move(summary), icon = s_game_icon]() {
-			if (ImGuiManager::InitializeFullscreenUI())
+			if (CanShowNotifications())
 			{
 				ImGuiFullscreen::AddNotification(
 					"achievement_summary", ACHIEVEMENT_SUMMARY_NOTIFICATION_TIME, std::move(title), std::move(summary), std::move(icon));
 			}
 		});
+#endif
 	}
 	Achievements::PlayAchievementSound(EmuConfig.Achievements.InfoSound, EmuConfig.Achievements.InfoSoundName, DEFAULT_INFO_SOUND_NAME);
 }
@@ -1175,7 +1261,7 @@ void Achievements::DisplayHardcoreDeferredMessage()
 {
 	MTGS::RunOnGSThread([]() {
 		if (VMManager::HasValidVM() && EmuConfig.Achievements.HardcoreMode && !s_hardcore_mode &&
-			ImGuiManager::InitializeFullscreenUI())
+			CanShowNotifications())
 		{
 			Host::AddIconOSDMessage(
 				"hardcore_on_reset", ICON_PF_DUMBELL, TRANSLATE_STR("Achievements", "Hardcore mode will be enabled on system reset."),
@@ -1212,11 +1298,20 @@ void Achievements::HandleUnlockEvent(const rc_client_event_t* event)
 
 		std::string badge_path = GetAchievementBadgePath(cheevo, cheevo->state);
 
+#ifdef PS5SX2_ACHIEVEMENTS
+		// The badge is cached once the game's list has been shown; otherwise GetAchievementBadgePath() has just
+		// started its download, and the toast takes it from RetroAchievements' server instead.
+		char badge_url[URL_BUFFER_SIZE];
+		if (rc_client_achievement_get_image_url(cheevo, cheevo->state, badge_url, std::size(badge_url)) != RC_OK)
+			badge_url[0] = '\0';
+		PS5Toast(PS5ToastKind::Unlock, title, cheevo->description, badge_path, badge_url);
+#else
 		MTGS::RunOnGSThread(
 			[title = std::move(title), summary = std::string(cheevo->description), badge_path = std::move(badge_path), id = cheevo->id]() {
 				ImGuiFullscreen::AddNotification(fmt::format("achievement_unlock_{}", id), EmuConfig.Achievements.NotificationsDuration,
 					std::move(title), std::move(summary), std::move(badge_path));
 			});
+#endif
 	}
 	Achievements::PlayAchievementSound(EmuConfig.Achievements.UnlockSound, EmuConfig.Achievements.UnlockSoundName, DEFAULT_UNLOCK_SOUND_NAME);
 }
@@ -1235,13 +1330,17 @@ void Achievements::HandleGameCompleteEvent(const rc_client_event_t* event)
 				s_game_summary.num_unlocked_achievements),
 			TRANSLATE_PLURAL_STR("Achievements", "%n points", "Mastery popup", s_game_summary.points_unlocked));
 
+#ifdef PS5SX2_ACHIEVEMENTS
+		PS5Toast(PS5ToastKind::Mastery, title, message, s_game_icon, s_game_icon_url);
+#else
 		MTGS::RunOnGSThread([title = std::move(title), message = std::move(message), icon = s_game_icon]() {
-			if (ImGuiManager::InitializeFullscreenUI())
+			if (CanShowNotifications())
 			{
 				ImGuiFullscreen::AddNotification(
 					"achievement_mastery", GAME_COMPLETE_NOTIFICATION_TIME, std::move(title), std::move(message), std::move(icon));
 			}
 		});
+#endif
 	}
 }
 
@@ -1262,13 +1361,17 @@ void Achievements::HandleSubsetCompleteEvent(const rc_client_event_t* event)
 
 		std::string badge_path = GetSubsetBadgePath(subset);
 
+#ifdef PS5SX2_ACHIEVEMENTS
+		PS5Toast(PS5ToastKind::Mastery, title, message, badge_path, subset->badge_url ? subset->badge_url : "");
+#else
 		MTGS::RunOnGSThread([title = std::move(title), message = std::move(message), badge_path = std::move(badge_path)]() {
-			if (ImGuiManager::InitializeFullscreenUI())
+			if (CanShowNotifications())
 			{
 				ImGuiFullscreen::AddNotification(
 					"achievement_subset_mastery", GAME_COMPLETE_NOTIFICATION_TIME, std::move(title), std::move(message), std::move(badge_path));
 			}
 		});
+#endif
 	}
 }
 
@@ -1282,7 +1385,7 @@ void Achievements::HandleLeaderboardStartedEvent(const rc_client_event_t* event)
 		std::string message = TRANSLATE_STR("Achievements", "Leaderboard attempt started.");
 
 		MTGS::RunOnGSThread([title = std::move(title), message = std::move(message), icon = s_game_icon, id = event->leaderboard->id]() {
-			if (ImGuiManager::InitializeFullscreenUI())
+			if (CanShowNotifications())
 			{
 				ImGuiFullscreen::AddNotification(fmt::format("leaderboard_{}", id), LEADERBOARD_STARTED_NOTIFICATION_TIME, std::move(title),
 					std::move(message), std::move(icon));
@@ -1301,7 +1404,7 @@ void Achievements::HandleLeaderboardFailedEvent(const rc_client_event_t* event)
 		std::string message = TRANSLATE_STR("Achievements", "Leaderboard attempt failed.");
 
 		MTGS::RunOnGSThread([title = std::move(title), message = std::move(message), icon = s_game_icon, id = event->leaderboard->id]() {
-			if (ImGuiManager::InitializeFullscreenUI())
+			if (CanShowNotifications())
 			{
 				ImGuiFullscreen::AddNotification(fmt::format("leaderboard_{}", id), LEADERBOARD_FAILED_NOTIFICATION_TIME, std::move(title),
 					std::move(message), std::move(icon));
@@ -1330,7 +1433,7 @@ void Achievements::HandleLeaderboardSubmittedEvent(const rc_client_event_t* even
 				EmuConfig.Achievements.SpectatorMode ? std::string_view() : TRANSLATE_SV("Achievements", " (Submitting)"));
 
 		MTGS::RunOnGSThread([title = std::move(title), message = std::move(message), icon = s_game_icon, id = event->leaderboard->id]() {
-			if (ImGuiManager::InitializeFullscreenUI())
+			if (CanShowNotifications())
 			{
 				ImGuiFullscreen::AddNotification(fmt::format("leaderboard_{}", id), EmuConfig.Achievements.LeaderboardsDuration,
 					std::move(title), std::move(message), std::move(icon));
@@ -1361,7 +1464,7 @@ void Achievements::HandleLeaderboardScoreboardEvent(const rc_client_event_t* eve
 			event->leaderboard_scoreboard->new_rank, event->leaderboard_scoreboard->num_entries);
 
 		MTGS::RunOnGSThread([title = std::move(title), message = std::move(message), icon = s_game_icon, id = event->leaderboard->id]() {
-			if (ImGuiManager::InitializeFullscreenUI())
+			if (CanShowNotifications())
 			{
 				ImGuiFullscreen::AddNotification(fmt::format("leaderboard_{}", id), EmuConfig.Achievements.LeaderboardsDuration,
 					std::move(title), std::move(message), std::move(icon));
@@ -1417,6 +1520,9 @@ void Achievements::HandleAchievementChallengeIndicatorShowEvent(const rc_client_
 	{
 		it->show_hide_time.Reset();
 		it->active = true;
+#ifdef PS5SX2_ACHIEVEMENTS
+		OrbisChallengesChanged();
+#endif
 		return;
 	}
 
@@ -1427,6 +1533,9 @@ void Achievements::HandleAchievementChallengeIndicatorShowEvent(const rc_client_
 	s_active_challenge_indicators.push_back(std::move(indicator));
 
 	DevCon.WriteLn("Achievements: Show challenge indicator for %u (%s)", event->achievement->id, event->achievement->title);
+#ifdef PS5SX2_ACHIEVEMENTS
+	OrbisChallengesChanged();
+#endif
 }
 
 void Achievements::HandleAchievementChallengeIndicatorHideEvent(const rc_client_event_t* event)
@@ -1439,7 +1548,43 @@ void Achievements::HandleAchievementChallengeIndicatorHideEvent(const rc_client_
 	DevCon.WriteLn("Achievements: Hide challenge indicator for %u (%s)", event->achievement->id, event->achievement->title);
 	it->show_hide_time.Reset();
 	it->active = false;
+#ifdef PS5SX2_ACHIEVEMENTS
+	OrbisChallengesChanged();
+#endif
 }
+
+#ifdef PS5SX2_ACHIEVEMENTS
+// 2026-10-08 (AI-assisted; a tester: "RA challenge indicator icon bottom-right with an on/off"): PCSX2 draws the active
+// challenges' badges with ImGui (DrawGameOverlays), which this port doesn't have; GSRenderer.cpp draws them in the bottom
+// right corner instead (PS5SX2/RAChallengeIcons). Called with the achievements lock held (the event handlers, the unload).
+// An indicator re-shown in the same session still has its entry here (only DrawGameOverlays erased faded ones): the
+// active ones are what count. Needs proper testing on the console.
+void Achievements::OrbisChallengesChanged()
+{
+	std::vector<std::string> badges;
+	for (const AchievementChallengeIndicator& indicator : s_active_challenge_indicators)
+		if (indicator.active && !indicator.badge_path.empty())
+			badges.push_back(indicator.badge_path);
+	{
+		std::lock_guard<std::mutex> lock(s_orbis_challenge_mutex);
+		if (badges == s_orbis_challenge_badges)
+			return;
+		s_orbis_challenge_badges = std::move(badges);
+	}
+	s_orbis_challenge_generation.fetch_add(1, std::memory_order_release);
+}
+
+u32 Achievements::OrbisChallengeGeneration()
+{
+	return s_orbis_challenge_generation.load(std::memory_order_acquire);
+}
+
+std::vector<std::string> Achievements::OrbisChallengeBadges()
+{
+	std::lock_guard<std::mutex> lock(s_orbis_challenge_mutex);
+	return s_orbis_challenge_badges;
+}
+#endif
 
 void Achievements::HandleAchievementProgressIndicatorShowEvent(const rc_client_event_t* event)
 {
@@ -1480,15 +1625,27 @@ void Achievements::HandleServerErrorEvent(const rc_client_event_t* event)
 		event->server_error->api ? event->server_error->api : "UNKNOWN",
 		event->server_error->error_message ? event->server_error->error_message : "UNKNOWN");
 	Console.Error("Achievements: %s", message.c_str());
+#ifdef PS5SX2_ACHIEVEMENTS
+	// PR #9 review item 9: ProsperoUI.cpp passes on only the OSD messages that start with "Achievements", so this one
+	// (a rejected unlock, say) never showed and the player saw only the local unlock toast. A toast of its own. (AI-assisted)
+	PS5Toast(PS5ToastKind::Info, fe::Tr(fe::Str::RaServerError),
+		fmt::format("{}: {}", event->server_error->api ? event->server_error->api : "?",
+			event->server_error->error_message ? event->server_error->error_message : "?"),
+		s_game_icon, s_game_icon_url);
+#else
 	Host::AddOSDMessage(std::move(message), Host::OSD_ERROR_DURATION);
+#endif
 }
 
 void Achievements::HandleServerDisconnectedEvent(const rc_client_event_t* event)
 {
 	Console.Warning("Achievements: Server disconnected.");
+#ifdef PS5SX2_ACHIEVEMENTS
+	s_orbis_unlocks_pending = true;
+#endif
 
 	MTGS::RunOnGSThread([]() {
-		if (ImGuiManager::InitializeFullscreenUI())
+		if (CanShowNotifications())
 		{
 			ImGuiFullscreen::AddNotification("achievements_disconnect", Host::OSD_ERROR_DURATION, TRANSLATE_STR("Achievements", "Achievements Disconnected"),
 				TRANSLATE_STR("Achievements", "An unlock request could not be completed. We will keep retrying to submit this request."), s_game_icon);
@@ -1499,9 +1656,12 @@ void Achievements::HandleServerDisconnectedEvent(const rc_client_event_t* event)
 void Achievements::HandleServerReconnectedEvent(const rc_client_event_t* event)
 {
 	Console.Warning("Achievements: Server reconnected.");
+#ifdef PS5SX2_ACHIEVEMENTS
+	s_orbis_unlocks_pending = false;
+#endif
 
 	MTGS::RunOnGSThread([]() {
-		if (ImGuiManager::InitializeFullscreenUI())
+		if (CanShowNotifications())
 		{
 			ImGuiFullscreen::AddNotification("achievements_reconnect", Host::OSD_INFO_DURATION, TRANSLATE_STR("Achievements", "Achievements Reconnected"),
 				TRANSLATE_STR("Achievements", "All pending unlock requests have completed."), s_game_icon);
@@ -1583,8 +1743,14 @@ bool Achievements::ResetHardcoreMode(bool is_booting)
 	// If we're running an unknown game, don't enable HC mode. We have to do this here,
 	// because the gameid can be cached, and identify immediately on GameChanged(),
 	// which gets called before ResetHardcoreMode().
+#ifdef PS5SX2_ACHIEVEMENTS
+	// PR #9 review item 6: softcore only. RetroAchievements counts an unapproved emulator's unlocks as softcore, and the
+	// port doesn't enforce hardcore's rules (state loads, the web page's speed controls). (AI-assisted)
+	const bool wanted_hardcore_mode = false;
+#else
 	const bool wanted_hardcore_mode = (IsLoggedInOrLoggingIn() || s_load_game_request) &&
 	                                  EmuConfig.Achievements.HardcoreMode;
+#endif
 	if (s_hardcore_mode == wanted_hardcore_mode)
 		return false;
 
@@ -1597,6 +1763,13 @@ bool Achievements::ResetHardcoreMode(bool is_booting)
 
 void Achievements::SetHardcoreMode(bool enabled, bool force_display_message)
 {
+#ifdef PS5SX2_ACHIEVEMENTS
+	if (enabled)
+	{
+		Console.Warning("Achievements: hardcore mode isn't available on the PS5 (softcore only)");
+		enabled = false;
+	}
+#endif
 	if (enabled == s_hardcore_mode)
 		return;
 
@@ -1606,7 +1779,7 @@ void Achievements::SetHardcoreMode(bool enabled, bool force_display_message)
 	if (VMManager::HasValidVM() && (HasActiveGame() || force_display_message))
 	{
 		MTGS::RunOnGSThread([enabled]() {
-			if (ImGuiManager::InitializeFullscreenUI())
+			if (CanShowNotifications())
 			{
 				Host::AddIconOSDMessage("hardcore_status", ICON_PF_DUMBELL,
 					enabled ? TRANSLATE_STR("Achievements", "Hardcore mode is now enabled.") :
@@ -1660,6 +1833,12 @@ void Achievements::LoadState(std::span<const u8> data)
 
 	// if we're active, make sure we've downloaded and activated all the achievements
 	// before deserializing, otherwise that state's going to get lost.
+#ifdef PS5SX2_ACHIEVEMENTS
+	// PR #9 review item 3: the loading screen is a stub on the PS5, and waiting here for every request (an unlock being
+	// sent, a ping) froze the game for up to the 60 s request limit on a slow connection. Only the game's set still
+	// loading matters, and only briefly; past that the state's progress is reset (fine in softcore). (AI-assisted)
+	OrbisWaitForGameLoad(3000);
+#else
 	if (s_http_downloader->HasAnyRequests())
 	{
 		bool was_running_idle;
@@ -1667,6 +1846,7 @@ void Achievements::LoadState(std::span<const u8> data)
 		s_http_downloader->WaitForAllRequests();
 		EndLoadingScreen(was_running_idle);
 	}
+#endif
 
 	if (data.empty())
 	{
@@ -1877,7 +2057,15 @@ void Achievements::ClientLoginWithPasswordCallback(int result, const char* error
 
 	SettingsInterface* secretsInterface = Host::Internal::GetSecretsSettingsLayer();
 	secretsInterface->SetStringValue("Achievements", "Token", user->token);
+#ifdef PS5SX2_ACHIEVEMENTS
+	if (!secretsInterface->Save(params->error))
+	{
+		params->result = false;
+		return;
+	}
+#else
 	secretsInterface->Save();
+#endif
 
 	ShowLoginSuccess(client);
 }
@@ -1889,6 +2077,15 @@ void Achievements::ClientLoginWithTokenCallback(int result, const char* error_me
 	if (result != RC_OK)
 	{
 		ReportFmtError("Login failed: {}", error_message);
+#ifdef PS5SX2_ACHIEVEMENTS
+		// PR #9 review item 9: a DNS failure or a timeout isn't a bad token. Only the server's own refusals ask for a new
+		// sign-in; anything else keeps the account and says the server couldn't be reached. (AI-assisted)
+		if (result != RC_INVALID_CREDENTIALS && result != RC_EXPIRED_TOKEN && result != RC_ACCESS_DENIED && result != RC_LOGIN_REQUIRED)
+		{
+			OrbisTokenLoginUnreachable(result, error_message);
+			return;
+		}
+#endif
 		Host::OnAchievementsLoginRequested(LoginRequestReason::TokenInvalid);
 		return;
 	}
@@ -1921,13 +2118,20 @@ void Achievements::ShowLoginSuccess(const rc_client_t* client)
 		std::string summary = fmt::format(TRANSLATE_FS("Achievements", "Score: {0} pts (Casual: {1} pts)\nUnread messages: {2}"), user->score,
 			user->score_softcore, user->num_unread_messages);
 
+#ifdef PS5SX2_ACHIEVEMENTS
+		char avatar_url[URL_BUFFER_SIZE];
+		if (rc_client_user_get_image_url(user, avatar_url, std::size(avatar_url)) != RC_OK)
+			avatar_url[0] = '\0';
+		PS5Toast(PS5ToastKind::Info, title, summary, badge_path, avatar_url);
+#else
 		MTGS::RunOnGSThread([title = std::move(title), summary = std::move(summary), badge_path = std::move(badge_path)]() {
-			if (ImGuiManager::InitializeFullscreenUI())
+			if (CanShowNotifications())
 			{
 				ImGuiFullscreen::AddNotification(
 					"achievements_login", LOGIN_NOTIFICATION_TIME, std::move(title), std::move(summary), std::move(badge_path));
 			}
 		});
+#endif
 	}
 }
 
@@ -2408,6 +2612,220 @@ void Achievements::DrawPauseMenuOverlays()
 		}
 	}
 }
+
+#ifdef PS5SX2_ACHIEVEMENTS
+// The PS5's own toast for the popups that matter most, made to look and sound like a PS5 trophy (AI-assisted).
+// What it can do was checked with test payloads on a PS5 Pro on 2026-10-05: the toast loads its picture itself,
+// from a /data path or an https URL, and its rawData.soundEffect plays the system's trophy ding or platinum
+// sound. Unlocks and masteries go in the "Trophies" channel, so the PS5's trophy-notification settings and Do Not
+// Disturb apply to them as to real trophies. OrbisNotifyRich only queues, so this is safe on the CPU thread.
+// Needs proper testing with real unlocks: the timing next to the game's own sound, and badges still downloading.
+void Achievements::PS5Toast(PS5ToastKind kind, const std::string& title, const std::string& text, const std::string& image_path,
+	const std::string& image_url)
+{
+	const std::string icon = OrbisToastIcon(image_path, image_url);
+	const bool sounds = EmuConfig.Achievements.SoundEffects;
+	const char* sound = nullptr; // the system's usual notification sound
+	const char* channel = ORBIS_TOAST_CHANNEL_SERVICE;
+	switch (kind)
+	{
+		case PS5ToastKind::Unlock:
+			sound = (sounds && EmuConfig.Achievements.UnlockSound) ? ORBIS_TOAST_SOUND_TROPHY : ORBIS_TOAST_SOUND_NONE;
+			channel = ORBIS_TOAST_CHANNEL_TROPHIES;
+			break;
+		case PS5ToastKind::Mastery:
+			sound = sounds ? ORBIS_TOAST_SOUND_PLATINUM : ORBIS_TOAST_SOUND_NONE;
+			channel = ORBIS_TOAST_CHANNEL_TROPHIES;
+			break;
+		case PS5ToastKind::Info:
+			if (!sounds || !EmuConfig.Achievements.InfoSound)
+				sound = ORBIS_TOAST_SOUND_NONE;
+			break;
+	}
+	Console.WriteLn("Achievements: PS5 toast (%s), picture %s, sound %s", kind == PS5ToastKind::Unlock ? "unlock" :
+		kind == PS5ToastKind::Mastery ? "mastery" : "info", icon.empty() ? "none" : (icon == image_path ? "cached" : "from the web"),
+		sound ? sound : "default");
+	OrbisNotifyRich(title.c_str(), text.c_str(), icon.c_str(), sound, channel);
+}
+
+// pr9n (AI-assisted): LoadState's wait (PR #9 review item 3). Under the achievements lock: only while the game's set is
+// still being loaded (the state's progress needs it), and at most `max_ms`.
+void Achievements::OrbisWaitForGameLoad(int max_ms)
+{
+	const auto loading = [] {
+		const int state = rc_client_get_load_game_state(s_client);
+		return state != RC_CLIENT_LOAD_GAME_STATE_NONE && state != RC_CLIENT_LOAD_GAME_STATE_DONE &&
+			   state != RC_CLIENT_LOAD_GAME_STATE_ABORTED;
+	};
+	if (!loading())
+		return;
+	const auto t0 = std::chrono::steady_clock::now();
+	const auto until = t0 + std::chrono::milliseconds(max_ms);
+	while (loading() && std::chrono::steady_clock::now() < until)
+	{
+		s_http_downloader->PollRequests();
+		Threading::Sleep(5);
+	}
+	const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+	if (loading())
+		Console.Warning("Achievements: the game's set is still loading after %lld ms; the state's progress is reset", static_cast<long long>(ms));
+	else
+		Console.WriteLn("Achievements: waited %lld ms for the game's set before loading the state", static_cast<long long>(ms));
+}
+
+// pr9n (AI-assisted): a token sign-in that got no answer (PR #9 review item 9): the account stays, the player is told.
+void Achievements::OrbisTokenLoginUnreachable(int result, const char* error_message)
+{
+	Console.Warning("Achievements: the server couldn't be reached for the sign-in (%d: %s); the account is kept", result,
+		error_message ? error_message : "");
+	OrbisAchievementsLoginUnreachable();
+	PS5Toast(PS5ToastKind::Info, "RetroAchievements", fe::Tr(fe::Str::RaUnreachable), std::string(), std::string());
+}
+
+// pr9n (AI-assisted): see Achievements.h (PR #9 review item 9: unlocks in flight were lost when the app restarted into
+// the shelf at once).
+bool Achievements::OrbisFlushBeforeExit(int max_ms)
+{
+	if (!IsActive())
+		return true;
+	const auto t0 = std::chrono::steady_clock::now();
+	const auto until = t0 + std::chrono::milliseconds(max_ms);
+	bool unsent = false;
+	for (;;)
+	{
+		{
+			const auto lock = GetLock();
+			if (!s_client || !s_http_downloader)
+				return true;
+			s_http_downloader->PollRequests();
+			rc_client_idle(s_client); // runs a retry of a pending unlock when it's due
+			unsent = s_orbis_submissions.load() > 0 || s_orbis_unlocks_pending;
+			if (!unsent) // a ping or a badge still loading doesn't matter now
+				break;
+		}
+		if (std::chrono::steady_clock::now() >= until)
+			break;
+		Threading::Sleep(20);
+	}
+	const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+	if (!unsent)
+	{
+		Console.WriteLn("Achievements: nothing left to send before closing (%lld ms)", static_cast<long long>(ms));
+		return true;
+	}
+	Console.Warning("Achievements: %d submission(s) in flight, pending %d, after %lld ms: lost", s_orbis_submissions.load(),
+		s_orbis_unlocks_pending ? 1 : 0, static_cast<long long>(ms));
+	OrbisNotifyRichNow("RetroAchievements", fe::Tr(fe::Str::RaUnsent), OrbisToastIcon(s_game_icon, s_game_icon_url).c_str(),
+		ORBIS_TOAST_SOUND_NONE, ORBIS_TOAST_CHANNEL_SERVICE);
+	return false;
+}
+
+// Web requests copy state while locked, without retaining any runtime pointers. (AI-assisted)
+fe::GameAchievementsState Achievements::GetPS5GameAchievements()
+{
+	auto lock = GetLock();
+	fe::GameAchievementsState result;
+	if (!s_client)
+	{
+		result.message = fe::Tr(fe::Str::AchievementSignIn);
+		return result;
+	}
+	if (!rc_client_get_user_info(s_client))
+	{
+		result.message = fe::Tr(fe::Str::AchievementConnecting);
+		result.busy = true;
+		return result;
+	}
+	if (!HasActiveGame())
+	{
+		result.busy = s_load_game_request != nullptr;
+		result.message = result.busy ? fe::Tr(fe::Str::AchievementLoading) : fe::Tr(fe::Str::AchievementNoData);
+		return result;
+	}
+	result.game_id = s_game_id;
+	result.title = GetGameTitle();
+	auto* list = rc_client_create_achievement_list(s_client, RC_CLIENT_ACHIEVEMENT_CATEGORY_CORE,
+		RC_CLIENT_ACHIEVEMENT_LIST_GROUPING_LOCK_STATE);
+	auto* subsets = rc_client_create_subset_list(s_client);
+	if (list && subsets && subsets->num_subsets)
+	{
+		const uint32_t main_subset = subsets->subsets[0]->id;
+		for (uint32_t bucket = 0; bucket < list->num_buckets; ++bucket)
+		{
+			if (list->buckets[bucket].subset_id && list->buckets[bucket].subset_id != main_subset)
+				continue;
+			for (uint32_t i = 0; i < list->buckets[bucket].num_achievements; ++i)
+			{
+				const auto* achievement = list->buckets[bucket].achievements[i];
+				fe::GameAchievement entry;
+				entry.id = achievement->id;
+				entry.points = achievement->points;
+				entry.unlocked = achievement->unlocked != RC_CLIENT_ACHIEVEMENT_UNLOCKED_NONE;
+				entry.title = achievement->title ? achievement->title : "";
+				entry.description = achievement->description ? achievement->description : "";
+				result.entries.push_back(std::move(entry));
+			}
+		}
+		std::stable_sort(result.entries.begin(), result.entries.end(), [](const auto& a, const auto& b) {
+			return a.unlocked && !b.unlocked;
+		});
+	}
+	if (list)
+		rc_client_destroy_achievement_list(list);
+	if (subsets)
+		rc_client_destroy_subset_list(subsets);
+	if (result.entries.empty())
+		result.message = fe::Tr(fe::Str::AchievementEmpty);
+	return result;
+}
+
+std::vector<u8> Achievements::GetPS5AchievementBadge(u32 id)
+{
+	auto lock = GetLock();
+	if (!s_client || !HasActiveGame() || !s_http_downloader)
+		return {};
+	const auto* achievement = rc_client_get_achievement_info(s_client, id);
+	if (!achievement || !achievement->badge_name[0])
+		return {};
+	static std::unordered_map<std::string, std::chrono::steady_clock::time_point> requested;
+	const bool unlocked = achievement->unlocked != RC_CLIENT_ACHIEVEMENT_UNLOCKED_NONE;
+	const std::string path = Path::Combine(s_image_directory,
+		TinyString::from_format("achievement_{}{}.png", achievement->badge_name, unlocked ? "" : "_lock"));
+	if (FileSystem::FileExists(path.c_str()))
+	{
+		requested.erase(path);
+		// Bound the read while holding the client lock. Network work is always asynchronous.
+		auto file = FileSystem::OpenManagedCFile(path.c_str(), "rb");
+		if (!file || std::fseek(file.get(), 0, SEEK_END) != 0)
+			return {};
+		const long size = std::ftell(file.get());
+		if (size <= 0 || size > 256 * 1024 || std::fseek(file.get(), 0, SEEK_SET) != 0)
+			return {};
+		std::vector<u8> bytes(size);
+		if (std::fread(bytes.data(), 1, bytes.size(), file.get()) != bytes.size())
+			return {};
+		return bytes;
+	}
+	// Avoid duplicate image requests each time the page refreshes during a slow download.
+	const auto now = std::chrono::steady_clock::now();
+	const auto previous = requested.find(path);
+	if (previous != requested.end() && now - previous->second < std::chrono::seconds(30))
+		return {};
+	// Keep at most two web image requests queued, leaving room for gameplay API calls.
+	for (auto it = requested.begin(); it != requested.end();)
+	{
+		if (now - it->second >= std::chrono::seconds(30) || FileSystem::FileExists(it->first.c_str()))
+			it = requested.erase(it);
+		else
+			++it;
+	}
+	if (requested.size() >= 2)
+		return {};
+	requested[path] = now;
+	GetAchievementBadgePath(achievement, unlocked ? RC_CLIENT_ACHIEVEMENT_STATE_UNLOCKED : RC_CLIENT_ACHIEVEMENT_STATE_ACTIVE);
+	return {};
+}
+#endif
 
 bool Achievements::PrepareAchievementsWindow()
 {

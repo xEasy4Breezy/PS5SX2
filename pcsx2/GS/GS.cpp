@@ -584,10 +584,17 @@ void GSThrottlePresentation()
 	g_gs_device->ThrottlePresentation();
 }
 
+#ifdef ORBIS_VULKAN
+void OrbisBezelGameChanged(const std::string& serial); // GSRenderer.cpp: the overlay picture's <serial>.png
+#endif
+
 void GSGameChanged()
 {
 	if (GSIsHardwareRenderer())
 		GSTextureReplacements::GameChanged();
+#ifdef ORBIS_VULKAN
+	OrbisBezelGameChanged(VMManager::GetDiscSerial()); // 2026-10-08 (AI-assisted)
+#endif
 
 	if (!VMManager::HasValidVM() && GSCapture::IsCapturing())
 		GSCapture::EndCapture();

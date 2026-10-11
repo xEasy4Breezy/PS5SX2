@@ -1,5 +1,5 @@
 // PS5 port frontend: what every shader shares.
-// Copyright (C) 2026 Spyros
+// Copyright (C) 2026 swordpdf
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 layout(set = 0, binding = 0) uniform Frame

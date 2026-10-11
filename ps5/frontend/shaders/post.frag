@@ -1,6 +1,6 @@
 #version 450
 // PS5 port frontend: FXAA over the rendered scene, into the display image.
-// Copyright (C) 2026 Spyros
+// Copyright (C) 2026 swordpdf
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 layout(push_constant) uniform Push

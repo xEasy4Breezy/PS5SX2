@@ -25,7 +25,11 @@ size_t GSCodeReserve::GetMemoryUsed()
 
 u8* GSCodeReserve::ReserveMemory(size_t size)
 {
-	pxAssert((s_memory_ptr + size) <= s_memory_end);
+	// PS5 port (2026-10-08, AI-assisted): nullptr when the region is full, so the function map gives up and the rasterizer resets
+	// the cache (GSDrawScanline::SetupDraw returns false, then ResetCodeCache) instead of writing code past the region's end. The
+	// port's region is 8 MiB (Memory.h SWrecSize), and the scanline JIT is on by default since vk-285-136. Needs proper testing.
+	if (s_memory_ptr + size > s_memory_end)
+		return nullptr;
 	return s_memory_ptr;
 }
 

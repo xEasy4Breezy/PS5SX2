@@ -5,7 +5,7 @@
 // Vulkan build does not compile (Makefile.vk). Each is reached only on a GL device,
 // so on GSDeviceVK they are never called; they exist so the link resolves.
 //
-// Copyright (C) 2026 Spyros
+// Copyright (C) 2026 swordpdf
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <cstddef>

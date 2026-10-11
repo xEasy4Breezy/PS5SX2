@@ -126,7 +126,18 @@ bool GSDrawScanline::SetupDraw(GSRasterizerData& data)
 {
 	const GSScanlineGlobalData& global = data.global;
 
-	static const bool s_ps5_swjit = OrbisFlag("swjit"); // vk-285-33: flags/
+	// vk-285-136 (AI-assisted): the scanline JIT by default, as upstream PCSX2 runs it; flags/noswjit keeps the C++ scanline that
+	// the port used until now (vk-285-33's flags/swjit, which was never shipped, turned the JIT on). The HW renderer draws
+	// some things on the CPU through this (GameDB cpuSpriteRenderBW or cpuCLUTRender, and CRC hacks such as BlueTongue's: Call
+	// of Duty 2 and 3, Cricket 07, Jak 3, Driv3r, Stuntman, Barnyard, Nicktoons Unite, Sonic Gems Collection), and 1.9's
+	// testers' profiles spent 14 to 60% of those games' GS thread in CDrawScanline/CDrawEdge; the software renderer and the
+	// FMV hack's videos run through it too. The JIT ran on the console in the SW-renderer builds (2026-09-21), before
+	// the code memory moved to direct memory (vk-285-115): needs proper testing on the console.
+	static const bool s_ps5_swjit = [] {
+		const bool on = !OrbisFlag("noswjit");
+		std::printf("[sw] scanline JIT %s\n", on ? "on (flags/noswjit: the C++ scanline)" : "off (flags/noswjit): the C++ scanline");
+		return on;
+	}();
 	if (s_ps5_swjit)
 	{
 	data.draw_scanline = m_ds_map[global.sel];

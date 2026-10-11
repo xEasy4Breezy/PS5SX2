@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: 2026 Spyros
+// SPDX-FileCopyrightText: 2026 swordpdf
 // SPDX-License-Identifier: GPL-3.0+
 
 #pragma once

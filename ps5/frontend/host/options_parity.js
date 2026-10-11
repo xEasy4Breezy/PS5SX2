@@ -2,7 +2,7 @@
 // lines options_dump.cpp writes for the shelf's sheet (see there). The page's text fields (Textures folder) have no row
 // on the sheet: left out.
 //   node options_parity.js <index.html>
-// Copyright (C) 2026 Spyros
+// Copyright (C) 2026 swordpdf
 // SPDX-License-Identifier: GPL-3.0-or-later
 "use strict";
 const fs = require("fs");
@@ -13,7 +13,8 @@ const head = script.slice(0, script.indexOf("// ---- vk-285-113: memory cards.")
 const GROUPS = new Function(head + "\nreturn GROUPS;")();
 const out = [];
 for (const g of GROUPS) {
-  out.push("G " + (g.tab || "settings") + " " + g.title);
+  if (g.items.every((it) => it.type === "text")) continue; // 2026-10-08: a group of text fields only (Folders) isn't on the sheet
+  out.push("G " + (g.tab || "settings") + " " + g.title + (g.game ? " [one game]" : g.global ? " [all games]" : "")); // 2026-10-08: Hardware fixes; vk-285-137: Shelf
   for (const it of g.items) {
     if (it.type === "text") continue;
     const options = it.type === "toggle" ? [["false", "Off"], ["true", "On"]] : it.options;

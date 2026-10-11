@@ -1,6 +1,6 @@
 // PS5 port frontend: the game list (see fe_games.h).
 //
-// Copyright (C) 2026 Spyros
+// Copyright (C) 2026 swordpdf
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "fe_games.h"
@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <dirent.h>
 #include <fcntl.h>
@@ -91,10 +92,62 @@ public:
 		: m_fd(fd)
 	{
 	}
-	bool Read(uint32_t lba, void* buf, size_t len) override { return ReadAt(m_fd, static_cast<uint64_t>(lba) * 2048, buf, len); }
+	bool Read(uint32_t lba, void* buf, size_t len) override
+	{
+		if (m_block == 2048 && m_offset == 0)
+		{
+			if (ReadAt(m_fd, static_cast<uint64_t>(lba) * 2048, buf, len))
+				return true;
+			// vk-285-146 (AI-assisted): the PS5's disc drive (/dev/cd0) reads only whole 2048-byte sectors, so a
+			// SYSTEM.CNF of 60 bytes failed there. Again in whole sectors, through a buffer. (An image file read
+			// exactly as before; this runs only when that failed.)
+			const size_t whole = (len + 2047) & ~static_cast<size_t>(2047);
+			if (whole == len || whole > (8u << 20))
+				return false;
+			std::vector<uint8_t> tmp(whole);
+			if (!ReadAt(m_fd, static_cast<uint64_t>(lba) * 2048, tmp.data(), whole))
+				return false;
+			std::memcpy(buf, tmp.data(), len);
+			return true;
+		}
+		// A raw image: sector by sector, the 2048 bytes of data m_offset bytes into each m_block-byte sector.
+		uint8_t* p = static_cast<uint8_t*>(buf);
+		for (; len; lba++)
+		{
+			const size_t n = std::min<size_t>(len, 2048);
+			if (!ReadAt(m_fd, static_cast<uint64_t>(lba) * m_block + m_offset, p, n))
+				return false;
+			p += n;
+			len -= n;
+		}
+		return true;
+	}
+
+	// 2026-10-08 (AI-assisted; testers: ".bin images don't load"): a .bin or .img is often a raw CD image, 2352-byte
+	// sectors (a PS2 CD from a .cue/.bin: mode 2 with the data 24 bytes in, or mode 1 with it 16 in), 2336 (mode 2
+	// without sync and header) or 2448 (with subcode), as PCSX2's own reader detects them (InputIsoFile::Detect). The
+	// layout that puts the ISO 9660 volume descriptor ("\1CD001") at sector 16; plain 2048-byte sectors (and false) when none
+	// does.
+	bool Detect()
+	{
+		static constexpr uint32_t kLayouts[][2] = {{2048, 0}, {2352, 24}, {2352, 16}, {2336, 8}, {2448, 24}, {2448, 16}};
+		for (const auto& layout : kLayouts)
+		{
+			m_block = layout[0];
+			m_offset = layout[1];
+			uint8_t pvd[6];
+			if (Read(16, pvd, sizeof(pvd)) && pvd[0] == 1 && std::memcmp(pvd + 1, "CD001", 5) == 0)
+				return true;
+		}
+		m_block = 2048;
+		m_offset = 0;
+		return false;
+	}
 
 private:
 	int m_fd;
+	uint32_t m_block = 2048;
+	uint32_t m_offset = 0;
 };
 
 // vk-285-108: a CHD through libchdr. A DVD image (chdman createdvd) holds 2048-byte units; a CD image
@@ -427,13 +480,18 @@ std::string s_serial_file;
 bool s_serial_loaded = false;
 std::unordered_map<std::string, std::string> s_serials; // "<path>\t<size>\t<mtime>" -> serial
 
+std::string MakeSerialKey(const std::string& path, long long size, long long mtime)
+{
+	return path + "\t" + std::to_string(size) + "\t" + std::to_string(mtime);
+}
+
 std::string SerialKey(const std::string& path)
 {
 	struct stat st = {};
-	if (stat(path.c_str(), &st) != 0)
+	// 2.02: regular files only -- the disc drive's node (ProsperoDiscDump.cpp reads /dev/cd0) holds another disc tomorrow.
+	if (stat(path.c_str(), &st) != 0 || !S_ISREG(st.st_mode))
 		return {};
-	return path + "\t" + std::to_string(static_cast<long long>(st.st_size)) + "\t" +
-	       std::to_string(static_cast<long long>(st.st_mtime));
+	return MakeSerialKey(path, static_cast<long long>(st.st_size), static_cast<long long>(st.st_mtime));
 }
 
 void LoadSerialsLocked()
@@ -457,28 +515,51 @@ void LoadSerialsLocked()
 	std::fclose(f);
 }
 
-std::string ChdSerial(const std::string& path)
+// 2.02: a serial the cache file has for this key (only found serials are kept).
+bool CachedSerial(const std::string& key, std::string& serial)
 {
-	const std::string key = SerialKey(path);
-	if (!key.empty())
-	{
-		std::lock_guard<std::mutex> lock(s_serial_mutex);
-		LoadSerialsLocked();
-		const auto it = s_serials.find(key);
-		if (it != s_serials.end())
-			return it->second;
-	}
-	std::string serial;
+	if (key.empty())
+		return false;
+	std::lock_guard<std::mutex> lock(s_serial_mutex);
+	LoadSerialsLocked();
+	const auto it = s_serials.find(key);
+	if (it == s_serials.end() || it->second.empty())
+		return false;
+	serial = it->second;
+	return true;
+}
+
+// The serial read from the image itself: a .chd through libchdr, a .cso/.zso decompressed (vk-285-113), anything else
+// as an ISO 9660 image (2026-10-08: a raw .bin/.img's sector layout detected).
+std::string ImageSerial(const std::string& path)
+{
 	if (HasExtension(path.c_str(), ".chd"))
 	{
 		ChdSectors disc;
-		serial = disc.Open(path) ? SerialFromDisc(disc) : std::string();
+		return disc.Open(path) ? SerialFromDisc(disc) : std::string();
 	}
-	else
+	if (HasExtension(path.c_str(), ".cso") || HasExtension(path.c_str(), ".zso"))
 	{
 		CsoSectors disc; // vk-285-113
-		serial = disc.Open(path) ? SerialFromDisc(disc) : std::string();
+		return disc.Open(path) ? SerialFromDisc(disc) : std::string();
 	}
+	const int fd = open(path.c_str(), O_RDONLY);
+	if (fd < 0)
+		return {};
+	IsoSectors disc(fd);
+	disc.Detect();
+	const std::string serial = SerialFromDisc(disc);
+	close(fd);
+	return serial;
+}
+
+// vk-285-108 (the CHDs), 2.02 (every format): the cache file first, else the image, and a serial found is kept.
+std::string KeyedSerial(const std::string& path, const std::string& key)
+{
+	std::string serial;
+	if (CachedSerial(key, serial))
+		return serial;
+	serial = ImageSerial(path);
 	if (!serial.empty() && !key.empty())
 	{
 		std::lock_guard<std::mutex> lock(s_serial_mutex);
@@ -511,7 +592,14 @@ std::string DescribeImage(const std::string& image_path)
 
 bool IsDiscImageName(const char* name)
 {
-	return HasExtension(name, ".iso") || HasExtension(name, ".chd") || HasExtension(name, ".cso") || HasExtension(name, ".zso");
+	// 2026-10-08: .bin and .img too (raw CD images or plain ISOs under another name; PCSX2 reads both, VMManager.cpp's list).
+	return HasExtension(name, ".iso") || HasExtension(name, ".chd") || HasExtension(name, ".cso") || HasExtension(name, ".zso") ||
+		   HasExtension(name, ".bin") || HasExtension(name, ".img") || IsElfName(name);
+}
+
+bool IsElfName(const char* name)
+{
+	return HasExtension(name, ".elf"); // 2026-10-08: a PS2 executable (homebrew, a patched game's executable)
 }
 
 void SetSerialCacheFile(const std::string& path)
@@ -526,15 +614,128 @@ void SetSerialCacheFile(const std::string& path)
 
 std::string ReadSerial(const std::string& image_path)
 {
-	if (HasExtension(image_path.c_str(), ".chd") || HasExtension(image_path.c_str(), ".cso") || HasExtension(image_path.c_str(), ".zso"))
-		return ChdSerial(image_path); // vk-285-113: the compressed formats keep their serials in the cache file
-	const int fd = open(image_path.c_str(), O_RDONLY);
+	// 2.02: every format through the serial cache (was the compressed ones only, vk-285-108/113).
+	return KeyedSerial(image_path, SerialKey(image_path));
+}
+
+std::string ReadSerial(const GameInfo& g)
+{
+	if (g.mtime == 0)
+		return ReadSerial(g.path);
+	return KeyedSerial(g.path, MakeSerialKey(g.path, static_cast<long long>(g.bytes), static_cast<long long>(g.mtime)));
+}
+
+// Read ISO9660 files without touching the emulator's global CDVD state. (AI-assisted)
+bool ReadAchievementExecutable(const std::string& path, std::string& name, std::vector<uint8_t>& bytes)
+{
+	name.clear();
+	bytes.clear();
+	auto read = [&](SectorReader& disc) {
+		uint8_t pvd[2048];
+		if (!disc.Read(16, pvd, sizeof(pvd)) || pvd[0] != 1 || std::memcmp(pvd + 1, "CD001", 5) != 0)
+			return false;
+		const uint32_t root_lba = Le32(pvd + 158), root_size = Le32(pvd + 166);
+		auto find = [&](uint32_t directory, uint32_t length, const std::string& wanted,
+						uint32_t& lba, uint32_t& size, bool& is_dir) {
+			if (!length || length > 1024 * 1024)
+				return false;
+			std::vector<uint8_t> data(length);
+			if (!disc.Read(directory, data.data(), data.size()))
+				return false;
+			for (size_t off = 0; off < data.size();)
+			{
+				const unsigned n = data[off];
+				if (!n)
+				{
+					off = (off / 2048 + 1) * 2048;
+					continue;
+				}
+				if (n < 34 || off + n > data.size() || data[off + 32] > n - 33)
+					return false;
+				std::string entry(reinterpret_cast<const char*>(data.data() + off + 33), data[off + 32]);
+				const auto version = entry.find(';');
+				if (version != std::string::npos)
+					entry.resize(version);
+				if (Lower(entry) == Lower(wanted))
+				{
+					// Multi-extent executables require a different reader; don't hash partial data.
+					if (data[off + 25] & 0x80)
+						return false;
+					lba = Le32(data.data() + off + 2);
+					size = Le32(data.data() + off + 10);
+					is_dir = (data[off + 25] & 2) != 0;
+					return true;
+				}
+				off += n;
+			}
+			return false;
+		};
+		uint32_t lba = 0, size = 0;
+		bool directory = false;
+		if (!find(root_lba, root_size, "SYSTEM.CNF", lba, size, directory) || directory || !size || size > 4096)
+			return false;
+		std::string cnf(size, '\0');
+		if (!disc.Read(lba, cnf.data(), size))
+			return false;
+		const auto boot = cnf.find("BOOT2");
+		const auto colon = cnf.find(':', boot);
+		if (boot == std::string::npos || colon == std::string::npos)
+			return false;
+		size_t start = colon + 1;
+		while (start < cnf.size() && (cnf[start] == '\\' || cnf[start] == '/'))
+			++start;
+		const auto end = cnf.find_first_of(";\r\n", start);
+		std::string executable = Trim(cnf.substr(start, end - start));
+		std::replace(executable.begin(), executable.end(), '\\', '/');
+		if (executable.empty())
+			return false;
+		uint32_t dir_lba = root_lba, dir_size = root_size;
+		size_t part = 0;
+		for (;;)
+		{
+			const auto slash = executable.find('/', part);
+			const auto component = executable.substr(part, slash - part);
+			if (component.empty() || component == "." || component == ".." ||
+				!find(dir_lba, dir_size, component, lba, size, directory))
+				return false;
+			if (slash == std::string::npos)
+			{
+				if (directory || !size)
+					return false;
+				bytes.resize(std::min<uint32_t>(size, 64 * 1024 * 1024));
+				if (!disc.Read(lba, bytes.data(), bytes.size()))
+				{
+					bytes.clear();
+					return false;
+				}
+				name = component;
+				return true;
+			}
+			if (!directory)
+				return false;
+			dir_lba = lba;
+			dir_size = size;
+			part = slash + 1;
+		}
+	};
+	if (HasExtension(path.c_str(), ".chd"))
+	{
+		ChdSectors disc;
+		return disc.Open(path) && read(disc);
+	}
+	if (HasExtension(path.c_str(), ".cso") || HasExtension(path.c_str(), ".zso"))
+	{
+		CsoSectors disc;
+		return disc.Open(path) && read(disc);
+	}
+	const int fd = open(path.c_str(), O_RDONLY);
 	if (fd < 0)
-		return {};
+		return false;
 	IsoSectors disc(fd);
-	const std::string serial = SerialFromDisc(disc);
+	disc.Detect(); // 2026-10-08: a raw .bin/.img's sector layout
+	const bool ok = read(disc);
 	close(fd);
-	return serial;
+	return ok;
 }
 
 void MakeTitle(const std::string& stem, std::string& title, std::string& region, std::string& extra)
@@ -599,6 +800,7 @@ struct DbEntry
 {
 	std::string name;
 	std::string region; // PCSX2's "NTSC-U", "PAL-E", ...
+	std::vector<std::pair<std::string, int>> hw_fixes; // 2026-10-08: gsHWFixes ("nativeScaling" -> 3), in the file's order
 };
 std::mutex s_db_mutex;
 std::string s_db_file;
@@ -642,14 +844,17 @@ void LoadDbLocked()
 	while ((n = std::fread(buf.data(), 1, buf.size(), f)) > 0)
 		text.append(buf.data(), n);
 	std::fclose(f);
-	std::string serial, name, name_en, region;
+	std::string serial, name, name_en, region, section;
+	std::vector<std::pair<std::string, int>> hw_fixes;
 	const auto flush = [&]() {
 		if (!serial.empty() && !(name_en.empty() && name.empty()))
-			s_db[serial] = DbEntry{name_en.empty() ? name : name_en, region};
+			s_db[serial] = DbEntry{name_en.empty() ? name : name_en, region, std::move(hw_fixes)};
 		serial.clear();
 		name.clear();
 		name_en.clear();
 		region.clear();
+		section.clear();
+		hw_fixes.clear();
 	};
 	const char* p = text.data();
 	const char* const end = p + text.size();
@@ -675,6 +880,21 @@ void LoadDbLocked()
 				const size_t kl = std::strlen(key);
 				return static_cast<size_t>(eol - q) > kl && std::memcmp(q, key, kl) == 0;
 			};
+			// 2026-10-08: the entry's own keys are 2 spaces in ("  gsHWFixes:"); a section's are 4 ("    nativeScaling: 3").
+			const long indent = q - p;
+			const char* colon = static_cast<const char*>(std::memchr(q, ':', static_cast<size_t>(eol - q)));
+			if (indent == 2 && colon)
+				section.assign(q, colon);
+			else if (indent == 4 && colon && colon > q && section == "gsHWFixes")
+			{
+				// "autoFlush: 1 # Fixes effects." (a fix without a value is 1, as GameDatabase.cpp reads it). The few with a
+				// function's name for a value (getSkipCount: "GSC_..."), which manual fixes don't touch, are left out.
+				const std::string value = YamlValue(colon + 1, eol);
+				char* stop = nullptr;
+				const long v = value.empty() ? 1 : std::strtol(value.c_str(), &stop, 10);
+				if (value.empty() || (stop && *stop == '\0'))
+					hw_fixes.emplace_back(std::string(q, colon), static_cast<int>(v));
+			}
 			if (is_key("name-en:"))
 				name_en = YamlValue(q + 8, eol);
 			else if (is_key("name-sort:"))
@@ -786,6 +1006,16 @@ bool ApplyGameDbTitle(GameInfo& g)
 	return true;
 }
 
+std::vector<std::pair<std::string, int>> GameDbHwFixes(const std::string& serial)
+{
+	if (serial.empty())
+		return {};
+	std::lock_guard<std::mutex> lock(s_db_mutex);
+	LoadDbLocked();
+	const auto it = s_db.find(serial);
+	return it == s_db.end() ? std::vector<std::pair<std::string, int>>() : it->second.hw_fixes;
+}
+
 void SortGames(std::vector<GameInfo>& games)
 {
 	std::sort(games.begin(), games.end(), [](const GameInfo& a, const GameInfo& b) {
@@ -824,7 +1054,7 @@ void ScanDir(const std::string& dir, std::vector<GameInfo>& games, std::vector<s
 	{
 		if (!IsDiscImageName(e->d_name))
 		{
-			if (subdirs && subdirs->size() < 64 && !SkipSubfolder(e->d_name))
+			if (subdirs && subdirs->size() < 4096 && !SkipSubfolder(e->d_name))
 			{
 				bool is_dir = e->d_type == DT_DIR;
 				if (e->d_type == DT_UNKNOWN)
@@ -845,9 +1075,40 @@ void ScanDir(const std::string& dir, std::vector<GameInfo>& games, std::vector<s
 		struct stat st = {};
 		if (stat(g.path.c_str(), &st) != 0 || !S_ISREG(st.st_mode))
 			continue;
+		// 2026-10-08: an .elf is listed when it is one (its first bytes "\x7fELF"): homebrew, or a game's executable that runs
+		// with a disc (the sheet's Disc image row; main-boot.cpp boots it as PCSX2 boots an ELF).
+		if (IsElfName(file.c_str()))
+		{
+			char magic[4] = {};
+			const int fd = open(g.path.c_str(), O_RDONLY);
+			const bool elf = fd >= 0 && read(fd, magic, sizeof(magic)) == 4 && std::memcmp(magic, "\x7f" "ELF", 4) == 0;
+			if (fd >= 0)
+				close(fd);
+			if (!elf)
+				continue;
+		}
+		// 2026-10-08: a .bin or .img under 16 MB is no PS2 disc (a BIOS dump, a memory card), and one without an ISO 9660
+		// volume in any sector layout is no data disc (the audio tracks of a .cue/.bin set, "Game (Track 2).bin"): not listed.
+		std::string cached_serial;
+		if ((HasExtension(file.c_str(), ".bin") || HasExtension(file.c_str(), ".img")) &&
+			// 2.02: one with a serial in the cache was a data disc already (no open: on an NFS share each costs ~30 ms)
+			!CachedSerial(MakeSerialKey(g.path, static_cast<long long>(st.st_size), static_cast<long long>(st.st_mtime)), cached_serial))
+		{
+			if (st.st_size < (16LL << 20))
+				continue;
+			const int fd = open(g.path.c_str(), O_RDONLY);
+			if (fd < 0)
+				continue;
+			IsoSectors disc(fd);
+			const bool data_disc = disc.Detect();
+			close(fd);
+			if (!data_disc)
+				continue;
+		}
 		g.file = file;
-		g.stem = file.substr(0, file.size() - 4); // ".iso", ".chd", ".cso", ".zso"
+		g.stem = file.substr(0, file.size() - 4); // ".iso", ".chd", ".cso", ".zso", ".bin", ".img"
 		g.bytes = static_cast<uint64_t>(st.st_size);
+		g.mtime = static_cast<int64_t>(st.st_mtime); // 2.02: the serial cache's key (ReadSerial(const GameInfo&))
 		MakeTitle(g.stem, g.title, g.region, g.extra);
 		games.push_back(g);
 	}
@@ -923,6 +1184,7 @@ void ReadBadges(GameInfo& g, const std::string& settings_dir, const std::string&
 {
 	g.badges.clear();
 	const std::string ini = settings_dir + "/" + g.stem + ".ini";
+	g.hidden = IniValue(ini, "PS5SX2/HideGame") == "true"; // vk-285-137: the game's own file only, never gs.ini
 	std::string scale = IniValue(ini, "upscale_multiplier");
 	if (scale.empty())
 		scale = IniValue(gs_ini, "upscale_multiplier");
@@ -944,5 +1206,126 @@ void ReadBadges(GameInfo& g, const std::string& settings_dir, const std::string&
 		g.badges.push_back("16:9");
 	if (IniHasLine(ini, "Patches/Enable=60 FPS"))
 		g.badges.push_back("60 FPS");
+}
+
+bool ShowHiddenGames(const std::string& gs_ini)
+{
+	return IniValue(gs_ini, "PS5SX2/ShowHiddenGames") == "true";
+}
+
+// vk-285-139 (AI-assisted; swordpdf: "multi-disc and disc-change support"). Needs proper testing on the console.
+int DiscNumber(const std::string& name, std::string* rest)
+{
+	std::string stem = name;
+	const size_t dot = stem.rfind('.');
+	if (dot != std::string::npos && dot > 0)
+		stem.erase(dot);
+	const std::string low = Lower(stem);
+	int n = 0;
+	size_t at = std::string::npos, end = 0;
+	for (size_t p = low.find("(disc"); p != std::string::npos; p = low.find("(disc", p + 1))
+	{
+		size_t q = p + 5;
+		while (q < low.size() && low[q] == ' ')
+			q++;
+		size_t d = q;
+		while (d < low.size() && std::isdigit(static_cast<unsigned char>(low[d])))
+			d++;
+		if (d == q || d - q > 2)
+			continue;
+		size_t e = d;
+		if (low.compare(e, 4, " of ") == 0)
+		{
+			e += 4;
+			const size_t m = e;
+			while (e < low.size() && std::isdigit(static_cast<unsigned char>(low[e])))
+				e++;
+			if (e == m)
+				continue;
+		}
+		if (e >= low.size() || low[e] != ')')
+			continue;
+		n = std::atoi(low.c_str() + q);
+		at = p;
+		end = e + 1;
+		break;
+	}
+	if (rest)
+	{
+		std::string r = at == std::string::npos ? low : low.substr(0, at) + low.substr(end);
+		std::string out;
+		for (char c : r) // the space either side of the tag counts once
+			if (!(c == ' ' && !out.empty() && out.back() == ' '))
+				out += c;
+		*rest = Trim(out);
+	}
+	return n;
+}
+
+std::vector<std::string> DiscSet(const std::string& path)
+{
+	const size_t slash = path.rfind('/');
+	const std::string dir = slash == std::string::npos ? std::string(".") : path.substr(0, slash);
+	const std::string name = slash == std::string::npos ? path : path.substr(slash + 1);
+	auto is_file = [](const std::string& p) {
+		struct stat st = {};
+		return stat(p.c_str(), &st) == 0 && S_ISREG(st.st_mode);
+	};
+	std::vector<std::string> m3us, images;
+	if (DIR* d = opendir(dir.c_str()))
+	{
+		while (const dirent* e = readdir(d))
+		{
+			if (e->d_name[0] == '.')
+				continue;
+			if (HasExtension(e->d_name, ".m3u"))
+				m3us.emplace_back(e->d_name);
+			else if (IsDiscImageName(e->d_name) && !IsElfName(e->d_name))
+				images.emplace_back(e->d_name);
+		}
+		closedir(d);
+	}
+	std::sort(m3us.begin(), m3us.end());
+	for (const std::string& m : m3us)
+	{
+		FILE* f = std::fopen((dir + "/" + m).c_str(), "r");
+		if (!f)
+			continue;
+		std::vector<std::string> list;
+		bool lists_this = false;
+		char line[1024];
+		while (std::fgets(line, sizeof(line), f))
+		{
+			std::string l = Trim(line);
+			if (l.empty() || l[0] == '#')
+				continue;
+			const std::string p = l[0] == '/' ? l : dir + "/" + l;
+			if (!is_file(p))
+				continue;
+			lists_this = lists_this || p == path || l == name;
+			list.push_back(p);
+		}
+		std::fclose(f);
+		if (lists_this && list.size() > 1)
+			return list;
+	}
+	std::string key;
+	if (DiscNumber(name, &key) == 0)
+		return {path};
+	std::vector<std::pair<int, std::string>> found;
+	for (const std::string& img : images)
+	{
+		std::string k;
+		const int n = DiscNumber(img, &k);
+		if (n > 0 && k == key && std::none_of(found.begin(), found.end(), [n](const auto& x) { return x.first == n; }))
+			found.emplace_back(n, img == name ? path : dir + "/" + img);
+	}
+	std::sort(found.begin(), found.end());
+	std::vector<std::string> out;
+	for (const auto& f : found)
+		out.push_back(f.second);
+	if (std::find(out.begin(), out.end(), path) == out.end())
+		out.insert(out.begin(), path);
+	return out;
 }
 } // namespace fe

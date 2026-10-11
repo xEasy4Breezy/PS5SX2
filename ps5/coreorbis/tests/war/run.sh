@@ -2,7 +2,7 @@
 # PS5SX2 (vk-285-119, AI-assisted): runs test_war.c -- orbis-shims/orbis_ps5vk_war.c against the driver release's own
 # ps5vk_cmd_buffer.o, renamed as link-vk.sh renames it -- on the PC.
 #   PS5_VULKAN_DIR=<the 6a20943 driver release folder> tests/war/run.sh [steps]
-# Copyright (C) 2026 Spyros
+# Copyright (C) 2026 swordpdf
 # SPDX-License-Identifier: GPL-3.0-or-later
 set -euo pipefail
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)

@@ -4874,6 +4874,47 @@ void GSTextureCache::InvalidateVideoMem(const GSOffset& off, const GSVector4i& r
 		}
 	});
 
+	// Scan for Sources whose higher mip layers (lyr 1-6) overlap this VRAM write.
+	// Source::SetPages() only registers mip 0 in m_src.m_map, so a framebuffer
+	// render into a mip 1-6 VRAM page goes unnoticed by the loopPages scan above,
+	// leaving stale GPU mip data (visible as the flat-coloured ring around the
+	// player character in R&C 1 after cutscenes — general fix, not game-specific).
+	// needs proper testing
+	// 2.01 follow-up (GoW1 black sky report): only for host->local (CPU) writes, as the commit message says. Every draw
+	// calls this with target=false (GSRendererHW.cpp InvalidateVideoMem(context->offset.fb, real_rect, false)), and a GPU
+	// draw never updates GS local memory, so re-uploading a layer there can only put stale VRAM over a good layer.
+	// Repeating sources index m_valid by texture-local block (Source::Update), not by GS page, so valid[page] = 0 would
+	// clear unrelated blocks of mip 0 there: skip them.
+	for (Source* s : m_src.m_surfaces)
+	{
+		if (!target)
+			break;
+		if (s->m_target || s->m_from_hash_cache || s->m_repeating)
+			continue;
+		u32* RESTRICT valid = s->m_valid.get();
+		if (!valid || s->CanPreload())
+			continue;
+		for (int lyr = 1; lyr <= 6; lyr++)
+		{
+			const GIFRegTEX0 ltex = s->m_layer_TEX0[lyr];
+			if (ltex.U64 == 0) // Never loaded (default-initialised to zero)
+				continue;
+			if (!GSUtil::HasSharedBits(psm, ltex.PSM))
+				continue;
+			const GSVector4i mrect(0, 0, 1 << ltex.TW, 1 << ltex.TH);
+			const u32 mip_end = GSLocalMemory::GetUnwrappedEndBlockAddress(ltex.TBP0, ltex.TBW, ltex.PSM, mrect);
+			if (end_bp <= ltex.TBP0 || start_bp >= mip_end)
+				continue;
+			// This mip layer's VRAM was overwritten — invalidate and force re-upload next draw.
+			const GSOffset mip_off(GSLocalMemory::m_psm[ltex.PSM].info, ltex.TBP0, ltex.TBW, ltex.PSM);
+			mip_off.loopPages(mrect, [valid](u32 page) {
+				valid[page] = 0;
+			});
+			s->m_complete_layers &= ~(1u << lyr);
+			s->m_layer_TEX0[lyr].U64 = 0; // Force UpdateLayer to call Update() next draw
+		}
+	}
+
 	if (!target)
 		return;
 

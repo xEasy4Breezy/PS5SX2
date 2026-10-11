@@ -8,7 +8,7 @@
 // One image: no menu. None: the caller's default. The nomenu flag: the last game, no menu.
 // vk-285-33: the images are looked for in games/ and then in the top folder (older setups).
 //
-// Copyright (C) 2026 Spyros
+// Copyright (C) 2026 swordpdf
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "demo_renderer.hpp"

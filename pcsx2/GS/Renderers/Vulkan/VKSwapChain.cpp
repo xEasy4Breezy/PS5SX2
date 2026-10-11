@@ -11,9 +11,13 @@
 #include "common/CocoaTools.h"
 #include "common/Console.h"
 
+#include "fmt/format.h" // vk-285-133: the modes offered, for boot.log
+
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdio>
+#include <string>
 
 #if defined(VK_USE_PLATFORM_XLIB_KHR)
 #include <X11/Xlib.h>
@@ -75,12 +79,18 @@ static VkSurfaceKHR CreateOrbisDisplaySurface(VkInstance instance, VkPhysicalDev
 
 	// The first display with a mode; the largest mode it offers (ps5vk has one), and of equally large ones the one nearest
 	// 60 Hz (vk-285-115: RADV can list 119.88 Hz first, when the title asks VideoOut for high frame rates).
+	// 2026-10-08 (AI-assisted): with frame generation on for the game (PS5SX2/FrameGeneration), the one nearest 120 Hz: a
+	// 60 fps game is shown at 120 with a generated frame between two of its own (GSDeviceVK.cpp, "frame generation").
+	// vk-285-133: the modes offered go to boot.log (vk-285-131's console run had only the 60 Hz one, and nothing said so).
+	extern bool g_orbis_fg_wanted;
+	const s64 wanted_mhz = g_orbis_fg_wanted ? 120000 : 60000;
 	VkDisplayKHR chosen_display = VK_NULL_HANDLE;
 	VkDisplayModePropertiesKHR chosen_mode = {};
-	const auto off_60hz = [](const VkDisplayModePropertiesKHR& m) {
+	const auto off_60hz = [wanted_mhz](const VkDisplayModePropertiesKHR& m) {
 		const s64 mhz = static_cast<s64>(m.parameters.refreshRate);
-		return mhz > 60000 ? mhz - 60000 : 60000 - mhz;
+		return mhz > wanted_mhz ? mhz - wanted_mhz : wanted_mhz - mhz;
 	};
+	std::string offered;
 	for (const VkDisplayPropertiesKHR& display : displays)
 	{
 		u32 mode_count = 0;
@@ -92,6 +102,8 @@ static VkSurfaceKHR CreateOrbisDisplaySurface(VkInstance instance, VkPhysicalDev
 			continue;
 		for (const VkDisplayModePropertiesKHR& mode : modes)
 		{
+			offered += fmt::format("{}{}x{} at {:.2f} Hz", offered.empty() ? "" : ", ", mode.parameters.visibleRegion.width,
+				mode.parameters.visibleRegion.height, mode.parameters.refreshRate / 1000.0);
 			const VkExtent2D& region = mode.parameters.visibleRegion;
 			const u64 area = static_cast<u64>(region.width) * region.height;
 			const u64 chosen_area =
@@ -141,8 +153,16 @@ static VkSurfaceKHR CreateOrbisDisplaySurface(VkInstance instance, VkPhysicalDev
 	}
 	Console.WriteLn("VK: display surface %ux%u on plane %u (%.2f Hz)", chosen_mode.parameters.visibleRegion.width,
 		chosen_mode.parameters.visibleRegion.height, chosen_plane, chosen_mode.parameters.refreshRate / 1000.0);
+	printf("[display] modes offered: %s; %s: %.2f Hz\n", offered.c_str(),
+		g_orbis_fg_wanted ? "frame generation is on, so the one nearest 120 Hz" : "the one nearest 60 Hz",
+		chosen_mode.parameters.refreshRate / 1000.0);
+	fflush(stdout);
 	return surface;
 }
+
+// vk-285-133 (AI-assisted): what ps5vk's output did with the swapchain (the param.json it read, 119.88 Hz selected, refused
+// with the system's code, ...), for boot.log: the driver's own lines go to stderr.log. Weak: the RADV eboot has no such call.
+extern "C" const char* ps5vk_output_status(void) __attribute__((weak));
 #endif
 
 VkSurfaceKHR VKSwapChain::CreateVulkanSurface(VkInstance instance, VkPhysicalDevice physical_device, WindowInfo* wi)
@@ -258,6 +278,13 @@ std::unique_ptr<VKSwapChain> VKSwapChain::Create(const WindowInfo& wi, VkSurface
 	if (!swap_chain->CreateSwapChain())
 		return nullptr;
 
+#ifdef ORBIS_VULKAN
+	if (ps5vk_output_status)
+	{
+		printf("[display] swapchain: %s\n", ps5vk_output_status());
+		fflush(stdout);
+	}
+#endif
 	return swap_chain;
 }
 

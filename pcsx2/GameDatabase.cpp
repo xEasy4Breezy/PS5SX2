@@ -1104,6 +1104,16 @@ constexpr OrbisSpeedHackFix kOrbisSpeedHackFixes[] = {
 	{"SLPM-65406", "Castlevania [Limited Edition]", 0, 0},
 	{"SLPM-66325", "Castlevania [Konami Dendou Selection]", 0, 0},
 	{"SLPM-61062", "Castlevania [Trial]", 0, 0},
+	// Castlevania: Curse of Darkness (Lament of Innocence's engine): froze opening the in-game menu with MTVU (tester's
+	// notes, vk-285-139, US): VU1's menu program MSCAL 0x10 ran out the 3M-cycle budget without its E-bit ([vulong]/
+	// [vurunaway]), then either the EE looped at 00402654/00750000 with VIF1 and VU1 idle (VU 100%, GS 0%, as Lament of
+	// Innocence's stalls) or the EE thread stopped outright (cycles frozen for 110 s).
+	{"SLUS-21168", "Castlevania - Curse of Darkness", 0, 0},
+	{"SLES-53755", "Castlevania - Curse of Darkness", 0, 0},
+	{"SLKA-25328", "Castlevania - Curse of Darkness", 0, 0},
+	{"SLPM-66175", "Akumajou Dracula - Yami no Juin", 0, 0},
+	{"SLPM-66668", "Akumajou Dracula - Yami no Juin [KONAMI The BEST]", 0, 0},
+	{"SLPM-61138", "Akumajo Dracula - Yami no Juin [Store Demo]", 0, 0},
 };
 
 void OrbisSetSpeedHack(GameDatabaseSchema::GameEntry& entry, SpeedHack id, int value)
@@ -1129,12 +1139,12 @@ struct OrbisGameFixAddition
 };
 
 constexpr OrbisGameFixAddition kOrbisGameFixAdditions[] = {
-	// GTA Liberty City Stories with its 60 FPS patch at 6x (Spyros's Pro, 2026-10-03): event tests 1.9 M -> 0.13 M a
+	// GTA Liberty City Stories with its 60 FPS patch at 6x (swordpdf's Pro, 2026-10-03): event tests 1.9 M -> 0.13 M a
 	// second, the EE thread 100% -> 80% busy at the same view; with vk-285-124's GIF path wait 47-53 fps became 58-60.
 	// Minutes of driving showed nothing wrong. The US release only; the EU (SLES-54135/54136) and JP (SLPM-66851,
 	// SLPM-55038) ones are untested.
 	{"SLUS-21423", "Grand Theft Auto - Liberty City Stories", Fix_InstantDMA},
-	// vk-285-128: San Andreas and Vice City (US) with their 60 FPS patches (Spyros's Pro, 2026-10-04), Instant DMA in
+	// vk-285-128: San Andreas and Vice City (US) with their 60 FPS patches (swordpdf's Pro, 2026-10-04), Instant DMA in
 	// their settings files: San Andreas's event tests 877 k -> 277 k a second; both held 60 with the EE overclocked
 	// (San Andreas EE Cycle Rate 2, Vice City 3 with vk-285-126) and showed nothing wrong in their sessions. EU/JP untested.
 	{"SLUS-20946", "Grand Theft Auto - San Andreas", Fix_InstantDMA},
@@ -1154,7 +1164,7 @@ struct OrbisGameDbAlias
 constexpr OrbisGameDbAlias kOrbisGameDbAliases[] = {
 	// Dragon Ball Z Budokai Tenkaichi 4, a fan mod of Budokai Tenkaichi 3 ("BT4 Beta 14 REV2 ENG", CRC 428113C2). Without
 	// BT3's fixes (half pixel offset 5, native scaling 4, the OI_DBZBTGames draw hook) Vegeta's shadow sat off at 6x and
-	// was right at 1x (Spyros's Pro, 2026-10-04); with the first two in its settings file it was right at 6x.
+	// was right at 1x (swordpdf's Pro, 2026-10-04); with the first two in its settings file it was right at 6x.
 	{"SLUS-21978", "SLUS-21678", "Dragon Ball Z - Budokai Tenkaichi 4 (fan mod of Budokai Tenkaichi 3)"},
 };
 

@@ -1,5 +1,6 @@
 // pcsx2-orbis boot smoke: VMManager init + Execute on worker + pc sampling.
 #include <atomic>
+#include <memory> // 2.02: orbis_probe_game_read
 #include <cstdarg>
 #include <vector>
 #include <algorithm>
@@ -14,6 +15,7 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <strings.h> // 2026-10-08: strcasecmp (an .elf from the shelf)
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -30,10 +32,18 @@
 #ifdef ORBIS_VULKAN
 #include "../frontend/fe_ps5.h"
 #include "../frontend/fe_i18n.h" // vk-285-110: the notifications' text
+#include "../frontend/fe_bios.h" // vk-285-134: the BIOS before the shelf
+#include "../frontend/fe_games.h" // vk-285-139: fe::DiscSet
+#include "ps2/BiosTools.h"       // vk-285-134: IsBIOS, IsBIOSAvailable
 #endif // vk-285-36/38: [vkwait], [shaders]
 extern volatile unsigned long long g_orbis_map_addr;
 #include "vtlb.h"
 #include "Host.h"
+#ifdef PS5SX2_ACHIEVEMENTS
+#include "Achievements.h" // pr9n: OrbisFlushBeforeExit
+#include "orbis-shims/ProsperoAchievements.h"
+#include "orbis-shims/ProsperoNotify.h" // 2026-10-05: OrbisNotifyHold
+#endif
 #include "common/Error.h"
 #include "common/HostSys.h"
 #include "common/CrashHandler.h"
@@ -54,7 +64,13 @@ extern volatile unsigned long long g_orbis_map_addr;
 #include "orbis-shims/OrbisTextureRoots.h" // vk-285-113: a game's texture pack on a USB drive
 #include "orbis-shims/ProsperoKbdMouse.h" // vk-285-72, vk-285-113: the PS5's USB keyboard and mouse
 #include "orbis-shims/OrbisPadMap.h"     // vk-285-116: the controller remapping
+#include "orbis-shims/ProsperoUsbPad.h"  // vk-285-140: USB guitars and pads the PS5 doesn't take as controllers
+#include "orbis-shims/ProsperoDiscDump.h" // vk-285-144: PS2 discs in the drive
+#include "orbis-shims/OrbisDiscDrive.h"   // PR #34: PS2 discs played straight from a drive (flag bootdisc)
+#include "SIO/Pad/PadGuitar.h"
+#include "OrbisNfs.h"                     // vk-285-135: games on NFS shares
 #include <mutex>
+#include <set> // vk-285-134
 // vk-285-108 (GSRenderer.cpp): the helper threads' CPUs and the ticker's heartbeat for the GS thread's watchdog.
 void OrbisHelperThreadAdd(pthread_t thread);
 extern "C" const int orbis_ps5vk_war_shim __attribute__((weak)); // vk-285-119 (orbis-shims/orbis_ps5vk_war.c)
@@ -258,6 +274,72 @@ static void orbis_boot_log_release(const char* when)
   fflush(stdout);
 }
 
+// live-15 (AI-assisted): the Lapy owned-root daemon rejects a target with more
+// than one thread and consumes the request marker either way, so the elevation
+// request must be sent before any other thread exists. On a console whose /data
+// is visible at boot, boot.log is opened directly (no thread) and this is moot.
+// On a console whose /data shows only after elevation, orbis_boot_log_hold()
+// would start the pipe-drain pump thread -- so it is deferred to AFTER elevation
+// (orbis_boot_log_begin_deferred below). In that window the eboot's own early
+// lines (the build and pid lines the installer's report parses, and the Lapy
+// step lines) are kept in memory here -- a plain string written by this sink, no
+// thread -- and flushed into boot.log once the log is live. Third-party stdout in
+// that window is not captured; it goes to the klog only, which is acceptable.
+namespace
+{
+std::string g_boot_early;          // the eboot's own early lines, deferred path only
+bool g_boot_defer_hold = false;    // /data not visible at boot: the pump is deferred past elevation
+bool g_boot_early_active = false;  // the early sink also keeps lines in memory
+} // namespace
+
+extern "C" void orbis_boot_early_log(const char* line)
+{
+  // Normal boot: stdout is boot.log, so this lands there as usual. Deferred boot:
+  // stdout is not the log yet, so also keep the line in memory for the flush below.
+  printf("%s\n", line);
+  fflush(stdout);
+  if (g_boot_early_active)
+  {
+    g_boot_early.append(line);
+    g_boot_early.push_back('\n');
+  }
+}
+
+// After elevation (deferred path only): now that /data should be writable, open
+// boot.log and write the held early lines at its top; if /data still is not
+// writable, fall back to the pipe+pump hold, seeded with those early lines so
+// orbis_boot_log_release writes them when the folder finally appears.
+static void orbis_boot_log_begin_deferred()
+{
+  if (!g_boot_defer_hold)
+    return;
+  g_boot_defer_hold = false;
+  g_boot_early_active = false;
+  if (orbis_boot_log_open(true))
+  {
+    setvbuf(stdout, nullptr, _IOFBF, 1 << 20);
+    if (!g_boot_early.empty())
+    {
+      printf("[boot] the %zu bytes below were kept in memory before the boot log was live "
+             "(deferred so the Lapy elevation request stayed single-threaded)\n",
+             g_boot_early.size());
+      fwrite(g_boot_early.data(), 1, g_boot_early.size(), stdout);
+      printf("[boot] end of the held early lines; boot.log goes on directly from here\n");
+    }
+    fflush(stdout);
+  }
+  else
+  {
+    orbis_boot_log_hold();
+    if (g_boot_held.load(std::memory_order_acquire) && g_boot_hold && !g_boot_early.empty())
+    {
+      std::lock_guard<std::mutex> lock(g_boot_hold->mutex);
+      g_boot_hold->text.insert(0, g_boot_early); // the early lines first, then the captured stream
+    }
+  }
+  g_boot_early.clear();
+}
+
 // vk-285-113: signals. The crash printer (orbis-shims/ProsperoCrash.cpp) covered SIGABRT, SIGILL and SIGFPE (SIGSEGV is the
 // page-fault handler's, which hands what it can't map to the printer). Many of v112's sessions ended with no closing
 // line at all; they could have died of any of the others: SIGBUS (a file mapped past its end, a misaligned access),
@@ -298,6 +380,15 @@ static void orbis_install_signal_handlers()
   fatal.sa_sigaction = &CrashHandler::CrashSignalHandler;
   for (const int sig : {SIGABRT, SIGILL, SIGFPE, SIGBUS, SIGTRAP, SIGSYS, SIGXCPU, SIGXFSZ})
     sigaction(sig, &fatal, nullptr);
+  // 2026-10-05 (AI-assisted): SIGSEGV too, for the shelf: the page-fault handler (which hands what it can't map to the
+  // printer) is installed only after the shelf, so a crash there left nothing but the kernel's report in klog (pr9f).
+  // Only while nothing else has SIGSEGV: this function runs again after PageFaultHandler::Install (just before the
+  // game), and pr9h set the printer there over the page-fault handler, so a game's first fastmem fault (its first
+  // write to a GS register, a second in) went to the printer and ended every game.
+  struct sigaction current;
+  memset(&current, 0, sizeof(current));
+  if (sigaction(SIGSEGV, nullptr, &current) == 0 && !(current.sa_flags & SA_SIGINFO) && current.sa_handler == SIG_DFL)
+    sigaction(SIGSEGV, &fatal, nullptr);
   struct sigaction quit;
   memset(&quit, 0, sizeof(quit));
   quit.sa_flags = SA_RESETHAND;
@@ -367,16 +458,32 @@ extern "C" void orbis_pad_vibration(unsigned pad_index, float large, float small
 // vk-285-113: the settings page's QR code over the game (GSRenderer.cpp): the fallback when the PS5's browser can't be opened.
 extern std::atomic<int> g_orbis_qr_show;
 
-// vk-285-113: L2 + D-pad down held for 2 s opens the settings page in the PS5's own web browser (SceShellCore's launcher,
-// libSceSystemService). The game keeps running behind it (the page is served by this app's own web thread). The thread
-// below logs what the console answers and then whether the page loads and how often it asks; if the console refuses to
-// open the browser, the page's QR code goes over the game instead (the same hold hides it again).
+// The settings-page combo (PS5SX2/WebButton1/2, default L2 + D-pad down, held 2 s) opens the settings page in the PS5's
+// own web browser (SceShellCore's launcher, libSceSystemService). The game keeps running behind it (the page is served by
+// this app's own web thread). The thread below logs what the console answers and then whether the page loads and how often
+// it asks; if the console refuses to open the browser, the page's QR code goes over the game instead (the same hold hides it).
 extern "C" int sceSystemServiceLaunchWebBrowser(const char* url, const void* param);
 static std::atomic<bool> g_orbis_browser_busy{false};
 
 static double orbis_mono_seconds()
 {
   return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+// 2.02 (AI-assisted; users: the black screen before the shelf got longer in 2.01): "[boot] t+N ms: <phase>" for each
+// startup phase, from main()'s first line, so a log shows where the time before the shelf goes. Through
+// orbis_boot_early_log, so the lines before elevation are kept on a console whose boot log starts only after it.
+static double g_boot_t0 = 0.0;
+static void orbis_boot_phase(const char* fmt, ...)
+{
+  char what[200];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(what, sizeof(what), fmt, ap);
+  va_end(ap);
+  char line[240];
+  snprintf(line, sizeof(line), "[boot] t+%.0f ms: %s", (orbis_mono_seconds() - g_boot_t0) * 1000.0, what);
+  orbis_boot_early_log(line);
 }
 
 static void orbis_browser_qr_fallback(const char* why)
@@ -551,6 +658,9 @@ static int32_t g_orbis_second_user = -1;
 // player 1 on port 1, players 2..4 on 2A..2C (1, 5, 6). Each extra player is the next logged-in user, with their controller.
 static int g_orbis_multitap = 0;
 static int g_orbis_extra_count = 0;
+// vk-285-140 (AI-assisted): PS2 port 1 is PCSX2's Guitar controller (a USB guitar found at the start, or Pad1/Type=Guitar in
+// gs.ini or the game's file): the pad thread then sets the guitar's inputs instead of a DualShock 2's.
+static std::atomic<bool> g_orbis_port1_guitar{false};
 static int32_t g_orbis_extra_user[3] = {-1, -1, -1};
 static u32 g_orbis_extra_index[3] = {1, 0, 0};
 
@@ -641,6 +751,13 @@ static void orbis_pad_apply(OrbisPadPort &p, const OrbisPadData &d)
   st.ly = d.ly;
   st.rx = d.rx;
   st.ry = d.ry;
+  {
+    const unsigned touches = d.rest[40];
+    uint16_t tx = 0xffffu;
+    memcpy(&tx, &d.rest[48], sizeof(tx));
+    st.touch = (touches == 0 || tx >= 4096u) ? 0 : (tx < 640u) ? 1 : (tx >= 1280u) ? 2 : 0;
+    st.half = (touches == 0 || tx >= 4096u) ? 0 : (tx < 960u) ? 1 : 2; // 2.02: a click's side (the pad is 1920 wide)
+  }
   const Out o = Apply(cfg, st);
   for (int t = 0; t < T_COUNT; t++)
   {
@@ -656,6 +773,52 @@ static void orbis_pad_apply(OrbisPadPort &p, const OrbisPadData &d)
   if (o.rx != last[2]) orbis_pad_axis(p.port, PadDualshock2::Inputs::PAD_R_RIGHT, PadDualshock2::Inputs::PAD_R_LEFT, o.rx, 128);
   if (o.ry != last[3]) orbis_pad_axis(p.port, PadDualshock2::Inputs::PAD_R_DOWN, PadDualshock2::Inputs::PAD_R_UP, o.ry, 128);
   last[0] = o.lx; last[1] = o.ly; last[2] = o.rx; last[3] = o.ry;
+}
+
+// vk-285-140 (AI-assisted): PS2 port 1 as PCSX2's Guitar. The DualSense plays it with PCSX2's default guitar bindings (R2 green,
+// Circle red, Triangle yellow, Cross blue, Square orange, the D-pad's up and down strum, the left stick's up the whammy, L2 tilt,
+// the touchpad's click Select, Options Start); a USB guitar adds its own frets, strum, whammy, star power and tilt. Only changes
+// are sent, as for the DualShock 2.
+static void orbis_pad_apply_guitar(OrbisPadPort &p, const OrbisPadData &d, const OrbisUsbPadOut *usb)
+{
+  float v[PadGuitar::Inputs::LENGTH] = {};
+  const uint32_t b = d.buttons;
+  v[PadGuitar::Inputs::GREEN] = ((b & 0x200u) || d.r2 >= 64) ? 1.0f : 0.0f;
+  v[PadGuitar::Inputs::RED] = (b & 0x2000u) ? 1.0f : 0.0f;
+  v[PadGuitar::Inputs::YELLOW] = (b & 0x1000u) ? 1.0f : 0.0f;
+  v[PadGuitar::Inputs::BLUE] = (b & 0x4000u) ? 1.0f : 0.0f;
+  v[PadGuitar::Inputs::ORANGE] = (b & 0x8000u) ? 1.0f : 0.0f;
+  v[PadGuitar::Inputs::STRUM_UP] = (b & 0x10u) ? 1.0f : 0.0f;
+  v[PadGuitar::Inputs::STRUM_DOWN] = (b & 0x40u) ? 1.0f : 0.0f;
+  v[PadGuitar::Inputs::SELECT] = (b & 0x40100000u) ? 1.0f : 0.0f;
+  v[PadGuitar::Inputs::START] = (b & 0x8u) ? 1.0f : 0.0f;
+  v[PadGuitar::Inputs::TILT] = ((b & 0x100u) || d.l2 >= 64) ? 1.0f : 0.0f;
+  // PadGuitar::Set takes the whammy's value times 255 off 127: 0.5 is all the way down.
+  v[PadGuitar::Inputs::WHAMMY] = d.ly < 118 ? std::min(1.0f, (118.0f - d.ly) / 118.0f) * 0.5f : 0.0f;
+  if (usb && usb->guitar)
+  {
+    const orbis_usbpad::GuitarOut &g = usb->strings;
+    if (g.green) v[PadGuitar::Inputs::GREEN] = 1.0f;
+    if (g.red) v[PadGuitar::Inputs::RED] = 1.0f;
+    if (g.yellow) v[PadGuitar::Inputs::YELLOW] = 1.0f;
+    if (g.blue) v[PadGuitar::Inputs::BLUE] = 1.0f;
+    if (g.orange) v[PadGuitar::Inputs::ORANGE] = 1.0f;
+    if (g.strum_up) v[PadGuitar::Inputs::STRUM_UP] = 1.0f;
+    if (g.strum_down) v[PadGuitar::Inputs::STRUM_DOWN] = 1.0f;
+    if (g.select) v[PadGuitar::Inputs::SELECT] = 1.0f;
+    if (g.start) v[PadGuitar::Inputs::START] = 1.0f;
+    if (g.tilt) v[PadGuitar::Inputs::TILT] = 1.0f;
+    v[PadGuitar::Inputs::WHAMMY] = std::max(v[PadGuitar::Inputs::WHAMMY], g.whammy * 0.5f);
+  }
+  static_assert(static_cast<int>(PadGuitar::Inputs::LENGTH) <= static_cast<int>(orbis_padmap::T_COUNT), "the guitar's inputs fit OrbisPadPort's last values");
+  for (int i = 0; i < PadGuitar::Inputs::LENGTH; i++)
+  {
+    if (v[i] != p.last_value[i])
+    {
+      Pad::SetControllerState(p.port, static_cast<u32>(i), v[i]);
+      p.last_value[i] = v[i];
+    }
+  }
 }
 
 // vk-285-113: one controller's rumble: what the game last asked for (or nothing: Rumble off, or leaving for the menu),
@@ -762,6 +925,8 @@ static void *orbis_pad_thread(void *)
     OrbisPadData d;
     memset(&d, 0, sizeof(d));
     int rc = p_read(handle, &d);
+    OrbisUsbPadOut usb_now; // vk-285-140
+    bool have_usb = false;
     // vk-285-113: the PS5's USB keyboard and mouse as the PS2 controller (orbis-shims/ProsperoKbdMouse.cpp): the keys held,
     // the mouse's buttons and its aim are added to what the DualSense reports (a button held on either is held; a stick the
     // keyboard or mouse moves is theirs while they move it). With no DualSense data at all they stand alone.
@@ -788,6 +953,35 @@ static void *orbis_pad_thread(void *)
         if (kp.ry != 128) d.ry = kp.ry;
       }
       s_kbm_was_active = active;
+      // vk-285-140 (AI-assisted): a USB pad or guitar the PS5 doesn't take as a controller (orbis-shims/ProsperoUsbPad.cpp),
+      // added the same way. A guitar on a port that is PCSX2's Guitar goes to orbis_pad_apply_guitar instead.
+      {
+        const bool usb = OrbisUsbPadState(usb_now);
+        have_usb = usb;
+        if (usb && !(usb_now.guitar && g_orbis_port1_guitar.load(std::memory_order_relaxed)))
+        {
+          const orbis_usbpad::PadOut &up = usb_now.pad;
+          if (rc != 0)
+          {
+            memset(&d, 0, sizeof(d));
+            d.lx = d.ly = d.rx = d.ry = 128;
+            rc = 0;
+          }
+          d.buttons |= up.buttons;
+          d.l2 = std::max(d.l2, up.l2);
+          d.r2 = std::max(d.r2, up.r2);
+          if (up.lx < 118 || up.lx > 138) d.lx = up.lx;
+          if (up.ly < 118 || up.ly > 138) d.ly = up.ly;
+          if (up.rx < 118 || up.rx > 138) d.rx = up.rx;
+          if (up.ry < 118 || up.ry > 138) d.ry = up.ry;
+        }
+        else if (usb && rc != 0)
+        {
+          memset(&d, 0, sizeof(d));
+          d.lx = d.ly = d.rx = d.ry = 128;
+          rc = 0;
+        }
+      }
       if (const int hotkey = OrbisKbdMouseTakeHotkey())
       {
         g_orbis_state_request.store(hotkey, std::memory_order_release);
@@ -805,7 +999,7 @@ static void *orbis_pad_thread(void *)
       bool state_fired = false;
       {
         const orbis_padmap::Config &cfg = orbis_padmap_current();
-        static orbis_padmap::ComboWatch s_save, s_load, s_fast;
+        static orbis_padmap::ComboWatch s_save, s_load, s_fast, s_disc, s_web;
         orbis_padmap::ComboState cs;
         cs.buttons = d.buttons;
         cs.l2 = d.l2;
@@ -821,6 +1015,36 @@ static void *orbis_pad_thread(void *)
         const bool load = s_load.Update(cfg.load, cfg.hold_ms, cs, now_ms, block) && !save;
         // vk-285-118: the fast forward combo (StubHost.cpp turns it on or off on the CPU thread).
         const bool fast = s_fast.Update(cfg.fast, cfg.hold_ms, cs, now_ms, block) && !save && !load;
+        // vk-285-139: the change disc combo (the next disc of the game's set; StubHost.cpp runs it on the CPU thread).
+        const bool disc = s_disc.Update(cfg.disc, cfg.hold_ms, cs, now_ms, block) && !save && !load && !fast;
+        // the open-settings-page combo (WebButton1/2, 2 s hold fixed): replaces the old hardcoded L2+D-pad down.
+        {
+          uint32_t web_block = 0;
+          if (s_web.Update(cfg.web, 2000, cs, now_ms, web_block))
+          {
+            if (g_orbis_qr_show.load(std::memory_order_relaxed))
+            {
+              g_orbis_qr_show.store(0, std::memory_order_relaxed);
+              printf("[pad] web combo: settings QR hidden (%s)\n", orbis_padmap::DescribeCombo(cfg.web, 2000).c_str());
+              fflush(stdout);
+              orbis_eventf("settings page QR code hidden (%s)", orbis_padmap::DescribeCombo(cfg.web, 2000).c_str());
+            }
+            else if (!g_orbis_browser_busy.exchange(true))
+            {
+              printf("[pad] web combo: opening the settings page (%s)\n", orbis_padmap::DescribeCombo(cfg.web, 2000).c_str());
+              fflush(stdout);
+              orbis_eventf("settings page: opening it in the PS5's browser (%s)", orbis_padmap::DescribeCombo(cfg.web, 2000).c_str());
+              orbis_open_settings_browser();
+            }
+          }
+        }
+        if (disc)
+        {
+          g_orbis_state_request.store(6, std::memory_order_release);
+          state_fired = true;
+          printf("[pad] change disc: %s\n", orbis_padmap::DescribeCombo(cfg.disc, cfg.hold_ms).c_str());
+          fflush(stdout);
+        }
         if (fast)
         {
           g_orbis_state_request.store(4, std::memory_order_release);
@@ -882,45 +1106,10 @@ static void *orbis_pad_thread(void *)
         if (s_click_consumed)
           d.buttons &= ~0x00100000u;
       }
-      // vk-285-113: L2 + D-pad down held for 2 s: the settings page in the PS5's own browser (or, with the QR code up,
-      // takes the QR code down). The game keeps running (and sees the buttons: a 2 s hold is nobody's move).
-      {
-        static bool s_holding = false, s_fired = false;
-        static std::chrono::steady_clock::time_point s_since;
-        const bool l2 = (d.buttons & 0x00000100u) != 0 || d.l2 >= 200u;
-        const bool down = (d.buttons & 0x00000040u) != 0;
-        if (l2 && down)
-        {
-          const auto now = std::chrono::steady_clock::now();
-          if (!s_holding)
-          {
-            s_holding = true;
-            s_fired = false;
-            s_since = now;
-          }
-          else if (!s_fired && now - s_since >= std::chrono::seconds(2))
-          {
-            s_fired = true;
-            if (g_orbis_qr_show.load(std::memory_order_relaxed))
-            {
-              g_orbis_qr_show.store(0, std::memory_order_relaxed);
-              printf("[pad] L2 + D-pad down held for 2 s: settings QR hidden\n");
-              fflush(stdout);
-              orbis_eventf("settings page QR code hidden (L2 + D-pad down held for 2 s)");
-            }
-            else if (!g_orbis_browser_busy.exchange(true))
-            {
-              printf("[pad] L2 + D-pad down held for 2 s: opening the settings page in the PS5's browser\n");
-              fflush(stdout);
-              orbis_eventf("settings page: opening it in the PS5's browser (L2 + D-pad down held for 2 s)");
-              orbis_open_settings_browser();
-            }
-          }
-        }
-        else
-          s_holding = false;
-      }
-      orbis_pad_apply(port1, d);
+      if (g_orbis_port1_guitar.load(std::memory_order_relaxed))
+        orbis_pad_apply_guitar(port1, d, have_usb ? &usb_now : nullptr); // vk-285-140
+      else
+        orbis_pad_apply(port1, d);
     }
     {
       static OrbisRumbleOut s_rumble1, s_rumble_extra[3];
@@ -1019,6 +1208,19 @@ static void orbis_apply_ini_file(MemorySettingsInterface& si, const char* path, 
     trim(val);
     const size_t sl = key.rfind('/');
     if (sl != std::string::npos) { sec = key.substr(0, sl); key = key.substr(sl + 1); }
+    // pr9n (AI-assisted), PR #9 review item 4: nothing in [Achievements] from gs.ini or a game's file (the settings page
+    // writes these files for anyone on the LAN): Achievements/Host would have had the next sign-in send the token to
+    // another server. The account comes from the sign-in and achievements-secrets.ini only.
+    {
+      std::string first = sec.substr(0, sec.find('/'));
+      for (char& c : first)
+        c = static_cast<char>(tolower((unsigned char)c));
+      if (first == "achievements")
+      {
+        printf("[boot] %s %s/%s ignored: RetroAchievements settings come from the sign-in only\n", tag, sec.c_str(), key.c_str());
+        continue;
+      }
+    }
     // vk-285-34: PCSX2's patch and cheat lists ("Patches/Enable=60 FPS" turns on a pnach's [60 FPS]
     // group): each line adds one name, so a game can list several.
     if ((sec == "Patches" || sec == "Cheats") && (key == "Enable" || key == "Disable"))
@@ -1049,6 +1251,9 @@ static void orbis_apply_gs_ini(MemorySettingsInterface& si, bool quiet = false)
   orbis_apply_ini_file(si, "/data/PCSX2/gs.ini", "gs.ini", quiet);
   if (!s_game_ini_path.empty()) // vk-285-32: then the game's own
     orbis_apply_ini_file(si, s_game_ini_path.c_str(), "game ini", quiet);
+#ifdef PS5SX2_ACHIEVEMENTS
+  OrbisAchievementsRestoreAccount(si); // pr9n: the account's keys as the secrets file has them, whatever a merge did
+#endif
 }
 
 // vk-285-64: pcsx2/Memory.cpp's choice of memory for the recompilers' code (the flag file jitdirect).
@@ -1067,10 +1272,19 @@ static bool g_vu_interp = false;
 static bool g_ee_interp = false;
 static bool g_iop_interp = false;
 extern "C" int sceSystemServiceLoadExec(const char* path, const char* argv[]);
+// 2026-10-08 (AI-assisted): frame generation's 120 Hz output outlives the process that asked for it (PS5_Vulkan R51), so
+// every way out of the process that leaves the GS's swapchain open (the menu, a restart, the exit, a new build) puts the
+// default output back first (the driver's ps5vk_output_restore_default, vk-285-131; nothing without it or at 60 Hz).
+extern "C" bool ps5vk_output_restore_default(void) __attribute__((weak));
+static void orbis_output_default()
+{
+  if (ps5vk_output_restore_default)
+    ps5vk_output_restore_default();
+}
 
 // etaHEN non-whitelist jailbreak: send JAILBREAK_CMD to the legacy CMD server
 // (127.0.0.1:9028). Grants the process full ucred/caps (JIT, direct memory...).
-static void orbis_try_jailbreak()
+static bool orbis_try_jailbreak() // 2.02: true when a port answered (orbis_elevate's last resort)
 {
     struct HijackerCommand
     {
@@ -1097,7 +1311,7 @@ static void orbis_try_jailbreak()
         {
             printf("[jailbreak] socket failed errno=%d\n", errno);
             fflush(stdout);
-            return;
+            return false;
         }
         sockaddr_in sa = {};
         sa.sin_family = AF_INET;
@@ -1131,15 +1345,27 @@ static void orbis_try_jailbreak()
         if (cmd.ret == 0 || cmd.ret == -1337)
         {
             g_jailbreak_ok = 1;
-            return;
+            return true;
         }
     }
     printf("[jailbreak] all ports failed\n");
     fflush(stdout);
+    return false;
 }
 
+// 2.02 (AI-assisted): the step VMManager::Initialize is in, and since when, for the boot watchdog's lines. A 2.01 tester's
+// starts all hung after "Opening CDVD..." and the watchdog could only say "still in Initialize". Callers pass string
+// literals, so keeping the pointer is safe.
+static std::atomic<const char*> s_orbis_stage{nullptr};
+static std::atomic<long long> s_orbis_stage_ms{0};
+static long long orbis_now_ms()
+{
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 extern "C" void orbis_stage(const char* stage)
 {
+    s_orbis_stage_ms.store(orbis_now_ms(), std::memory_order_relaxed);
+    s_orbis_stage.store(stage, std::memory_order_release);
     ps5::debug::set_line(5, "stage: %s", stage);
 }
 
@@ -1228,6 +1454,31 @@ static bool orbis_vu1_speed_from(const SettingsInterface& si)
 // the rumble.
 extern std::atomic<int> g_orbis_overlay_mode;
 extern std::atomic<int> g_orbis_fps_graph;
+extern std::atomic<int> g_orbis_ra_challenge; // 2026-10-08: PS5SX2/RAChallengeIcons (GSRenderer.cpp OrbisDrawChallengeIcons)
+// 2026-10-08 (AI-assisted): the overlay picture (GSRenderer.cpp OrbisDrawBezel): PS5SX2/Bezel and PS5SX2/BezelDir, live.
+extern std::atomic<int> g_orbis_bezel;
+extern std::atomic<u32> g_orbis_bezel_gen;
+static std::mutex g_orbis_bezel_mutex;
+static std::string g_orbis_bezel_dir;
+std::string OrbisBezelDirectory()
+{
+  std::lock_guard<std::mutex> lock(g_orbis_bezel_mutex);
+  return g_orbis_bezel_dir;
+}
+static void orbis_set_bezel(bool on, const std::string& dir)
+{
+  {
+    std::lock_guard<std::mutex> lock(g_orbis_bezel_mutex);
+    if (on == (g_orbis_bezel.load(std::memory_order_relaxed) != 0) && dir == g_orbis_bezel_dir)
+      return;
+    g_orbis_bezel_dir = dir;
+    g_orbis_bezel.store(on ? 1 : 0, std::memory_order_relaxed);
+  }
+  g_orbis_bezel_gen.fetch_add(1, std::memory_order_release);
+  printf("[boot] overlay picture %s (PS5SX2/Bezel), from %s\n", on ? "on" : "off",
+    dir.empty() ? "/data/PCSX2/overlays" : (dir + ", then /data/PCSX2/overlays (PS5SX2/BezelDir)").c_str());
+  fflush(stdout);
+}
 
 // vk-285-113: a game's texture pack outside /data/PCSX2/textures: PS5SX2/TexturesDir/<serial>, or a USB drive's
 // PS5SX2/textures, PCSX2/textures or textures folder (orbis-shims/OrbisTextureRoots.h; GSTextureReplacements.cpp asks
@@ -1258,9 +1509,22 @@ static void orbis_ps5opts_from(const SettingsInterface& si)
   s32 overlay = -1;
   if (!si.GetIntValue("PS5SX2", "Overlay", &overlay) || overlay < 0 || overlay > 2)
     overlay = -1;
-  bool graph = false, rumble = true;
+  bool graph = false, rumble = true, challenge = true;
   si.GetBoolValue("PS5SX2", "FpsGraph", &graph);
   si.GetBoolValue("PS5SX2", "Rumble", &rumble);
+  si.GetBoolValue("PS5SX2", "RAChallengeIcons", &challenge); // 2026-10-08 (AI-assisted): the RetroAchievements challenge icons
+  {
+    bool bezel = false; // 2026-10-08 (AI-assisted): the overlay picture
+    std::string bezel_dir;
+    si.GetBoolValue("PS5SX2", "Bezel", &bezel);
+    si.GetStringValue("PS5SX2", "BezelDir", &bezel_dir);
+    orbis_set_bezel(bezel, bezel_dir);
+  }
+  if (g_orbis_ra_challenge.exchange(challenge ? 1 : 0, std::memory_order_relaxed) != (challenge ? 1 : 0))
+  {
+    printf("[boot] RetroAchievements challenge icons %s (PS5SX2/RAChallengeIcons)\n", challenge ? "on" : "off");
+    fflush(stdout);
+  }
   const int old_overlay = g_orbis_overlay_mode.exchange(overlay, std::memory_order_relaxed);
   const int old_graph = g_orbis_fps_graph.exchange(graph ? 1 : 0, std::memory_order_relaxed);
   const int old_rumble = g_orbis_rumble_on.exchange(rumble ? 1 : 0, std::memory_order_relaxed);
@@ -1361,6 +1625,20 @@ static bool orbis_mtvu_after_gamedb(bool from_settings)
   return from_settings;
 }
 
+#ifdef ORBIS_VULKAN
+// 2026-10-08 (AI-assisted): frame generation's latency hold (see the boot's "frame generation" block): the game runs 0.08% slow so that
+// two presents a frame at 120 Hz never fill the swapchain's queue. Applied to the settings layer at the boot and at each live reload
+// (which rebuilds the layer from the files).
+extern bool g_orbis_fg_wanted;
+static void orbis_fg_hold(MemorySettingsInterface& si)
+{
+  if (!g_orbis_fg_wanted)
+    return;
+  const float scalar = si.GetFloatValue("Framerate", "NominalScalar", 1.0f);
+  si.SetFloatValue("Framerate", "NominalScalar", scalar * 0.9992f);
+}
+#endif
+
 void orbis_reload_gs_ini_cpu();
 // vk-285-118 (AI-assisted): GPU readbacks to Don't wait for the rest of the game, asked for by GSRenderer.cpp's
 // OrbisReadbackAutoSecond (older firmware's readback stall). Not when gs.ini or the game's file sets HWDownloadMode: that
@@ -1398,6 +1676,9 @@ void orbis_reload_gs_ini_cpu()
 {
   MemorySettingsInterface trial = s_base_pre_gsini;
   orbis_apply_gs_ini(trial);
+#ifdef ORBIS_VULKAN
+  orbis_fg_hold(trial); // 2026-10-08
+#endif
   orbis_usb_kbm_for_mode(trial); // vk-285-113
   Pcsx2Config next;
   {
@@ -1443,6 +1724,16 @@ void orbis_reload_gs_ini_cpu()
     printf("[gsini] the renderer, GS device options and MTVU keep their running values until the next launch\n");
     kept = true;
   }
+#ifdef ORBIS_VULKAN
+  // 2026-10-10: frame generation is read once, before the GS opens (the boot's "frame generation" block; the 120 Hz mode is
+  // picked with the swapchain), so a change to PS5SX2/FrameGeneration waits for the next launch: say so rather than "applied"
+  // (a GoW II tester turned it off mid-game and frames went on being generated for the rest of the session).
+  if ((trial.GetBoolValue("PS5SX2", "FrameGeneration", false) && !g_sw_renderer) != g_orbis_fg_wanted)
+  {
+    printf("[gsini] frame generation stays %s until the next launch\n", g_orbis_fg_wanted ? "on" : "off");
+    kept = true;
+  }
+#endif
   {
     std::unique_lock<std::mutex> lock = Host::GetSettingsLock();
     s_base_si = trial;
@@ -1473,7 +1764,7 @@ void orbis_reload_gs_ini_cpu()
       g_orbis_mtvu_batch.load(std::memory_order_relaxed), g_orbis_mtvu_ring_kb.load(std::memory_order_relaxed)); // vk-285-84/90
   }
   fflush(stdout);
-  orbis_eventf(kept ? "live apply: applied in the running game; MTVU and the other relaunch-only options wait for the next launch" :
+  orbis_eventf(kept ? "live apply: applied in the running game; MTVU, frame generation and the other relaunch-only options wait for the next launch" :
                       "live apply: applied in the running game");
   OrbisOSDLabel(kept ? "APPLIED (SOME AT NEXT LAUNCH)" : "GS.INI APPLIED");
 }
@@ -1526,7 +1817,7 @@ static std::string orbis_build_label()
   return "Test build " + std::to_string(g_orbis_test_build) + " \xC2\xB7 " ORBIS_BUILD_TAG;
 }
 
-// vk-285-105 (Spyros): testing builds point at the testers' Discord, in smaller text under the build
+// vk-285-105 (swordpdf): testing builds point at the testers' Discord, in smaller text under the build
 // on the shelf and over the game. Empty in a normal build.
 static std::string orbis_test_note()
 {
@@ -1570,6 +1861,20 @@ static void orbis_clock_survey()
     ratio * tsc_mhz, ratio);
 }
 static std::string s_console_info; // "firmware 11.40 · SoC ... · CPU ..." (one line)
+
+// pr9n (AI-assisted): the product part of RetroAchievements' User-Agent (pcsx2/Host.cpp, PR #9 review item 10):
+// "PS5SX2/vk-285-128-pr9n (PS5 11.40)". The firmware is the survey's (orbis_console_survey runs before any RA call).
+std::string OrbisUserAgentProduct()
+{
+  std::string fw = "?";
+  const size_t at = s_console_info.find("firmware ");
+  if (at != std::string::npos)
+  {
+    fw = s_console_info.substr(at + 9);
+    fw = fw.substr(0, fw.find(' '));
+  }
+  return std::string("PS5SX2/") + ORBIS_BUILD_TAG + " (PS5 " + fw + ")";
+}
 
 static std::string orbis_console_survey()
 {
@@ -1671,6 +1976,7 @@ void OrbisBackToMenuCpu()
 // "Kill for LoadExec", "Terminating pid"). It works asynchronously: wait for it, and _exit() only if it never comes.
 [[noreturn]] void OrbisExitApp(int status)
 {
+  orbis_output_default();
   orbis_log_drain();
   fflush(stdout);
   fflush(stderr);
@@ -1693,6 +1999,17 @@ void OrbisBackToMenuCpu()
   OrbisExitApp(status);
 }
 
+// vk-285-144 (AI-assisted): the next start is a re-exec into the shelf, not the user opening the app: a PS2 disc still in the drive
+// doesn't start its game again then (orbis-shims/ProsperoDiscDump.cpp reads and deletes this file).
+static void orbis_mark_relaunch()
+{
+  if (FILE *f = fopen(OrbisLogPath("relaunch.txt").c_str(), "wb"))
+  {
+    fprintf(f, "%lld\n", static_cast<long long>(time(nullptr)));
+    fclose(f);
+  }
+}
+
 // vk-285-109: our own eboot again, into the shelf, after a start that failed (the VM never ran, so no memory
 // card or NVRAM to write back). Returns when LoadExec doesn't take.
 static void orbis_restart_to_menu()
@@ -1702,6 +2019,8 @@ static void orbis_restart_to_menu()
   if (stat(path, &st) != 0)
     path = "/app0/eboot.bin";
   printf("[menu] the game didn't start: re-executing %s\n", path);
+  orbis_mark_relaunch(); // vk-285-144
+  orbis_output_default();
   orbis_log_drain();
   fflush(stdout);
   fflush(stderr);
@@ -1723,11 +2042,19 @@ static void orbis_back_to_menu()
   SPU2::SetOutputPaused(true);
   FileMcd_EmuClose();
   cdvdSaveNVRAM();
+#ifdef PS5SX2_ACHIEVEMENTS
+  // pr9n (AI-assisted), PR #9 review item 9: unlocks and leaderboard entries still being sent went with the process.
+  // Up to 5 s for them (a retry of one that failed included), on this thread, the one that polled them in the game;
+  // a notification says so when they don't make it. Returns at once when nothing is waiting.
+  Achievements::OrbisFlushBeforeExit(5000);
+#endif
   const char* path = "/data/homebrew/PPSA99203/eboot.bin";
   struct stat st{};
   if (stat(path, &st) != 0)
     path = "/app0/eboot.bin";
   printf("[menu] re-executing %s\n", path);
+  orbis_mark_relaunch(); // vk-285-144
+  orbis_output_default();
   fflush(stdout);
   fflush(stderr);
   const int rc = sceSystemServiceLoadExec(path, nullptr);
@@ -1748,9 +2075,98 @@ static void orbis_back_to_menu()
 // Test build 1 (vk-285-55): the USB folders games are listed from, looked up before the jailbreak
 // (for the cover prefetch; the sandbox may not show the drives yet) and again after it.
 static std::vector<std::string> s_usb_dirs;
+
+// 2026-10-08 (AI-assisted; testers: "have users select their bios and games scan path (across the entire possible paths)
+// some people want ext/usb or m2"): gs.ini's PS5SX2/GameFolders, folders separated by ';' (the settings page, all games),
+// listed like the drives' (with one level of folders in them), and PS5SX2/BiosFolder, where the BIOS is looked for first.
+// The drives themselves (/mnt/usb0-7, /mnt/ext0-1) are looked through without them (orbis_usb_game_dirs, BiosTools.cpp).
+static std::string orbis_gs_ini_string(const char* key)
+{
+  MemorySettingsInterface peek;
+  orbis_apply_ini_file(peek, "/data/PCSX2/gs.ini", "gs.ini", true);
+  std::string value;
+  peek.GetStringValue("PS5SX2", key, &value);
+  return value;
+}
+
+static std::vector<std::string> orbis_extra_game_folders(const char* when)
+{
+  std::vector<std::string> dirs;
+  const std::string list = orbis_gs_ini_string("GameFolders");
+  size_t at = 0;
+  while (at <= list.size())
+  {
+    size_t end = list.find_first_of(";|", at);
+    if (end == std::string::npos)
+      end = list.size();
+    std::string dir = list.substr(at, end - at);
+    while (!dir.empty() && (dir.back() == ' ' || dir.back() == '/'))
+      dir.pop_back();
+    while (!dir.empty() && dir.front() == ' ')
+      dir.erase(0, 1);
+    at = end + 1;
+    if (dir.empty())
+      continue;
+    struct stat st = {};
+    const bool ok = dir[0] == '/' && stat(dir.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
+    if (when)
+      printf("[boot] %s: game folder %s (PS5SX2/GameFolders)%s\n", when, dir.c_str(), ok ? "" : ": not a folder here, skipped");
+    if (ok && std::find(dirs.begin(), dirs.end(), dir) == dirs.end())
+      dirs.push_back(dir);
+  }
+  if (when && !dirs.empty())
+    fflush(stdout);
+  return dirs;
+}
+
+// vk-285-135 (AI-assisted; testers: "nfs mounting"): gs.ini's PS5SX2/NfsShares, nfs:// addresses separated by ';' (the
+// settings page's Folders group, the shelf's folder picker), mounted after the jailbreak (orbis-shims/OrbisNfs.cpp: the
+// app's own NFS client) and listed like the drives: each share's folder under /nfs/<host>/<path>. All at once, each try
+// giving up after 5 s; a share that didn't mount is said in boot.log and left out, and the shelf starts without it.
+static std::vector<std::string> orbis_nfs_game_folders(const char* when)
+{
+  std::vector<std::string> dirs;
+  const std::string list = orbis_gs_ini_string("NfsShares");
+  if (list.find_first_not_of(" \t\r\n;") == std::string::npos)
+  {
+    OrbisNfs::SetShares(std::string());
+    return dirs;
+  }
+  std::vector<std::string> problems;
+  OrbisNfs::SetShares(list, &problems);
+  for (const std::string& p : problems)
+    printf("[boot] %s: NFS share left out (PS5SX2/NfsShares): %s\n", when, p.c_str());
+  const auto t0 = std::chrono::steady_clock::now();
+  for (const OrbisNfs::ShareInfo& s : OrbisNfs::MountAll(5000))
+  {
+    printf("[boot] %s: NFS share %s: %s%s\n", when, s.url.c_str(), s.state.c_str(),
+      s.mounted ? (", its games listed from " + s.mount_point).c_str() : "");
+    if (s.mounted)
+      dirs.push_back(s.mount_point);
+  }
+  printf("[boot] %s: NFS shares looked at in %.2f s\n", when,
+    std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+  fflush(stdout);
+  return dirs;
+}
+
 static void orbis_scan_usb(const char* when)
 {
   s_usb_dirs = orbis_usb_game_dirs(when);
+  for (const std::string& dir : orbis_extra_game_folders(when)) // 2026-10-08
+  {
+    if (std::find(s_usb_dirs.begin(), s_usb_dirs.end(), dir) == s_usb_dirs.end())
+      s_usb_dirs.push_back(dir);
+  }
+  // vk-285-135: the NFS shares, once the jailbreak gave the app the network's sockets and /data.
+  if (std::strcmp(when, "after the jailbreak") == 0)
+  {
+    for (const std::string& dir : orbis_nfs_game_folders(when))
+    {
+      if (std::find(s_usb_dirs.begin(), s_usb_dirs.end(), dir) == s_usb_dirs.end())
+        s_usb_dirs.push_back(dir);
+    }
+  }
 }
 
 // Test build 1: the logs report's first lines (the settings page's Download logs).
@@ -1765,12 +2181,69 @@ static std::string orbis_report_header()
 }
 
 // The frontend's folders (vk-285-44: used twice, for the cover prefetch and for the shelf).
+// vk-285-134 (AI-assisted): the BIOS before the shelf (build 130's logs: 961 starts on 235 consoles without one). When PCSX2
+// finds none, a BIOS in a .zip/.rar/.7z in the BIOS folder, /data/PCSX2 or a drive is taken out into the BIOS folder; when
+// there's still none, s_bios_problem says what was found instead, and the shelf shows it and won't start a game.
+static std::string s_bios_problem;
+static std::set<std::string> s_bios_archives_tried;
+static bool orbis_is_bios(const std::string& path)
+{
+  u32 version = 0, region = 0;
+  std::string description, zone;
+  return IsBIOS(path.c_str(), version, description, region, zone);
+}
+static std::vector<std::string> orbis_bios_places()
+{
+  std::vector<std::string> dirs = {EmuFolders::Bios};
+  if (EmuFolders::Bios != "/data/PCSX2")
+    dirs.push_back("/data/PCSX2");
+  for (int i = 0; i < 10; i++)
+  {
+    const std::string root = i < 8 ? "/mnt/usb" + std::to_string(i) : "/mnt/ext" + std::to_string(i - 8);
+    struct stat st = {};
+    if (stat(root.c_str(), &st) == 0 && S_ISDIR(st.st_mode))
+      dirs.push_back(root);
+  }
+  return dirs;
+}
+static bool orbis_check_bios()
+{
+  if (IsBIOSAvailable(std::string()))
+  {
+    s_bios_problem.clear();
+    return true;
+  }
+  std::string from;
+  const std::string taken = fe::ExtractBiosFromArchives(orbis_bios_places(), EmuFolders::Bios, orbis_is_bios,
+    &s_bios_archives_tried, &from);
+  if (!taken.empty())
+  {
+    printf("[bios] %s taken out of %s\n", taken.c_str(), from.c_str());
+    fflush(stdout);
+    if (IsBIOSAvailable(std::string()))
+    {
+      s_bios_problem.clear();
+      return true;
+    }
+  }
+  s_bios_problem = fe::DescribeBiosProblem(EmuFolders::Bios, "/data/PCSX2", orbis_bios_places(), orbis_is_bios);
+  printf("[bios] no PS2 BIOS: %s\n", s_bios_problem.c_str());
+  fflush(stdout);
+  return false;
+}
+
 static OrbisFrontendPaths orbis_frontend_paths(bool allow_download)
 {
   OrbisFrontendPaths fe;
+  // vk-285-134: the BIOS, for the shelf's line and its check at each start.
+  fe.bios_check = []() { return orbis_check_bios(); };
+  fe.bios_dir = EmuFolders::Bios == "/data/PCSX2" ? "/data/PCSX2/bios" : EmuFolders::Bios;
+  fe.bios_problem = [](){ return s_bios_problem; };
   // Test build 1 (vk-285-55): USB drives, the testing label and the logs download.
   fe.usb_dirs = s_usb_dirs;
   fe.usb_list = OrbisDir("cache") + "/usb-games.txt";
+  for (const OrbisNfs::ShareInfo& s : OrbisNfs::Shares()) // vk-285-156: a share's covers/ and ART/ folders, like a drive's
+    fe.share_roots.push_back(s.mount_point);
   fe.serial_cache = OrbisDir("cache") + "/chd-serials.txt"; // vk-285-108
   fe.gamedb_file = OrbisDir("resources") + "/GameIndex.yaml"; // vk-285-113: the games' names, for the shelf and the page
   fe.memcards_dir = OrbisDir("memcards"); // vk-285-113: the settings page's memory card list and creator
@@ -1789,7 +2262,212 @@ static OrbisFrontendPaths orbis_frontend_paths(bool allow_download)
   fe.allow_download = allow_download;
   fe.sound = !orbis_flag("nomenusound"); // vk-285-47
   fe.settings_log = OrbisLogPath("settings.log"); // vk-285-51
+  // 2026-10-05: HD texture packs from archive.org, in the folder PCSX2 reads them from (EmuFolders::Textures, set below
+  // to /data/PCSX2/textures). Not OrbisDir("textures"): that answers /data/PCSX2 itself when the folder isn't there yet
+  // (swordpdf's PS5 had none), and pr9h installed a pack as /data/PCSX2/<serial> where no game looks. The manager makes
+  // the folder when it first needs it.
+  fe.textures_dir = "/data/PCSX2/textures";
+  fe.texture_pack_list = OrbisDir("cache") + "/texture-packs.json";
+  fe.texture_packs = !orbis_flag("notexpacks");
+  // 2026-10-08 (AI-assisted): a game's patches and cheats from GitHub (the sheet's "Get patches and cheats"), into the
+  // folders PCSX2 reads them from (EmuFolders::Patches and ::Cheats below).
+  fe.cheats_dir = OrbisDir("cheats");
+  fe.online_patch_manifest = OrbisDir("cache") + "/online-patches.txt";
+  fe.online_patches = !orbis_flag("noonlinepatches");
   return fe;
+}
+
+// 2026-10-08 (AI-assisted): an ELF's disc image (PS5SX2/ElfDisc in its settings file): a full path, or a file name the shelf
+// lists, looked for in the folders it lists games from (games/, /data/PCSX2, the drives' and the extra folders) and one folder
+// down in each, the first found winning as on the shelf. "" when unset or not found.
+static std::string orbis_find_image(const std::string& want, const char* what);
+static std::string orbis_elf_disc()
+{
+  if (s_game_ini_path.empty())
+    return {};
+  MemorySettingsInterface peek;
+  orbis_apply_ini_file(peek, s_game_ini_path.c_str(), "game ini", true);
+  std::string want;
+  if (!peek.GetStringValue("PS5SX2", "ElfDisc", &want) || want.empty())
+    return {};
+  return orbis_find_image(want, "the ELF's disc");
+}
+
+// A disc image by the name the shelf's rows store (its file name: found in the game folders and one folder down), or a
+// full path. "" when it isn't there (and the log says so).
+static std::string orbis_find_image(const std::string& want, const char* what)
+{
+  struct stat st = {};
+  const auto is_file = [&](const std::string& p) { return stat(p.c_str(), &st) == 0 && S_ISREG(st.st_mode); };
+  if (want.find('/') != std::string::npos)
+  {
+    if (is_file(want) || (OrbisDiscDrive::IsDrivePath(want) && stat(want.c_str(), &st) == 0)) // PR #34: or a drive, "/dev/cd1"
+      return want;
+    printf("[boot] %s %s isn't there\n", what, want.c_str());
+    return {};
+  }
+  std::vector<std::string> dirs = {OrbisDir("games"), "/data/PCSX2"};
+  dirs.insert(dirs.end(), s_usb_dirs.begin(), s_usb_dirs.end());
+  for (const std::string& dir : dirs)
+  {
+    if (is_file(dir + "/" + want))
+      return dir + "/" + want;
+    DIR* d = opendir(dir.c_str());
+    if (!d)
+      continue;
+    std::string found;
+    int subdirs = 0;
+    while (const dirent* e = readdir(d))
+    {
+      if (e->d_name[0] == '.' || ++subdirs > 64)
+        continue;
+      const std::string p = dir + "/" + e->d_name + "/" + want;
+      if (is_file(p))
+      {
+        found = p;
+        break;
+      }
+    }
+    closedir(d);
+    if (!found.empty())
+      return found;
+  }
+  printf("[boot] %s %s isn't in the game folders\n", what, want.c_str());
+  return {};
+}
+
+// vk-285-139 (AI-assisted; swordpdf: "multi-disc and disc-change support (to even support gameshark iso)", the cheat disc "would
+// have to be disc 1 at all times"). The discs the running game can change to: the cheat disc first when the game starts from
+// it (PS5SX2/CheatDiscStart, its own file or gs.ini; PS5SX2/CheatDisc in gs.ini), then the game's own (fe::DiscSet: "(Disc N)"
+// beside it, or an .m3u). The change disc combo (request 6) puts the next one in, the settings page any image (request 5).
+// Needs proper testing on the console (a GameShark's disc swap, a two-disc game).
+static std::mutex s_disc_mutex;
+static std::vector<std::string> s_disc_set;
+static std::string s_disc_current, s_disc_request;
+
+std::string orbis_current_disc()
+{
+  std::lock_guard<std::mutex> lock(s_disc_mutex);
+  return s_disc_current;
+}
+
+std::vector<std::string> orbis_disc_set()
+{
+  std::lock_guard<std::mutex> lock(s_disc_mutex);
+  return s_disc_set;
+}
+
+bool orbis_request_disc(const std::string& path)
+{
+  {
+    std::lock_guard<std::mutex> lock(s_disc_mutex);
+    if (s_disc_current.empty())
+      return false; // no game (or the PS2 menu, or an ELF with no disc)
+    s_disc_request = path;
+  }
+  g_orbis_state_request.store(5, std::memory_order_release);
+  return true;
+}
+
+// The CPU thread (StubHost.cpp's PumpMessagesOnCPUThread), between frames.
+void OrbisChangeDiscCpu(int req)
+{
+  std::string to;
+  int number = 0, count = 0;
+  {
+    std::lock_guard<std::mutex> lock(s_disc_mutex);
+    count = static_cast<int>(s_disc_set.size());
+    if (req == 6)
+    {
+      if (count < 2)
+      {
+        OrbisOSDLabel("ONE DISC");
+        printf("[disc] change disc: this game has one disc\n");
+        fflush(stdout);
+        return;
+      }
+      const auto at = std::find(s_disc_set.begin(), s_disc_set.end(), s_disc_current);
+      const int i = at == s_disc_set.end() ? -1 : static_cast<int>(at - s_disc_set.begin());
+      to = s_disc_set[static_cast<size_t>((i + 1) % count)];
+    }
+    else
+    {
+      to.swap(s_disc_request);
+    }
+    const auto in = std::find(s_disc_set.begin(), s_disc_set.end(), to);
+    number = in == s_disc_set.end() ? 0 : static_cast<int>(in - s_disc_set.begin()) + 1;
+  }
+  if (to.empty())
+    return;
+  // PR #34 (AI-assisted port): to or from a disc drive's disc too (the cheat disc's game, in the drive), played from the
+  // disc itself; the disc watcher leaves that drive alone from then on (ProsperoDiscDump.cpp), so changing back to it
+  // never meets a copy.
+  const bool to_drive = OrbisDiscDrive::IsDrivePath(to);
+  if (to_drive && !OrbisDiscDumpClaim(to))
+  {
+    OrbisOSDLabel("DISC BEING COPIED");
+    printf("[disc] change disc: %s: its disc is being copied; try again when the copy ends\n", to.c_str());
+    fflush(stdout);
+    return;
+  }
+  const bool ok = VMManager::ChangeDisc(to_drive ? CDVD_SourceType::Disc : CDVD_SourceType::Iso, to);
+  if (ok)
+  {
+    std::lock_guard<std::mutex> lock(s_disc_mutex);
+    s_disc_current = to;
+  }
+  char label[48];
+  if (!ok)
+    std::snprintf(label, sizeof(label), "DISC CHANGE FAILED");
+  else if (number > 0 && count > 1)
+    std::snprintf(label, sizeof(label), "DISC %d OF %d", number, count);
+  else
+    std::snprintf(label, sizeof(label), "DISC CHANGED");
+  OrbisOSDLabel(label);
+  printf("[disc] %s: %s (%s)\n", req == 6 ? "change disc combo" : "settings page", to.c_str(), ok ? label : "failed");
+  orbis_eventf("change disc: %s%s", to.substr(to.rfind('/') + 1).c_str(), ok ? "" : " (failed)");
+  fflush(stdout);
+}
+
+// At the game's start: the set, and the disc it starts from (the cheat disc, when it's on and found).
+static std::string orbis_disc_boot(const std::string& game)
+{
+  // PR #34: a drive is the disc in it (another goes in by hand); fe::DiscSet would look through /dev for "(Disc N)".
+  std::vector<std::string> set = OrbisDiscDrive::IsDrivePath(game) ? std::vector<std::string>{game} : fe::DiscSet(game);
+  std::string start = game;
+  MemorySettingsInterface peek;
+  orbis_apply_ini_file(peek, "/data/PCSX2/gs.ini", "gs.ini", true);
+  if (!s_game_ini_path.empty())
+    orbis_apply_ini_file(peek, s_game_ini_path.c_str(), "game ini", true);
+  std::string on, want;
+  if (peek.GetStringValue("PS5SX2", "CheatDiscStart", &on) && (on == "true" || on == "1"))
+  {
+    MemorySettingsInterface global;
+    orbis_apply_ini_file(global, "/data/PCSX2/gs.ini", "gs.ini", true);
+    if (!global.GetStringValue("PS5SX2", "CheatDisc", &want) || want.empty())
+      printf("[disc] Start from the cheat disc is on, but no cheat disc is set (Cheat disc, the sheet for all games)\n");
+    else
+    {
+      const std::string cheat = orbis_find_image(want, "the cheat disc");
+      if (!cheat.empty() && cheat != game)
+      {
+        set.erase(std::remove(set.begin(), set.end(), cheat), set.end());
+        set.insert(set.begin(), cheat);
+        start = cheat;
+      }
+    }
+  }
+  {
+    std::lock_guard<std::mutex> lock(s_disc_mutex);
+    s_disc_set = set;
+    s_disc_current = start;
+  }
+  std::string list;
+  for (size_t i = 0; i < set.size(); i++)
+    list += (i ? " | " : "") + set[i].substr(set[i].rfind('/') + 1);
+  printf("[disc] %zu disc(s): %s; starts from %s\n", set.size(), list.c_str(), start.substr(start.rfind('/') + 1).c_str());
+  fflush(stdout);
+  return start;
 }
 
 // vk-285-45: the flags folder before and after the jailbreak. Before it, the sandbox answers
@@ -1940,6 +2618,150 @@ static void orbis_set_aside_shader_caches()
 // Vice City (2x) hung that way ("completion marker not written within 2 s", the vk-285-13..15 signature) on the one
 // console with no flags. The opt-in flags (vk_widemem, vk_triple, vk_recordthread, vk_fullstatecopy, vk_16k and the
 // vk_no* switches) still need their files.
+// vk-285-133 (AI-assisted): the title's param.json for ps5vk's 120 Hz mode (frame generation). The driver offers the 119.88 Hz
+// mode only when the title's param.json declares high frame rates (attribute3 0x80040), and it read /app0/sce_sys/param.json,
+// which after the jailbreak doesn't lead to our folder: vk-285-131 on the console never offered the mode, and the TV stayed at
+// 60 Hz. PS5VK_PARAM_JSON names the first of these that opens instead: the running app's own folder as the sandbox mounts it
+// (what the system sees), /app0, then the install folder. What it declares is logged here, since the driver's own lines go to
+// stderr.log.
+// vk-285-134 (AI-assisted): build 130's logs had ~27 starts that failed with "Requested filename '...' does not exist" for a
+// file the shelf had just listed (and the same game started before and after on the same console, from internal storage and
+// USB drives alike). Before the VM looks, the file is stat'ed here: when it isn't seen, up to 3 s of retries, and boot.log
+// gets errno, whether its folder opens and whether a file of that name is in it.
+static void orbis_wait_for_game_file(const std::string& path)
+{
+  if (path.empty() || path[0] != '/')
+    return;
+  struct stat st = {};
+  if (stat(path.c_str(), &st) == 0)
+    return;
+  const int first = errno;
+  const size_t slash = path.find_last_of('/');
+  const std::string dir = slash == 0 ? "/" : path.substr(0, slash), name = path.substr(slash + 1);
+  bool listed = false;
+  int dir_errno = 0;
+  if (DIR* d = opendir(dir.c_str()))
+  {
+    while (const dirent* e = readdir(d))
+      listed |= name == e->d_name;
+    closedir(d);
+  }
+  else
+    dir_errno = errno;
+  printf("[boot] game file not seen: stat errno %d; its folder %s %s%s; retrying for up to 3 s\n", first, dir.c_str(),
+    dir_errno ? "doesn't open, errno " : "opens", dir_errno ? std::to_string(dir_errno).c_str() : (listed ? ", the name is in it" : ", the name isn't in it"));
+  fflush(stdout);
+  for (int i = 1; i <= 15; i++)
+  {
+    usleep(200000);
+    if (stat(path.c_str(), &st) == 0)
+    {
+      printf("[boot] game file seen after %d ms\n", i * 200);
+      fflush(stdout);
+      return;
+    }
+  }
+  printf("[boot] game file still not seen (errno %d)\n", errno);
+  fflush(stdout);
+}
+
+// 2.02 (AI-assisted): a 2.01 tester's games on a USB drive (bridge 14cd:1661) all hung at a black screen from one minute on,
+// across app restarts and reboots: emulog.txt (flushed every line) stopped at "Opening CDVD...", i.e. inside the image's
+// first read, and closing the app then crashed the PS5 (a thread can't leave a read the drive never answers). Before the VM
+// starts, the image's first 128 KiB are read here on a thread of their own: if they haven't come in 5 s, boot.log and
+// settings.log say so and a notification asks for the drive to be unplugged and plugged back in (a removed drive fails the
+// read, which lets the start carry on to a proper error). The read also leaves those sectors in the cache for the VM's own.
+static void orbis_probe_game_read(const std::string& path)
+{
+  struct stat st = {};
+  if (path.empty() || path[0] != '/' || stat(path.c_str(), &st) != 0 || !S_ISREG(st.st_mode))
+    return;
+  struct Probe
+  {
+    std::atomic<bool> done{false};
+    ssize_t got = 0;
+    int err = 0;
+  };
+  auto probe = std::make_shared<Probe>();
+  const long long t0 = orbis_now_ms();
+  std::thread([probe, path]() {
+    const int fd = open(path.c_str(), O_RDONLY);
+    if (fd < 0)
+      probe->err = errno;
+    else
+    {
+      std::vector<char> buf(128 * 1024);
+      probe->got = pread(fd, buf.data(), buf.size(), 0);
+      if (probe->got < 0)
+        probe->err = errno;
+      close(fd);
+    }
+    probe->done.store(true, std::memory_order_release);
+  }).detach();
+  long long next_warn = t0 + 5000;
+  bool notified = false;
+  while (!probe->done.load(std::memory_order_acquire))
+  {
+    usleep(50000);
+    const long long now = orbis_now_ms();
+    if (now < next_warn)
+      continue;
+    next_warn = now + 30000;
+    printf("[boot] game file: its first 128 KiB haven't come in %lld s: the drive isn't answering (%s)\n", (now - t0) / 1000,
+      path.c_str());
+    fflush(stdout);
+    if (!notified)
+    {
+      notified = true;
+      orbis_eventf("the game's drive isn't answering: the image's first read hasn't returned (%s)", path.c_str());
+      sys_notify("PS5SX2: the drive with this game isn't answering. Unplug it and plug it back in (don't close PS5SX2 while "
+                 "it waits).");
+    }
+  }
+  const long long took = orbis_now_ms() - t0;
+  if (probe->got <= 0 || took >= 1000 || notified)
+  {
+    printf("[boot] game file: first read %s in %lld ms (%zd bytes, errno %d)\n", probe->got > 0 ? "done" : "failed", took,
+      probe->got, probe->err);
+    fflush(stdout);
+  }
+}
+
+static void orbis_vk_param_json()
+{
+  static const char* const paths[] = {"/mnt/sandbox/PPSA99203_000/app0/sce_sys/param.json", "/app0/sce_sys/param.json",
+                                      "/data/homebrew/PPSA99203/sce_sys/param.json"};
+  std::string tried;
+  for (const char* path : paths)
+  {
+    FILE* const file = fopen(path, "rb");
+    if (!file)
+    {
+      const int error = errno;
+      tried += std::string(tried.empty() ? "" : ", ") + path + " (errno " + std::to_string(error) + ")";
+      continue;
+    }
+    static char text[16384];
+    const size_t length = fread(text, 1, sizeof(text) - 1, file);
+    fclose(file);
+    text[length] = '\0';
+    const char* at = strstr(text, "\"attribute3\"");
+    if (at)
+      at = strchr(at, ':');
+    const unsigned long attribute3 = at ? strtoul(at + 1, nullptr, 0) : 0;
+    const bool declared = at && (attribute3 & 0x80040ul) == 0x80040ul;
+    setenv("PS5VK_PARAM_JSON", path, 0);
+    printf("[boot] param.json for the 120 Hz mode: %s, attribute3 %s0x%lx: %s\n", path, at ? "" : "absent, ", attribute3,
+      declared ? "high frame rates declared, so the driver offers 119.88 Hz (frame generation asks for it)"
+               : "high frame rates (0x80040) not declared, so the display stays at 60 Hz (the param.json that comes "
+                 "with this build declares them)");
+    fflush(stdout);
+    return;
+  }
+  printf("[boot] param.json for the 120 Hz mode: none opened (%s); the display stays at 60 Hz\n", tried.c_str());
+  fflush(stdout);
+}
+
 static void orbis_vk_environment()
 {
   const bool hw = !g_sw_renderer;
@@ -1959,6 +2781,7 @@ static void orbis_vk_environment()
   }
   // The driver keeps its compiled shaders next to PCSX2's caches, not in /app0.
   setenv("PS5VK_SHADER_CACHE_DIR", (OrbisDir("cache") + "/ps5vk-shader-cache").c_str(), 0); // vk-285-33: cache/
+  orbis_vk_param_json(); // vk-285-133: before the frontend's swapchain, the driver's first look at the modes
   // The driver's queue profile (a stderr.log line every 10 s) unless novkprof.
   if (!orbis_flag("novkprof")) setenv("PS5VK_PROFILE", "1", 0);
   // vk-285-14: on a GPU hang the driver writes the hung step's words and register tables here
@@ -1988,7 +2811,10 @@ static void orbis_vk_environment()
   // 3x and 6x ("4K") needs 7680.
   // vk-285-66: 16384 with the flag file vk_16k, so PCSX2 offers 8x (16384 / 1280 = 12.8; at 8192 it
   // stops at 6x). The descriptor and target size fields hold 14 bits (the driver's ps5vk_max_extent_2d).
-  if (hw) setenv("PS5VK_MAX_EXTENT_2D", orbis_flag("vk_16k") ? "16384" : "8192", 0);
+  // vk-285-134d (swordpdf: "also have a selectable option for 8x native"): 16384 by default, so the Resolution row's 8x
+  // applies (vk-285-66 ran R&C at 8x and 60 fps with it, and the 12 GiB heap it wants is the default since); the flag
+  // file vk_8k keeps 8192 (PCSX2 then stops at 6x).
+  if (hw) setenv("PS5VK_MAX_EXTENT_2D", orbis_flag("vk_8k") ? "8192" : "16384", 0);
   // vk-285-66: VkDeviceMemory outside the 4 GiB window and a 12 GiB heap (Mihawk's R86-R88) with the
   // flag file vk_widemem.
   if (hw && orbis_flag("vk_widemem")) setenv("PS5VK_WIDE_MEMORY", "1", 0);
@@ -2027,7 +2853,7 @@ static void orbis_vk_environment()
   {
     static const char* const names[] = {"PS5VK_FULL_STATE", "PS5VK_WAR_BARRIER", "PS5VK_LAZY_TARGET_FLUSH", "PS5VK_LIVE_DIR",
                                         "PS5VK_MAX_EXTENT_2D", "PS5VK_GPU_UPLOAD", "PS5VK_BREADCRUMBS", "PS5VK_WIDE_MEMORY",
-                                        "PS5VK_SWAPCHAIN_IMAGES", "PS5VK_HANG_DUMP"};
+                                        "PS5VK_SWAPCHAIN_IMAGES", "PS5VK_HANG_DUMP", "PS5VK_PARAM_JSON"};
     std::string line;
     for (const char* name : names)
     {
@@ -2043,14 +2869,19 @@ static void orbis_vk_environment()
 
 int main()
 {
+  g_boot_t0 = orbis_mono_seconds(); // 2.02: the origin of the [boot] t+ lines
   // Bigapp: no elfldr socket. Log to file (read back over FTP) + notify.
   // vk-285-33: in logs/ when that folder exists (OrbisPaths.h).
   // vk-285-113: a broken pipe (a network peer that went away) is an error return, not the end of the app.
   signal(SIGPIPE, SIG_IGN);
   // stdout and stderr go to boot.log; when /data isn't visible yet (a console whose Helper's mount hook didn't take),
-  // into memory until it is (orbis_boot_log_release, after the jailbreak).
+  // into memory until it is. live-15: the pipe+pump hold is deferred to after elevation (the Lapy daemon needs a
+  // single-threaded target); until then the eboot's own early lines are kept in memory by orbis_boot_early_log.
   if (!orbis_boot_log_open(true))
-    orbis_boot_log_hold();
+  {
+    g_boot_defer_hold = true;
+    g_boot_early_active = true;
+  }
   // Orbis: fresh fault history per run (pf.log otherwise appends forever).
   {
     snprintf(g_orbis_pf_log, sizeof(g_orbis_pf_log), "%s", OrbisLogPath("pf.log").c_str()); // vk-285-33
@@ -2067,7 +2898,8 @@ int main()
   setvbuf(stdout, nullptr, _IOFBF, 1 << 20);
   fprintf(stderr, "[boot] stderr-ok\n");
   printf("[boot] main=%p\n", (void*)&main);
-  printf("[boot] build=" ORBIS_BUILD_TAG "\n");
+  orbis_boot_early_log("[boot] build=" ORBIS_BUILD_TAG); // live-15: kept in memory on the deferred-log path
+  orbis_boot_phase("main started%s", g_boot_defer_hold ? " (boot log held until after elevation)" : "");
   {
     // vk-285-91: what VZEROUPPER costs on this CPU. The GS thread's profiles (vk-285-89/90) had 5-7% of
     // their samples on the instruction right after one, so the eboot is now built with -mno-vzeroupper
@@ -2126,7 +2958,9 @@ int main()
   {
     FILE* f = fopen("/data/PCSX2/pid.txt", "w");
     if (f) { fprintf(f, "%d", (int)getpid()); fclose(f); }
-    printf("[boot] pid=%d\n", (int)getpid());
+    char line[32];
+    snprintf(line, sizeof(line), "[boot] pid=%d", (int)getpid());
+    orbis_boot_early_log(line); // live-15: kept in memory on the deferred-log path (the report parses it)
     fflush(stdout);
   }
 
@@ -2160,20 +2994,53 @@ int main()
 #ifdef ORBIS_VULKAN
   orbis_log_flag_access("before the jailbreak");
   orbis_scan_usb("before the jailbreak"); // test build 1: whether the sandbox shows USB drives yet
+  orbis_boot_phase("cover prefetch starting");
   if (!orbis_flag("nofrontend") && !orbis_flag("nomenu") && !orbis_flag("nocoverdl"))
     orbis_frontend_prefetch_covers(orbis_frontend_paths(true), 30.0, sys_notify);
+  orbis_boot_phase("cover prefetch done");
 #endif
 
-  // Primary: etaHEN/OnionHEN download0 file-broker jailbreak (needs PPSA99203
-  // in the HEN app_jailbreak allowlist). Falls back to the legacy CMD ports.
-  extern bool orbis_hen_jailbreak();
+  // Elevation (live-15, 2.02; see orbis-shims/ProsperoHenJailbreak.cpp). This runs
+  // here, after the single-threaded cover prefetch and BEFORE the deferred boot-log
+  // pump below, so a Lapy request is sent with only the main thread alive -- the
+  // daemon rejects a multi-threaded target and consumes the marker either way.
+  // 2.02 (AI-assisted): orbis_elevate tries the Lapy daemon AND the etaHEN/OnionHEN/Helper request (2.01 had only Lapy:
+  // 4 x 10 s of black screen on every other console, then no elevation), the one that worked last time first, and nothing
+  // when already root; the ports (orbis_try_jailbreak) are its last resort. cache/elevation.txt keeps what worked.
+  extern const char* orbis_elevate(const char* hint, bool (*try_ports)());
   extern bool orbis_probe_jit();
   extern void orbis_log_hen_config();
   orbis_log_hen_config();
-  if (orbis_hen_jailbreak())
-    g_jailbreak_ok = 1;
-  else
-    orbis_try_jailbreak();
+  {
+    const std::string cache_path = OrbisDir("cache") + "/elevation.txt";
+    char last[32] = {};
+    if (FILE* f = fopen(cache_path.c_str(), "r"))
+    {
+      if (!fgets(last, sizeof(last), f))
+        last[0] = 0;
+      fclose(f);
+      last[strcspn(last, "\r\n \t")] = 0;
+    }
+    const double t_elev = orbis_mono_seconds();
+    const char* method = orbis_elevate(last, orbis_try_jailbreak);
+    if (std::strcmp(method, "none") != 0)
+      g_jailbreak_ok = 1;
+    orbis_boot_phase("elevation took %.0f ms via %s (last start: %s)", (orbis_mono_seconds() - t_elev) * 1000.0, method,
+      last[0] ? last : "not known");
+    // "already" says nothing about which one answers; keep what was there.
+    if (std::strcmp(method, "already") != 0 && std::strcmp(method, last) != 0)
+    {
+      if (FILE* f = fopen(cache_path.c_str(), "w"))
+      {
+        fprintf(f, "%s\n", method);
+        fclose(f);
+      }
+    }
+  }
+  // live-15: elevation is done (the request window is over), so it is safe to
+  // start the boot-log pump thread on the console where /data showed only now;
+  // the early lines kept in memory are flushed into boot.log here.
+  orbis_boot_log_begin_deferred();
 #ifdef ORBIS_VULKAN
   orbis_log_flag_access("after the jailbreak");
 #endif
@@ -2190,6 +3057,7 @@ int main()
   const bool jit_probe_ok = orbis_probe_jit();
   if (jit_probe_ok)
     g_jailbreak_ok = 1;
+  orbis_boot_phase("boot log live, console surveyed, JIT probe %s", jit_probe_ok ? "ok" : "failed");
   // vk-285-62: the memory probe (orbis-shims/orbis_memprobe.cpp): what direct memory can hold
   // (executable code, aliased guest pages, fixed mappings), with the flag file memprobe.
   if (orbis_flag("memprobe"))
@@ -2258,6 +3126,7 @@ int main()
         sys_notify("PS5SX2: new build, restarting");
         ps5::debug::set_line(2, "NEW BUILD - RESTARTING");
         sleep(1);
+        orbis_output_default();
         int rc = sceSystemServiceLoadExec(path, nullptr);
         printf("[boot] LoadExec failed rc=%d, staying on current build\n", rc);
         fflush(stdout);
@@ -2270,6 +3139,21 @@ int main()
   EmuFolders::DataRoot = "/data/PCSX2";
   // vk-285-33: sub-folders when they exist, else the top folder as before (OrbisPaths.h).
   EmuFolders::Bios = OrbisDir("bios");
+  {
+    // 2026-10-08 (AI-assisted): PS5SX2/BiosFolder (gs.ini, the settings page), when it is a folder, is looked through first.
+    std::string dir = orbis_gs_ini_string("BiosFolder");
+    while (dir.size() > 1 && dir.back() == '/')
+      dir.pop_back();
+    struct stat st = {};
+    if (!dir.empty())
+    {
+      const bool ok = dir[0] == '/' && stat(dir.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
+      printf("[boot] BIOS folder %s (PS5SX2/BiosFolder)%s\n", dir.c_str(), ok ? "" : ": not a folder here, /data/PCSX2/bios instead");
+      if (ok)
+        EmuFolders::Bios = dir;
+      fflush(stdout);
+    }
+  }
   EmuFolders::Settings = "/data/PCSX2";
   EmuFolders::Logs = OrbisDir("logs");
   EmuFolders::MemoryCards = OrbisDir("memcards");
@@ -2306,6 +3190,9 @@ int main()
   // screen of their own, before PCSX2 opens the display. Ratchet & Clank when there are none.
   // vk-285-40: after the driver's environment above, because the frontend runs on the same driver.
   extern std::string orbis_select_game(const char* games_dir, const char* top_dir, const char* build_tag);
+#ifdef PS5SX2_ACHIEVEMENTS
+  OrbisAchievementsInit(s_base_si, "/data/PCSX2");
+#endif
   ps5::debug::set_line(2, "game selector...");
 #ifdef ORBIS_VULKAN
   // vk-285-40: the frontend (../frontend/fe_ps5.cpp): the disc images as PS2 cases on a cover-flow
@@ -2315,16 +3202,118 @@ int main()
   // with the nofrontend flag.
   // vk-285-50: the settings page (frontend/fe_web.cpp) for phones and PCs, before the shelf that
   // shows its QR code; it keeps running in the game. The nowebui flag leaves it off.
+  orbis_boot_phase("looking at USB drives and NFS shares");
   orbis_scan_usb("after the jailbreak"); // test build 1: games on USB drives
+  orbis_boot_phase("USB drives and NFS shares looked at; checking the BIOS");
+  orbis_check_bios(); // vk-285-134: after the drives are seen, before the shelf
+  orbis_boot_phase("BIOS checked");
   orbis_boot_log_release("before the settings page starts"); // vk-285-113: still holding? (the folder can show up late)
+  // vk-285-144 (AI-assisted): a PS2 DVD in the drive, copied to games/ and started (orbis-shims/ProsperoDiscDump.cpp).
+  OrbisDiscDumpStart();
   if (!orbis_flag("nowebui"))
     orbis_web_start(orbis_frontend_paths(false), orbis_build_label().c_str());
+  orbis_boot_phase("settings page started");
   // vk-285-110: the shelf tries the missing covers of games on USB drives (the prefetch above can't see
   // the drives) in the background, after the covers on disk. Nothing else downloads after the jailbreak.
   // HTTPS failed there on vk-285-41/42, with etaHEN's jailbreak; with the PS5SX2 Helper's it hasn't been
   // tried, and boot.log's "[frontend] cover ..." lines will show it. When it fails, the next start's
   // prefetch fetches them from cache/usb-games.txt, as before.
-  if (!orbis_flag("nofrontend") && !orbis_flag("nomenu"))
+  // vk-285-160 (AI-assisted): the disc-auto daemon ELF (ps5/disclaunch/disc_launch.c) found the ISO
+  // for the disc in the drive and wrote its full path here.  Read and delete the file immediately
+  // (it is always transient) so the next normal start uses the shelf.
+  //
+  // vk-285-160d: if disc-launch-exec.txt is also present the daemon wrote both files because
+  // PS5SX2 was not already running when the disc was inserted; the disc watcher will soon consume
+  // exec.txt and self-exec so PS5SX2 comes to the foreground.  Skip disc-launch.txt now to avoid
+  // starting the game twice (once here in the background and again on the foreground boot).
+  // Leave disc-launch.txt on disk; the disc watcher's self-exec boot will pick it up cleanly.
+  {
+      const std::string dlp = OrbisLogPath("disc-launch.txt");
+      const std::string dep = OrbisLogPath("disc-launch-exec.txt");
+      struct stat exec_st{};
+      const bool exec_pending = stat(dep.c_str(), &exec_st) == 0;
+      if (exec_pending) {
+          printf("[boot] disc-launch: exec.txt present — self-exec imminent; deferring disc-launch.txt\n");
+          fflush(stdout);
+      } else if (FILE* f = fopen(dlp.c_str(), "r")) {
+          char buf[1024] = {};
+          if (fgets(buf, sizeof(buf), f)) {
+              // strip trailing newline / whitespace
+              size_t n = strlen(buf);
+              while (n && (buf[n - 1] == '\n' || buf[n - 1] == '\r' || buf[n - 1] == ' '))
+                  buf[--n] = '\0';
+              if (n) {
+                  struct stat dst {};
+                  if (stat(buf, &dst) == 0) {
+                      s_game_path = buf;
+                      printf("[boot] disc-launch: starting %s\n", buf);
+                      fflush(stdout);
+                      // vk-285-160d/e: write the autostart guard so the disc watcher (which starts
+                      // after us) doesn't queue the same game a second time. The daemon puts the
+                      // disc's serial on line 2 (dumps are named "Title (SERIAL).iso", so it can't
+                      // be read off the file name).
+                      char serial[64] = {};
+                      if (fgets(serial, sizeof(serial), f)) {
+                          size_t sn = strlen(serial);
+                          while (sn && (serial[sn - 1] == '\n' || serial[sn - 1] == '\r' || serial[sn - 1] == ' '))
+                              serial[--sn] = '\0';
+                      }
+                      if (serial[0]) {
+                          if (FILE* af = fopen(OrbisLogPath("disc-autostart.txt").c_str(), "w")) {
+                              fprintf(af, "%s %lld\n", serial, static_cast<long long>(time(nullptr)));
+                              fclose(af);
+                          }
+                      }
+                  } else {
+                      printf("[boot] disc-launch: %s: stat failed (errno %d) — ignored\n", buf, errno);
+                  }
+              }
+          }
+          fclose(f);
+          unlink(dlp.c_str());
+      }
+  }
+  // PR #34 (Heyde Moura; AI-assisted port): the bootdisc flag (flags/bootdisc). A PS2 disc in a disc drive (a USB DVD or BD
+  // drive on a PS5 without one of its own, or the PS5's drive) starts straight away, without the shelf, and plays from the
+  // disc itself (orbis-shims/OrbisIOCtlSrc.cpp), as a PS2 starts the disc it holds. A disc-launch request above goes first
+  // (it names a copy already made); with no PS2 disc in a drive the shelf opens as usual. The drives are looked at here
+  // only, once, because the flag asks for it; the disc watcher (ProsperoDiscDump.cpp) then leaves the drive alone. Not
+  // frontend_ran: a start that fails closes the app rather than coming back here in a loop.
+  if (s_game_path.empty() && orbis_flag("bootdisc"))
+  {
+    const std::vector<std::string> drives = OrbisDiscDrive::List();
+    if (drives.empty())
+      printf("[disc] bootdisc: no disc drive (/dev/cd0 to /dev/cd7); the shelf opens\n");
+    for (const std::string& drive : drives)
+    {
+      std::string why;
+      if (!OrbisDiscDrive::WaitReady(drive, 10000, &why))
+      {
+        printf("[disc] bootdisc: %s: %s\n", drive.c_str(), why.c_str());
+        continue;
+      }
+      if (!OrbisDiscDumpClaim(drive))
+      {
+        printf("[disc] bootdisc: %s: its disc is being copied; not started from the drive\n", drive.c_str());
+        continue;
+      }
+      const std::string serial = fe::ReadSerial(drive);
+      if (serial.empty())
+      {
+        printf("[disc] bootdisc: %s: the disc in it isn't a PS2 game (no SYSTEM.CNF naming its executable)\n", drive.c_str());
+        OrbisDiscDumpRelease(drive);
+        continue;
+      }
+      s_game_path = drive;
+      const char* shown = OrbisDiscDrive::SafeSerial(serial) ? serial.c_str() : "a PS2 game";
+      printf("[disc] bootdisc: %s holds %s; starting it from the drive without the shelf\n", drive.c_str(), shown);
+      orbis_eventf("bootdisc: starting the disc in %s (%s) without the shelf", drive.c_str(), shown);
+      break;
+    }
+    fflush(stdout);
+  }
+  orbis_boot_phase("shelf starting (its game scan and first frame are timed in its own [frontend] lines)");
+  if (s_game_path.empty() && !orbis_flag("nofrontend") && !orbis_flag("nomenu"))
     s_game_path = orbis_frontend_run(orbis_frontend_paths(!orbis_flag("nocoverdl")), ORBIS_BUILD_TAG, &frontend_ran);
 #endif
 #ifdef ORBIS_VULKAN
@@ -2333,7 +3322,11 @@ int main()
   orbis_hide_splash();
 #endif
   orbis_boot_log_release("after the shelf"); // vk-285-113
-  if (!frontend_ran)
+#ifdef PS5SX2_ACHIEVEMENTS
+  OrbisAchievementsWaitForLogin();
+  OrbisAchievementsStopBrowser(); // pr9n: the shelf's achievement list isn't needed now (was: wait out its requests)
+#endif
+  if (s_game_path.empty() && !frontend_ran)
     s_game_path = orbis_select_game(OrbisDir("games").c_str(), "/data/PCSX2", ORBIS_BUILD_TAG); // vk-285-33: games/ too
   if (s_game_path.empty())
   {
@@ -2346,21 +3339,48 @@ int main()
     sys_notify(fe::Tr(fe::Str::NotifyNoGame));
     orbis_exit_quietly(0);
   }
+  // 2026-10-08 (AI-assisted; testers asked for the PS2's own boot and menu): the sheet's "PS2 system menu" (fe_ps5.h
+  // kOrbisSystemMenuPath): no disc, so VMManager boots the BIOS into its menu (AutoDetectSource: an empty file name is
+  // CDVD_SourceType::NoDisc); gs.ini's settings, no game's file. Needs proper testing on the console.
+  const bool system_menu = s_game_path == kOrbisSystemMenuPath;
+  if (system_menu)
+  {
+    s_game_path.clear();
+    s_game_ini_path.clear();
+    printf("[boot] the PS2 system menu (no disc); settings: gs.ini only\n");
+    orbis_eventf("game start: the PS2 system menu (no disc) | all games (gs.ini): %s", orbis_ini_summary("/data/PCSX2/gs.ini").c_str());
+    fflush(stdout);
+  }
+  else
   {
     // vk-285-32: its settings file, named after the image without the extension.
     std::string stem = s_game_path.substr(s_game_path.rfind('/') + 1);
     const size_t dot = stem.rfind('.');
     if (dot != std::string::npos && dot > 0)
       stem.erase(dot);
+    // PR #34: a game played from a drive ("/dev/cd1"): its settings file named after the disc's serial (checked fit for a
+    // file name), so each game put in the drive keeps its own. The disc watcher leaves the drive alone from here on.
+    if (OrbisDiscDrive::IsDrivePath(s_game_path))
+    {
+      if (!OrbisDiscDumpClaim(s_game_path))
+        printf("[disc] %s: started while its disc is being copied: both read the drive\n", s_game_path.c_str());
+      const std::string serial = fe::ReadSerial(s_game_path);
+      const bool safe = OrbisDiscDrive::SafeSerial(serial);
+      stem = safe ? serial : "Disc drive " + stem;
+      printf("[disc] game from the drive %s: %s\n", s_game_path.c_str(),
+        safe ? serial.c_str() : serial.empty() ? "no serial read" : "a serial unfit for a file name (not used)");
+    }
     s_game_ini_path = "/data/PCSX2/settings/" + stem + ".ini";
   }
 #ifdef ORBIS_VULKAN
-  orbis_web_now_playing(s_game_path); // vk-285-50: the page marks it and applies its changes live
+  if (!system_menu)
+    orbis_web_now_playing(s_game_path); // vk-285-50: the page marks it and applies its changes live
 #endif
-  printf("[boot] game: %s\n[boot] game settings: %s (%s)\n", s_game_path.c_str(), s_game_ini_path.c_str(),
-    access(s_game_ini_path.c_str(), F_OK) == 0 ? "found" : "none");
-  fflush(stdout);
+  if (!system_menu)
   {
+    printf("[boot] game: %s\n[boot] game settings: %s (%s)\n", s_game_path.c_str(), s_game_ini_path.c_str(),
+      access(s_game_ini_path.c_str(), F_OK) == 0 ? "found" : "none");
+    fflush(stdout);
     // Test build 1 (vk-285-55): where the image is, when it isn't in games/ (a USB drive, say).
     const std::string dir = s_game_path.substr(0, s_game_path.rfind('/'));
     const std::string from = dir == OrbisDir("games") ? std::string() : " (from " + dir + ")";
@@ -2368,6 +3388,9 @@ int main()
       s_game_path.substr(s_game_path.rfind('/') + 1).c_str(), from.c_str(), orbis_ini_summary(s_game_ini_path).c_str(),
       orbis_ini_summary("/data/PCSX2/gs.ini").c_str());
   }
+  // 2026-10-05 (AI-assisted): rich toasts (RetroAchievements' login and game summary) wait for the game's first 12 s:
+  // sent in its first seconds, they showed without their pictures (orbis-shims/ProsperoNotify.cpp, the pacing).
+  OrbisNotifyHold(12);
 #ifdef ORBIS_VULKAN
   if (g_orbis_test_build > 0)
   {
@@ -2422,7 +3445,9 @@ int main()
 
   {
     std::unique_lock<std::mutex> lock = Host::GetSettingsLock();
+#ifndef PS5SX2_ACHIEVEMENTS
     Host::Internal::SetBaseSettingsLayer(&s_base_si);
+#endif
     Host::Internal::SetGameSettingsLayer(&s_game_si, lock);
     Host::Internal::SetInputSettingsLayer(&s_input_si, lock);
   }
@@ -2467,6 +3492,207 @@ int main()
     s_base_si.SetStringValue("USB2", "Type", "hidmouse");
   }
   printf("[boot] USB keyboard and mouse %s\n", orbis_flag("nousbkbm") ? "off (flag nousbkbm)" : "on ports 1 and 2");
+  // vk-285-141 (AI-assisted): the controller's microphone as a PS2 USB microphone (orbis-shims/ProsperoMic.cpp captures it,
+  // ProsperoAudio.cpp hands it to PCSX2's USB microphone). PS5SX2/Microphone, the game's file or gs.ini: auto (the default:
+  // on for the games that won't start without one: Lifeline, Operator's Side), 0 off, 1 a USB microphone (PCSX2's
+  // "singstar" device as Logitech's), 2 a USB headset (Logitech's; what the game sends its speaker plays nowhere). It takes
+  // the PS2's USB port 2, the mouse's; a game's own USB2/Type still wins.
+  {
+    MemorySettingsInterface peek = s_base_si;
+    orbis_apply_gs_ini(peek, true);
+    const std::string mode = peek.GetStringValue("PS5SX2", "Microphone", "auto");
+    const std::string serial = fe::ReadSerial(s_game_path);
+    static const char* const needs_mic[] = {"SLUS-20848", "SCPS-15038", "SCPS-15039", "SCPS-19213"};
+    bool needs = false;
+    for (const char* s : needs_mic)
+      needs = needs || serial == s;
+    const int mic = mode == "1" ? 1 : mode == "2" ? 2 : mode == "0" ? 0 : (needs ? 1 : 0);
+    if (mic == 1)
+    {
+      s_base_si.SetStringValue("USB2", "Type", "singstar");
+      s_base_si.SetUIntValue("USB2", "singstar_subtype", 1u); // MIC_LOGITECH: one microphone, Logitech's USB IDs
+      s_base_si.SetStringValue("USB2", "singstar_input_device_name", "DualSense");
+    }
+    else if (mic == 2)
+    {
+      s_base_si.SetStringValue("USB2", "Type", "headset");
+      s_base_si.SetStringValue("USB2", "headset_input_device_name", "DualSense");
+    }
+    printf("[boot] microphone: %s (PS5SX2/Microphone %s, serial %s%s)\n",
+      mic == 1 ? "a USB microphone on USB port 2" : mic == 2 ? "a USB headset on USB port 2" : "off", mode.c_str(),
+      serial.empty() ? "unknown" : serial.c_str(), needs ? ", a game that needs one" : "");
+    fflush(stdout);
+  }
+  // live-7 (AI-assisted): swordpdf: a PAL disc's "PlayStation 2" logo came out scrambled on full boot with his only BIOS, a
+  // USA one; a European BIOS fixed it ("the fix was the region bios"; the logo on the disc is encrypted per region, as on a
+  // real PS2). When the BIOS folder holds BIOSes of several regions, the one matching the game's region (from its serial)
+  // is used for that game; the configured one (Filenames/BIOS, else the one PCSX2 would pick) when it already matches or
+  // there's no match. Its own .nvm keeps each BIOS's settings. PS5SX2/BiosByRegion=false turns it off.
+  {
+    MemorySettingsInterface peek = s_base_si;
+    orbis_apply_gs_ini(peek, true);
+    const bool on = peek.GetBoolValue("PS5SX2", "BiosByRegion", true);
+    const bool disc_game = !s_game_path.empty() &&
+      !(s_game_path.size() > 4 && strcasecmp(s_game_path.c_str() + s_game_path.size() - 4, ".elf") == 0);
+    const std::string serial = disc_game ? fe::ReadSerial(s_game_path) : std::string();
+    // the BIOS region (BiosTools' numbering: 0 Japan, 1 USA, 2 Europe, 4 Asia, 6 China) a serial's prefix asks for
+    int want = -1;
+    if (serial.size() >= 4)
+    {
+      const std::string p = serial.substr(0, 4);
+      if (p == "SLUS" || p == "SCUS" || p == "PBPX" || p == "LSP-")
+        want = 1;
+      else if (p == "SLES" || p == "SCES" || p == "SCED" || p == "SLED")
+        want = 2;
+      else if (p == "SLPM" || p == "SLPS" || p == "SCPS" || p == "SCPM" || p == "SCAJ" || p == "SLAJ")
+        want = (p == "SCAJ" || p == "SLAJ") ? 4 : 0;
+      else if (p == "SCKA" || p == "SLKA")
+        want = 4;
+      else if (p == "SCCS")
+        want = 6;
+    }
+    if (on && want >= 0)
+    {
+      struct Found { std::string rel; u32 region; std::string zone; };
+      std::vector<Found> found;
+      FileSystem::FindResultsArray results;
+      if (FileSystem::FindFiles(EmuFolders::Bios.c_str(), "*", FILESYSTEM_FIND_FILES | FILESYSTEM_FIND_RECURSIVE, &results))
+      {
+        for (const FILESYSTEM_FIND_DATA& fd : results)
+        {
+          if (fd.Size < 4u * 1024 * 1024 || fd.Size > 8u * 1024 * 1024)
+            continue;
+          u32 version = 0, region = 0;
+          std::string description, zone;
+          if (!IsBIOS(fd.FileName.c_str(), version, description, region, zone))
+            continue;
+          std::string rel = fd.FileName;
+          if (rel.compare(0, EmuFolders::Bios.size() + 1, EmuFolders::Bios + "/") == 0)
+            rel = rel.substr(EmuFolders::Bios.size() + 1);
+          found.push_back({rel, region, zone});
+        }
+      }
+      const std::string configured = peek.GetStringValue("Filenames", "BIOS", "");
+      const Found* current = nullptr;
+      for (const Found& f : found)
+        if (!configured.empty() && f.rel == configured)
+          current = &f;
+      if (!current && !found.empty())
+        current = &found.front(); // roughly what PCSX2 picks with none configured
+      const Found* match = nullptr;
+      if (current && static_cast<int>(current->region) == want)
+        match = current;
+      for (const Found& f : found)
+        if (!match && static_cast<int>(f.region) == want)
+          match = &f;
+      if (match && (!current || match != current))
+      {
+        s_base_si.SetStringValue("Filenames", "BIOS", match->rel.c_str());
+        printf("[boot] BIOS by region: %s is a %s game, using %s (%s) instead of %s\n", serial.c_str(), match->zone.c_str(),
+          match->rel.c_str(), match->zone.c_str(), current ? (current->rel + " (" + current->zone + ")").c_str() : "none");
+      }
+      else
+      {
+        printf("[boot] BIOS by region: %s wants region %d; %s (%zu BIOS file%s in %s)\n", serial.c_str(), want,
+          match ? ("already using " + match->rel).c_str() : "no BIOS of that region, keeping the configured one",
+          found.size(), found.size() == 1 ? "" : "s", EmuFolders::Bios.c_str());
+      }
+    }
+    else
+    {
+      printf("[boot] BIOS by region: %s\n", !on ? "off (PS5SX2/BiosByRegion)" : serial.empty() ? "no disc serial" : "region unknown for this serial");
+    }
+    fflush(stdout);
+  }
+#ifdef ORBIS_VULKAN
+  // live-9 (AI-assisted; swordpdf: "just have this setting be the standard for rac1 for everyone"): Ratchet & Clank (1) gets the
+  // setup that held 60 fps / 100% at its heavy spot on his base PS5 (fw 4.03, 2026-10-10; claude/rac1-base-ps5.md), where the
+  // frame passed 4400 draws and became two submissions (the second waits for a vblank on that firmware): a 4800-draw
+  // submission budget (GSDeviceVK.cpp; flags/vk_drawbudget still wins), the driver's recorder thread (PS5VK_RECORD_THREAD, as
+  // the flag file vk_recordthread) with its batched hand-off (the driver's live flag file vk_recbatch), and pin=3's thread
+  // layout EE 2, GS 6, VU 4, recorder 8, queue 10 (GSRenderer.cpp; any pin key in live.ini replaces it). Resolution, frame
+  // generation and the rest stay the user's. The vk_recbatch file is made for the game and removed again at the next start of
+  // another game (the marker logs/auto-vk_recbatch.txt says it was made here); one the user made stays. PS5SX2/GameTuning=false
+  // (gs.ini or the game's file) turns it off.
+  {
+    MemorySettingsInterface peek = s_base_si;
+    orbis_apply_gs_ini(peek, true);
+    const bool on = peek.GetBoolValue("PS5SX2", "GameTuning", true);
+    const bool disc_game = !s_game_path.empty() &&
+      !(s_game_path.size() > 4 && strcasecmp(s_game_path.c_str() + s_game_path.size() - 4, ".elf") == 0);
+    const std::string serial = disc_game ? fe::ReadSerial(s_game_path) : std::string();
+    static const char* const rac1[] = {"SCUS-97199", "SCES-50916", "SCAJ-20001", "SCPS-15037",  // the releases
+                                       "SCED-50916", "SCED-51075", "SCUS-97209", "SCUS-97240"}; // their demos
+    bool is_rac1 = false;
+    for (const char* s : rac1)
+      is_rac1 = is_rac1 || serial == s;
+    const std::string recbatch = OrbisDir("flags") + "/vk_recbatch";
+    const std::string marker = OrbisLogPath("auto-vk_recbatch.txt");
+    const bool tune = on && is_rac1 && !g_sw_renderer && !OrbisDriverIsRADV();
+    struct stat st;
+    if (tune)
+    {
+      setenv("PS5SX2_DRAW_BUDGET", "6000", 0); // live-10: 4800 -> 6000 (a view past 4800, "still the same issue"); the words guard in GSDeviceVK.cpp
+      setenv("PS5VK_RECORD_THREAD", "1", 0);
+      setenv("PS5SX2_PIN_LAYOUT", "2 6 4 8 10", 0);
+      if (stat(recbatch.c_str(), &st) != 0)
+      {
+        if (FILE* f = fopen(recbatch.c_str(), "w"))
+        {
+          fclose(f);
+          if (FILE* m = fopen(marker.c_str(), "w"))
+          {
+            fprintf(m, "flags/vk_recbatch made for %s at start; removed at the next start of another game\n", serial.c_str());
+            fclose(m);
+          }
+        }
+      }
+    }
+    else if (stat(marker.c_str(), &st) == 0)
+    {
+      unlink(recbatch.c_str());
+      unlink(marker.c_str());
+    }
+    printf("[boot] game tuning: %s\n", tune ? "Ratchet & Clank (draw budget 6000, recorder thread + vk_recbatch, thread layout 2 6 4 8 10)" :
+      !on ? "off (PS5SX2/GameTuning)" : "none for this game");
+    fflush(stdout);
+  }
+#endif
+  // 2026-10-05 (AI-assisted; swordpdf: the network adapter on for every game, after a tester went online in Resident Evil
+  // Outbreak with SOCOM II's lines): the PS2's network adapter as SOCOM II's file sets it (claude/socom2-online.md):
+  // PCSX2's sockets backend on the console's own connection, its DHCP server giving the game an address, and the DNS the
+  // PS5 uses (pcsx2/DEV9/AdapterUtils.cpp GetDNS). DEV9's receive thread starts only once a game sends (net.cpp), so games
+  // that never use the network don't pay for it. gs.ini, a game's file or the sheet's Network adapter row
+  // (DEV9/Eth/EthEnable=false) turn it off; so does the flag file nonetwork, for every game.
+  if (!orbis_flag("nonetwork"))
+  {
+    s_base_si.SetBoolValue("DEV9/Eth", "EthEnable", true);
+    s_base_si.SetStringValue("DEV9/Eth", "EthApi", "Sockets");
+    s_base_si.SetStringValue("DEV9/Eth", "EthDevice", "Auto");
+    s_base_si.SetBoolValue("DEV9/Eth", "InterceptDHCP", true);
+  }
+  printf("[boot] PS2 network adapter %s\n", orbis_flag("nonetwork") ? "off (flag nonetwork)" : "on by default (sockets, DHCP)");
+  // vk-285-140 (AI-assisted): USB guitars and pads the PS5 doesn't take as controllers (orbis-shims/ProsperoUsbPad.cpp). Started
+  // here so that a guitar plugged in before the game can make PS2 port 1 a Guitar below (up to a second's wait for it).
+  bool guitar_game = false;
+  {
+    // vk-285-142: in a Guitar Hero / Rock Band game a USB device known only by its reports' shape is taken as a guitar.
+    fe::GameInfo gi;
+    gi.path = s_game_path;
+    gi.serial = fe::ReadSerial(s_game_path);
+    const size_t slash = s_game_path.rfind('/');
+    gi.title = s_game_path.substr(slash == std::string::npos ? 0 : slash + 1);
+    fe::ApplyGameDbTitle(gi);
+    std::string low = gi.title + " " + s_game_path;
+    for (char &ch : low)
+      ch = static_cast<char>(tolower(static_cast<unsigned char>(ch)));
+    guitar_game = low.find("guitar hero") != std::string::npos || low.find("rock band") != std::string::npos ||
+                  low.find("band hero") != std::string::npos;
+    OrbisUsbPadSetGuitarHint(guitar_game);
+    printf("[boot] USB pads: %s (\"%s\")\n", guitar_game ? "a Guitar Hero or Rock Band game" : "not a guitar game", gi.title.c_str());
+  }
+  OrbisUsbPadStart();
+  const bool usb_guitar_at_start = OrbisUsbPadWaitGuitar(1000);
   {
     // vk-285-109: player 2 (see g_orbis_second_user).
     int32_t first = -1;
@@ -2514,11 +3740,53 @@ int main()
       g_orbis_multitap == 0 ? "off" : g_orbis_multitap == 1 ? "in port 1" : "in port 2",
       who.empty() ? " PS2 port 2 stays empty" : who.c_str());
   }
+  {
+    // vk-285-140: a USB guitar at the start makes PS2 port 1 PCSX2's Guitar, unless gs.ini or the game's file sets Pad1's type.
+    MemorySettingsInterface peek = s_base_si;
+    orbis_apply_gs_ini(peek, true);
+    std::string own_type;
+    const bool typed = peek.GetStringValue("Pad1", "Type", &own_type) && !own_type.empty();
+    // vk-285-155 (AI-assisted): only make port 1 a Guitar when this is a guitar game, or the usbguitar flag is set. A real
+    // guitar left plugged in while a normal game runs used to turn port 1 into a Guitar for that game too, and PadGuitar
+    // masks the first button byte, so the game saw the D-pad held left and no sticks: unplayable. gs.ini or the game's file
+    // can still set Pad1/Type=Guitar by hand.
+    const bool want_guitar = usb_guitar_at_start && (guitar_game || orbis_flag("usbguitar"));
+    if (want_guitar && !typed)
+      s_base_si.SetStringValue("Pad1", "Type", "Guitar");
+    MemorySettingsInterface after = s_base_si;
+    orbis_apply_gs_ini(after, true);
+    const std::string type = after.GetStringValue("Pad1", "Type", "DualShock2");
+    g_orbis_port1_guitar.store(type == "Guitar", std::memory_order_relaxed);
+    printf("[boot] PS2 port 1: %s%s\n", type.c_str(),
+      usb_guitar_at_start ? (typed ? " (a USB guitar is connected, but gs.ini or the game's file sets Pad1's type)"
+                                    : want_guitar ? " (a USB guitar is connected)"
+                                                  : " (a USB guitar is connected, but this isn't a guitar game: use the usbguitar flag)")
+                          : "");
+    fflush(stdout);
+  }
   s_base_pre_gsini = s_base_si; // eerec-285
   orbis_apply_gs_ini(s_base_si);
+#ifdef PS5SX2_ACHIEVEMENTS
+  OrbisAchievementsConfigure(s_base_si);
+#endif
   orbis_usb_kbm_for_mode(s_base_si); // vk-285-113
   orbis_vu1_speed_from(s_base_si); // vk-285-75
   orbis_ps5opts_from(s_base_si); // vk-285-113
+#ifdef ORBIS_VULKAN
+  {
+    // 2026-10-08 (AI-assisted): PS5SX2/FrameGeneration, per game (or in gs.ini): a frame generated between two of the game's and
+    // presented before the second (GSDeviceVK.cpp, "frame generation"), with the TV in its 120 Hz mode for the game (VKSwapChain.cpp
+    // picks the mode when the swapchain is made, so it is read here, before the GS opens). Needs proper testing.
+    g_orbis_fg_wanted = s_base_si.GetBoolValue("PS5SX2", "FrameGeneration", false) && !g_sw_renderer;
+    // The latency hold (RPCS3-PS5 m74): at 120 Hz each game frame brings two presents, which fill every refresh; a game a hair
+    // faster than half the display's rate would fill the swapchain's queue and show every frame later from then on. The game
+    // runs 0.08% slow instead (59.89 fps for NTSC's 59.94): the queue stays empty, and once in a while a refresh repeats.
+    orbis_fg_hold(s_base_si);
+    printf("[boot] frame generation: %s\n", g_orbis_fg_wanted ? "on (PS5SX2/FrameGeneration; the display asked for at 120 Hz)" :
+      "off");
+    fflush(stdout);
+  }
+#endif
   {
     // vk-285-110: the PS2 system language games are told (pcsx2/CDVD/CDVD.cpp): the PS5SX2/GameLanguage
     // setting (0 Japanese .. 7 Portuguese, from gs.ini or the game's settings file), else the PS5's own
@@ -2541,10 +3809,49 @@ int main()
 
   VMBootParameters params;
   params.filename = s_game_path; // vk-285-30
+  // vk-285-139: a game's discs (and the cheat disc as disc 1 when the game starts from it).
+  if (!s_game_path.empty() && !(s_game_path.size() > 4 && strcasecmp(s_game_path.c_str() + s_game_path.size() - 4, ".elf") == 0))
+  {
+    params.filename = orbis_disc_boot(s_game_path);
+    // PR #34: a disc drive plays from the disc itself, through PCSX2's disc reader (orbis-shims/OrbisIOCtlSrc.cpp).
+    if (OrbisDiscDrive::IsDrivePath(params.filename))
+      params.source_type = CDVD_SourceType::Disc;
+    else if (params.filename != s_game_path)
+      params.source_type = CDVD_SourceType::Iso;
+  }
+  // 2026-10-08 (AI-assisted; testers: "mount ELFs", "ELF properties: disc path"): an .elf from the shelf boots as PCSX2 boots
+  // an ELF (VMBootParameters::elf_override, always fast booted; host: is its folder when EmuCore/HostFs is on), with the disc
+  // image its settings file names (PS5SX2/ElfDisc: a file name the shelf lists, or a full path), else with no disc. Needs
+  // proper testing on the console.
+  if (s_game_path.size() > 4 && strcasecmp(s_game_path.c_str() + s_game_path.size() - 4, ".elf") == 0)
+  {
+    params.elf_override = s_game_path;
+    const std::string disc = orbis_elf_disc();
+    if (!disc.empty())
+    {
+      params.filename = disc;
+      // PR #34: the ELF's disc in a drive ("/dev/cd1"), played from the drive
+      const bool drive = OrbisDiscDrive::IsDrivePath(disc);
+      if (drive && !OrbisDiscDumpClaim(disc))
+        printf("[disc] %s: started while its disc is being copied: both read the drive\n", disc.c_str());
+      params.source_type = drive ? CDVD_SourceType::Disc : CDVD_SourceType::Iso;
+      std::lock_guard<std::mutex> lock(s_disc_mutex); // vk-285-139: the page can change it
+      s_disc_set = {disc};
+      s_disc_current = disc;
+    }
+    else
+    {
+      params.filename.clear();
+      params.source_type = CDVD_SourceType::NoDisc;
+    }
+    printf("[boot] ELF %s, %s\n", s_game_path.c_str(), disc.empty() ? "no disc (PS5SX2/ElfDisc not set or not found)" : ("disc " + disc).c_str());
+    fflush(stdout);
+  }
 
-  // Orbis: no ImGui backend on the PS5 - disable the Achievements host
-  // (its ImGui usage faults without a context).
+  // The PS5 account service uses native notifications instead of ImGui overlays.
+#ifndef PS5SX2_ACHIEVEMENTS
   EmuConfig.Achievements.Enabled = false;
+#endif
   GSConfig.Renderer = (g_use_gl_renderer && !g_sw_renderer) ? ORBIS_GPU_RENDERER : GSRendererType::SW;
   GSConfig.SWExtraThreads = g_sw_renderer ? 4 : 2;
   // EE+IOP+VU recompilers (JIT memory + emitter >4GB fixes in).
@@ -2557,7 +3864,11 @@ int main()
   EmuConfig.Speedhacks.vu1Instant = !g_no_speedhacks;
   EmuConfig.Speedhacks.vuFlagHack = !g_no_speedhacks;
   EmuConfig.Speedhacks.vuThread = false;
+#ifdef PS5SX2_ACHIEVEMENTS
+  printf("[boot] achievements available (softcore, native notifications)\n");
+#else
   printf("[boot] achievements disabled (no ImGui backend)\n");
+#endif
   fflush(stdout);
   printf("[boot] initializing...\n");
   fflush(stdout);
@@ -2570,7 +3881,11 @@ int main()
       std::this_thread::sleep_for(std::chrono::seconds(5));
       if (!init_done.load())
       {
-        printf("[boot] watchdog t+%ds: still in Initialize\n", (i + 1) * 5);
+        // 2.02: the step it's in (orbis_stage), so a stuck start's log names the call.
+        const char* stage = s_orbis_stage.load(std::memory_order_acquire);
+        const long long in_ms = orbis_now_ms() - s_orbis_stage_ms.load(std::memory_order_relaxed);
+        printf("[boot] watchdog t+%ds: still in Initialize, step: %s (for %lld s)\n", (i + 1) * 5,
+          stage ? stage : "before the first step", stage ? in_ms / 1000 : 0ll);
         fflush(stdout);
       }
     }
@@ -2691,6 +4006,9 @@ int main()
   SysMemory::Reset();
   printf("[boot] SysMemory::Reset done\n");
   fflush(stdout);
+  orbis_wait_for_game_file(params.filename); // vk-285-134
+  orbis_stage("game file: first read");
+  orbis_probe_game_read(params.filename); // 2.02
   const VMBootResult res = VMManager::Initialize(params, &err);
   init_done = true;
   printf("[boot] Initialize=%d err=%s\n", (int)res, err.GetDescription().c_str());
@@ -2699,6 +4017,8 @@ int main()
   if (res == VMBootResult::StartupSuccess)
   {
     std::string title = VMManager::GetTitle(true);
+    if (title.empty() && system_menu)
+      title = "PS2 system menu"; // 2026-10-08
     if (title.empty())
     {
       title = s_game_path.substr(s_game_path.rfind('/') + 1);

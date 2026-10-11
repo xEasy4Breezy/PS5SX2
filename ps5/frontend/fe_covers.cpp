@@ -1,12 +1,13 @@
 // PS5 port frontend: covers (see fe_covers.h).
 //
-// Copyright (C) 2026 Spyros
+// Copyright (C) 2026 swordpdf
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "fe_covers.h"
 #include "fe_i18n.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -251,8 +252,8 @@ std::vector<std::string> Wrap(const Fonts& fonts, const std::string& text, float
 
 std::string UsbDriveRoot(const std::string& path)
 {
-	// "/mnt/usb<n>/..." (fe_ps5.cpp lists /mnt/usb0 to /mnt/usb7)
-	if (path.compare(0, 8, "/mnt/usb") != 0)
+	// "/mnt/usb<n>/..." (fe_ps5.cpp lists /mnt/usb0 to /mnt/usb7), 2026-10-08: and "/mnt/ext<n>/..." (extended storage, M.2)
+	if (path.compare(0, 8, "/mnt/usb") != 0 && path.compare(0, 8, "/mnt/ext") != 0)
 		return {};
 	size_t i = 8;
 	while (i < path.size() && path[i] >= '0' && path[i] <= '9')
@@ -260,6 +261,43 @@ std::string UsbDriveRoot(const std::string& path)
 	if (i == 8 || i >= path.size() || path[i] != '/')
 		return {};
 	return path.substr(0, i);
+}
+
+namespace
+{
+std::mutex g_share_roots_lock;
+std::vector<std::string> g_share_roots;
+} // namespace
+
+bool OnNetworkShare(const std::string& path)
+{
+	return path.compare(0, 5, "/nfs/") == 0;
+}
+
+void SetShareRoots(const std::vector<std::string>& roots)
+{
+	std::vector<std::string> keep;
+	for (std::string r : roots)
+	{
+		while (r.size() > 1 && r.back() == '/')
+			r.pop_back();
+		if (OnNetworkShare(r) && std::find(keep.begin(), keep.end(), r) == keep.end())
+			keep.push_back(r);
+	}
+	std::lock_guard<std::mutex> lock(g_share_roots_lock);
+	g_share_roots = std::move(keep);
+}
+
+std::string DriveRoot(const std::string& path)
+{
+	std::string root = UsbDriveRoot(path);
+	if (!root.empty() || !OnNetworkShare(path))
+		return root;
+	std::lock_guard<std::mutex> lock(g_share_roots_lock);
+	for (const std::string& r : g_share_roots)
+		if (r.size() > root.size() && path.size() > r.size() && path.compare(0, r.size(), r) == 0 && path[r.size()] == '/')
+			root = r;
+	return root;
 }
 
 std::string OplGameId(const std::string& serial)
@@ -362,8 +400,8 @@ std::vector<CoverFile> CoverFinder::Search(const GameInfo& g, bool first_only)
 	const size_t slash = g.path.rfind('/');
 	if (slash != std::string::npos && slash > 0 && Lookup(g.path.substr(0, slash), g.stem, "beside", out) && first_only)
 		return out;
-	// 3. A covers folder at the root of the game's USB drive.
-	const std::string drive = UsbDriveRoot(g.path);
+	// 3. A covers folder at the root of the game's USB drive (vk-285-156: or NFS share).
+	const std::string drive = DriveRoot(g.path);
 	const std::string drive_covers = Subdir(drive, "covers");
 	if (!drive_covers.empty())
 		for (const std::string& n : names)
@@ -384,8 +422,15 @@ std::vector<CoverFile> CoverFinder::Search(const GameInfo& g, bool first_only)
 	return out;
 }
 
-bool CoverService::Decode(const std::vector<uint8_t>& bytes, int max_h, CoverImage& out)
+bool CoverService::Decode(const std::vector<uint8_t>& bytes, int max_h, CoverImage& out, int max_dimension)
 {
+	if (max_dimension > 0)
+	{
+		int w, h, channels;
+		if (!stbi_info_from_memory(bytes.data(), static_cast<int>(bytes.size()), &w, &h, &channels) ||
+			w > max_dimension || h > max_dimension)
+			return false;
+	}
 	int w = 0, h = 0, n = 0;
 	unsigned char* px = stbi_load_from_memory(bytes.data(), static_cast<int>(bytes.size()), &w, &h, &n, 4);
 	if (!px || w < 16 || h < 16)
@@ -516,41 +561,65 @@ void CoverService::Start(const std::vector<GameInfo>& games, const Fonts* fonts,
 	m_cfg = cfg;
 	m_download = std::move(download);
 	m_stop = false;
-	m_finished = false;
+	{
+		std::lock_guard<std::mutex> lock(m_mutex);
+		m_live.assign(m_games.size(), 0);
+		m_todo.assign(m_games.size(), 0);
+	}
 	if (!m_cfg.cache_dir.empty())
 		MakeDirs(m_cfg.cache_dir);
-	// A thread of its own with a roomy stack (image decoding and font rasterizing run on it).
+	// Threads of their own with a roomy stack (image decoding and font rasterizing run on them). 2026-10-10: the
+	// painting and the downloads apart, so a download (up to 20 s) never holds back the boxes the shelf is showing.
 	pthread_attr_t attr;
 	pthread_attr_init(&attr);
 	pthread_attr_setstacksize(&attr, 1024 * 1024);
+	m_running = 2;
 	m_thread_started = pthread_create(&m_thread, &attr, &CoverService::ThreadMain, this) == 0;
-	pthread_attr_destroy(&attr);
 	if (!m_thread_started)
-		m_finished = true;
+		m_running--;
+	m_dl_thread_started = pthread_create(&m_dl_thread, &attr, &CoverService::DownloadThreadMain, this) == 0;
+	if (!m_dl_thread_started)
+		m_running--;
+	pthread_attr_destroy(&attr);
 }
 
 void* CoverService::ThreadMain(void* self)
 {
 	CoverService* s = static_cast<CoverService*>(self);
 	s->Run();
-	s->m_finished = true;
+	s->m_running--;
+	return nullptr;
+}
+
+void* CoverService::DownloadThreadMain(void* self)
+{
+	CoverService* s = static_cast<CoverService*>(self);
+	s->RunDownloads();
+	s->m_running--;
 	return nullptr;
 }
 
 bool CoverService::Stop(int timeout_ms)
 {
 	m_stop = true;
-	if (!m_thread_started)
+	{
+		std::lock_guard<std::mutex> lock(m_mutex);
+		m_wake.notify_all();
+	}
+	if (!m_thread_started && !m_dl_thread_started)
 		return true;
 	if (timeout_ms >= 0)
 	{
-		for (int waited = 0; !m_finished && waited < timeout_ms; waited += 10)
+		for (int waited = 0; m_running > 0 && waited < timeout_ms; waited += 10)
 			usleep(10000);
-		if (!m_finished)
+		if (m_running > 0)
 			return false;
 	}
-	pthread_join(m_thread, nullptr);
-	m_thread_started = false;
+	if (m_thread_started)
+		pthread_join(m_thread, nullptr);
+	if (m_dl_thread_started)
+		pthread_join(m_dl_thread, nullptr);
+	m_thread_started = m_dl_thread_started = false;
 	return true;
 }
 
@@ -567,6 +636,58 @@ bool CoverService::Poll(CoverImage& out)
 void CoverService::SetSelected(int selected)
 {
 	m_selected = selected;
+}
+
+void CoverService::Want(int index)
+{
+	std::lock_guard<std::mutex> lock(m_mutex);
+	if (index < 0 || static_cast<size_t>(index) >= m_live.size() || m_live[static_cast<size_t>(index)])
+		return;
+	m_live[static_cast<size_t>(index)] = 1;
+	m_todo[static_cast<size_t>(index)] = 1;
+	m_wake.notify_all();
+}
+
+void CoverService::Forget(int index)
+{
+	std::lock_guard<std::mutex> lock(m_mutex);
+	if (index < 0 || static_cast<size_t>(index) >= m_live.size())
+		return;
+	m_live[static_cast<size_t>(index)] = 0;
+	m_todo[static_cast<size_t>(index)] = 0;
+}
+
+int CoverService::NextWanted() const
+{
+	const int sel = m_selected;
+	int best = -1, best_d = 1 << 30;
+	for (int i = 0; i < static_cast<int>(m_todo.size()); i++)
+		if (m_todo[static_cast<size_t>(i)] && std::abs(i - sel) < best_d)
+		{
+			best_d = std::abs(i - sel);
+			best = i;
+		}
+	return best;
+}
+
+// vk-285-157's throttle, kept: at most 24 images (< 18 MB) wait for the main thread, which takes 4 a frame.
+bool CoverService::Push(CoverImage& img)
+{
+	static const size_t kMaxQueue = 24;
+	for (;;)
+	{
+		{
+			std::lock_guard<std::mutex> lock(m_mutex);
+			if (m_stop || img.game < 0 || static_cast<size_t>(img.game) >= m_live.size() || !m_live[static_cast<size_t>(img.game)])
+				return false;
+			if (m_results.size() < kMaxQueue)
+			{
+				m_results.push_back(std::move(img));
+				return true;
+			}
+		}
+		usleep(5000); // 5 ms; yields CPU to the render thread
+	}
 }
 
 std::string CoverService::Status() const
@@ -615,13 +736,13 @@ bool CoverService::FindLocalCover(CoverFinder& finder, int index, CoverImage& ou
 }
 
 // A download for the game is worth a try: a serial, downloads allowed (on the shelf only for games on
-// USB drives), and no 404 for it in the last two weeks. (The network being down is checked as the
+// USB drives and, vk-285-156, NFS shares: the prefetch before the jailbreak sees neither), and no 404 for it in the last two weeks. (The network being down is checked as the
 // downloads go: m_offline.)
 bool CoverService::MayDownload(int index) const
 {
 	const GameInfo& g = m_games[static_cast<size_t>(index)];
 	return !g.serial.empty() && m_cfg.allow_download && m_download && !m_cfg.url_template.empty() &&
-		   (!m_cfg.download_usb_only || !UsbDriveRoot(g.path).empty()) && !RecentlyMissing(m_cfg.cache_dir, g.serial);
+		   (!m_cfg.download_usb_only || !UsbDriveRoot(g.path).empty() || OnNetworkShare(g.path)) && !RecentlyMissing(m_cfg.cache_dir, g.serial);
 }
 
 bool CoverService::DownloadCover(int index, CoverImage& out)
@@ -651,10 +772,11 @@ bool CoverService::DownloadCover(int index, CoverImage& out)
 	}
 	else if (status == 404)
 		WriteFileAtomic(missing, std::vector<uint8_t>{'4', '0', '4', '\n'});
-	else if (status < 0)
+	else if (status < 0 || status == 429) // 2026-10-10: the cover host's rate limit: stop rather than hammer it
 		m_offline = true;
 	std::printf("[frontend] cover %s: %s -> %d%s\n", g.serial.c_str(), url.c_str(), status,
 		ok ? " (saved)" :
+		status == 429 ? " (rate limited; no more downloads this session)" :
 		status >= 0 ? "" :
 		m_stop ? " (stopped: the shelf closed)" :
 				 " (network down; no more downloads this session)");
@@ -728,71 +850,78 @@ int CoverService::Prefetch(const std::vector<GameInfo>& games, const std::vector
 	return saved;
 }
 
+// 2026-10-10 (AI-assisted; a tester with ~2,600 games on an NFS share got no covers): the games the shelf wants, nearest
+// the selection first: spine and placeholder, then the cover on disk (CoverFinder). Before, every game was painted and
+// every cover on disk decoded before any download, and the shelf kept a texture for each: about 1.2 MB a game for the
+// spine and placeholder, plus the cover's (~1.5 MB), which ran a 2,600-game shelf out of memory, and past ~1,020 games
+// out of the renderer's descriptor sets, so boxes stopped being drawn (the selected one too, as its cover came).
 void CoverService::Run()
 {
-	const size_t n = m_games.size();
-	// Spines and placeholders first: they make every box presentable at once.
-	std::vector<bool> done(n, false);
-	for (size_t k = 0; k < n && !m_stop; k++)
-	{
-		const int i = NextGame(done);
-		done[static_cast<size_t>(i)] = true;
-		CoverImage spine, hold;
-		PaintSpine(*m_fonts, m_games[static_cast<size_t>(i)], spine);
-		PaintPlaceholder(*m_fonts, m_games[static_cast<size_t>(i)], hold);
-		spine.game = hold.game = i;
-		std::lock_guard<std::mutex> lock(m_mutex);
-		m_results.push_back(std::move(spine));
-		m_results.push_back(std::move(hold));
-	}
-	// Then the covers already on disk, nearest the selection first (vk-285-110: all of them before any
-	// download, so a slow or failing download never holds one back).
-	auto deliver = [this](int i, CoverImage& cover) {
-		cover.game = i;
-		cover.kind = CoverImage::Cover;
-		std::lock_guard<std::mutex> lock(m_mutex);
-		m_results.push_back(std::move(cover));
-	};
 	CoverFinder finder(m_cfg.manual_dir, m_cfg.cache_dir);
-	std::vector<bool> want(n, false); // a download is worth a try
-	int found = 0, wanted = 0;
-	std::string sources; // " (cache 11, beside 1)" for the log
-	std::vector<std::pair<std::string, int>> by_source;
-	done.assign(n, false);
-	for (size_t k = 0; k < n && !m_stop; k++)
+	while (!m_stop)
 	{
-		const int i = NextGame(done);
-		done[static_cast<size_t>(i)] = true;
+		int i;
+		{
+			std::unique_lock<std::mutex> lock(m_mutex);
+			i = NextWanted();
+			if (i < 0)
+			{
+				m_wake.wait_for(lock, std::chrono::milliseconds(100));
+				continue;
+			}
+			m_todo[static_cast<size_t>(i)] = 0;
+		}
+		const GameInfo& g = m_games[static_cast<size_t>(i)];
+		CoverImage spine, hold;
+		PaintSpine(*m_fonts, g, spine);
+		PaintPlaceholder(*m_fonts, g, hold);
+		spine.game = hold.game = i;
+		if (!Push(spine) || !Push(hold))
+			continue;
 		CoverImage cover;
 		bool upgrade = true;
 		if (FindLocalCover(finder, i, cover, upgrade))
 		{
-			found++;
-			auto it = std::find_if(by_source.begin(), by_source.end(), [&](const auto& s) { return s.first == cover.source; });
-			if (it == by_source.end())
-				by_source.emplace_back(cover.source, 1);
-			else
-				it->second++;
-			deliver(i, cover);
+			cover.game = i;
+			cover.kind = CoverImage::Cover;
+			Push(cover);
 		}
-		want[static_cast<size_t>(i)] = upgrade && MayDownload(i);
-		wanted += want[static_cast<size_t>(i)] ? 1 : 0;
 	}
-	for (const auto& s : by_source)
-		sources += (sources.empty() ? " (" : ", ") + s.first + " " + std::to_string(s.second);
-	if (!sources.empty())
-		sources += ")";
-	std::printf("[frontend] covers on disk: %d of %zu%s; %d to download%s\n", found, n, sources.c_str(), wanted,
-		m_cfg.allow_download ? "" : " (downloads off here)");
+}
+
+// The missing covers (none on disk, or only an OPL ART one; no 404 in the last two weeks), downloaded into the cache
+// nearest the selection first until the network fails. A cover for a game the shelf still shows goes to it too; the
+// rest wait in the cache for when the shelf gets to them. Nothing is decoded here but the downloads.
+void CoverService::RunDownloads()
+{
+	const size_t n = m_games.size();
+	timespec t0;
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	CoverFinder finder(m_cfg.manual_dir, m_cfg.cache_dir);
+	std::vector<bool> done(n, true);
+	int have = 0, wanted = 0;
+	for (size_t i = 0; i < n && !m_stop; i++)
+	{
+		bool on_disk = false;
+		for (const CoverFile& f : finder.Find(m_games[i]))
+			on_disk = on_disk || std::strcmp(f.source, "art") != 0; // an OPL ART cover is worth replacing
+		have += on_disk ? 1 : 0;
+		if (!on_disk && MayDownload(static_cast<int>(i)))
+		{
+			done[i] = false;
+			wanted++;
+		}
+	}
+	timespec t1;
+	clock_gettime(CLOCK_MONOTONIC, &t1);
+	std::printf("[frontend] covers on disk: %d of %zu; %d to download%s (checked in %.0f ms)\n", have, n, wanted,
+		m_cfg.allow_download ? "" : " (downloads off here)",
+		static_cast<double>(t1.tv_sec - t0.tv_sec) * 1000.0 + (t1.tv_nsec - t0.tv_nsec) / 1e6);
 	std::fflush(stdout);
 	{
 		std::lock_guard<std::mutex> lock(m_mutex);
 		m_download_total = wanted;
 	}
-	// Then the downloads, nearest the selection first, until the network fails. After the HEN jailbreak
-	// HTTPS failed on vk-285-41/42; when it still does, the next start's prefetch fetches these.
-	for (size_t i = 0; i < n; i++)
-		done[i] = !want[i];
 	for (int k = 0; k < wanted && !m_stop && !m_offline; k++)
 	{
 		const int i = NextGame(done);
@@ -801,7 +930,11 @@ void CoverService::Run()
 		done[static_cast<size_t>(i)] = true;
 		CoverImage cover;
 		if (DownloadCover(i, cover))
-			deliver(i, cover);
+		{
+			cover.game = i;
+			cover.kind = CoverImage::Cover;
+			Push(cover); // dropped when the shelf isn't showing the game: it's in the cache for when it is
+		}
 	}
 	std::lock_guard<std::mutex> lock(m_mutex);
 	m_busy = false;

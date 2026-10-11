@@ -4,7 +4,7 @@
 // objects go into both eboots; the few places where the two drivers want different things ask here at run time
 // (orbis-shims/orbis_vk.cpp: RADV's entry point is a weak reference, null in a ps5vk eboot).
 //
-// Copyright (C) 2026 Spyros
+// Copyright (C) 2026 swordpdf
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #pragma once

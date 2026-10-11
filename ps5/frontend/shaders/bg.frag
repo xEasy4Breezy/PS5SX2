@@ -2,7 +2,7 @@
 #extension GL_GOOGLE_include_directive : require
 // PS5 port frontend: the background: a deep blue-violet gradient, a soft glow behind the selected
 // box tinted by its cover, and a thin glow on the floor under it.
-// Copyright (C) 2026 Spyros
+// Copyright (C) 2026 swordpdf
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "common.glsl"
 

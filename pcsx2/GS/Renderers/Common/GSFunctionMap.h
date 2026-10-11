@@ -166,6 +166,12 @@ public:
 	void Clear()
 	{
 		m_cgmap.clear();
+		// PS5 port (2026-10-08, AI-assisted): the functions looked up so far too: they point into the code being thrown away (a reset
+		// reuses that memory), and a key whose generation failed for want of room is looked up again. Needs proper testing.
+		for (auto& i : this->m_map_active)
+			delete i.second;
+		this->m_map_active.clear();
+		this->m_active = nullptr;
 	}
 
 	VALUE GetDefaultFunction(KEY key)
@@ -183,6 +189,11 @@ public:
 			HostSys::BeginCodeWrite();
 
 			u8* code_ptr = GSCodeReserve::ReserveMemory(MAX_SIZE);
+			if (!code_ptr) [[unlikely]] // PS5 port (2026-10-08): the region is full; the caller resets the cache and asks again
+			{
+				HostSys::EndCodeWrite();
+				return nullptr;
+			}
 			CG cg(key, code_ptr, MAX_SIZE);
 			cg.Generate();
 			pxAssert(cg.GetSize() < MAX_SIZE);

@@ -4,7 +4,7 @@
 // qsort_s and localtime_s that no RADV title on the console makes. Defined here, before libc.a, they never are.
 // Hidden: the eboot exports nothing.
 //
-// Copyright (C) 2026 Spyros
+// Copyright (C) 2026 swordpdf
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 	.text

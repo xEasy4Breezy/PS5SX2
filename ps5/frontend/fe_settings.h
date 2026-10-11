@@ -3,7 +3,7 @@
 // memcards/, the games' patch groups and the recommended settings (assets/presets.ini). Moved here from fe_web.cpp
 // unchanged; the editing, card and recommended helpers at the end are the page's own steps, for the sheet.
 //
-// Copyright (C) 2026 Spyros
+// Copyright (C) 2026 swordpdf
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #pragma once
@@ -68,6 +68,7 @@ struct IniState
 {
 	std::vector<std::pair<std::string, std::string>> kv;
 	std::vector<std::string> enabled;
+	std::vector<std::string> cheats; // 2026-10-08: Cheats/Enable lines (the sheet's Cheats rows)
 };
 
 IniState ReadState(const std::string& text);
@@ -78,6 +79,14 @@ bool SameState(IniState a, IniState b);
 std::string DescribeChanges(const IniState& before, const IniState& after);
 // One section of presets.ini ("[@global]", "[SLUS-20733]"). False when there is none.
 bool PresetSection(const std::string& presets, const std::string& id, std::string& out);
+
+// ---- 2026-10-08 (AI-assisted): PCSX2's manual hardware fixes (EmuCore/GS/UserHacks=true). While they are on, PCSX2
+// leaves out the game database's hardware-renderer fixes for the game (GameDatabase.cpp applyGSHardwareFixes) unless the
+// settings give the same value, as on a PC. ManualFixSettings: those fixes as the settings that set them by hand, e.g.
+// ("UserHacks_native_scaling", "3") for Kingdom Hearts (SLUS-20370), from the database file (fe_games.h GameDbHwFixes).
+// The sheet and the page write them when manual fixes are turned on for a game, so that turning it on changes nothing
+// until a fix is changed. Fixes PCSX2 applies either way (mipmapping, blending levels, the CRC hacks) aren't in it.
+std::vector<std::pair<std::string, std::string>> ManualFixSettings(const std::string& serial);
 
 // ---- vk-285-114: the page's steps as functions, for the shelf's options sheet.
 
@@ -90,8 +99,10 @@ struct Change
 		Unset,
 		PatchOn,
 		PatchOff,
+		CheatOn,  // 2026-10-08: a Cheats/Enable line for a cheat group
+		CheatOff,
 	} kind = Set;
-	std::string key;   // the setting, or the patch group's name
+	std::string key;   // the setting, or the patch (or cheat) group's name
 	std::string value; // for Set
 };
 

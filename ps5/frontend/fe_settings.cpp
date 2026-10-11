@@ -1,10 +1,11 @@
 // PS5 port frontend: the settings files (see fe_settings.h). The first part is fe_web.cpp's code as it was (vk-285-113),
 // moved here unchanged so the shelf's options sheet uses the same reader and writer as the settings page.
 //
-// Copyright (C) 2026 Spyros
+// Copyright (C) 2026 swordpdf
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "fe_settings.h"
+#include "fe_games.h" // 2026-10-08: GameDbHwFixes
 
 #include <algorithm>
 #include <cerrno>
@@ -145,6 +146,14 @@ bool SafeKey(const std::string& key)
 	for (char c : key)
 		if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '/'))
 			return false;
+	// pr9n (AI-assisted), PR #9 review item 4: nothing in [Achievements] from the page or the sheet. The page answers anyone
+	// on the LAN, and Achievements/Host pointed at another https server would have had the next sign-in send the user's
+	// token there (Token and Username would replace the account). The account comes from the sign-in only.
+	std::string first = key.substr(0, key.find('/'));
+	for (char& c : first)
+		c = static_cast<char>(c >= 'A' && c <= 'Z' ? c - 'A' + 'a' : c);
+	if (first == "achievements")
+		return false;
 	return true;
 }
 
@@ -284,6 +293,12 @@ IniState ReadState(const std::string& text)
 				st.enabled.push_back(l.value);
 			continue;
 		}
+		if (l.key == "Cheats/Enable") // 2026-10-08
+		{
+			if (std::find(st.cheats.begin(), st.cheats.end(), l.value) == st.cheats.end())
+				st.cheats.push_back(l.value);
+			continue;
+		}
 		if (IsListKey(l.key))
 			continue;
 		auto it = std::find_if(st.kv.begin(), st.kv.end(), [&](const std::pair<std::string, std::string>& p) { return p.first == l.key; });
@@ -346,6 +361,12 @@ std::string DescribeChanges(const IniState& before, const IniState& after)
 	for (const std::string& e : before.enabled)
 		if (std::find(after.enabled.begin(), after.enabled.end(), e) == after.enabled.end())
 			add("patch off: " + e);
+	for (const std::string& e : after.cheats) // 2026-10-08
+		if (std::find(before.cheats.begin(), before.cheats.end(), e) == before.cheats.end())
+			add("cheat on: " + e);
+	for (const std::string& e : before.cheats)
+		if (std::find(after.cheats.begin(), after.cheats.end(), e) == after.cheats.end())
+			add("cheat off: " + e);
 	return out;
 }
 
@@ -383,6 +404,73 @@ bool PresetSection(const std::string& presets, const std::string& id, std::strin
 	if (out == "\n")
 		out.clear();
 	return found;
+}
+
+// ---- 2026-10-08 (AI-assisted): the game database's fixes that PCSX2's manual hardware fixes switch off ------------------
+
+std::vector<std::pair<std::string, std::string>> ManualFixSettings(const std::string& serial)
+{
+	// GameDatabase.cpp's gsHWFixes names (isUserHackHWFix: every fix but deinterlace, mipmap, texture preloading, trilinear
+	// filtering, the blending levels, the PCRTC ones and the CRC hacks) and the GS settings that set each by hand
+	// (Pcsx2Config.cpp's keys); `flag`: an on/off setting (value > 0). The recommended-only ones (recommendedAccurateAlphaTest,
+	// recommendedHWAA1) only show a message, so they're left out.
+	static const struct
+	{
+		const char* fix;
+		const char* key;
+		bool flag;
+	} kFixes[] = {
+		{"autoFlush", "UserHacks_AutoFlushLevel", false},
+		{"cpuFramebufferConversion", "UserHacks_CPU_FB_Conversion", true},
+		{"readTCOnClose", "UserHacks_ReadTCOnClose", true},
+		{"disableDepthSupport", "UserHacks_DisableDepthSupport", true},
+		{"preloadFrameData", "preload_frame_with_gs_data", true},
+		{"disablePartialInvalidation", "UserHacks_DisablePartialInvalidation", true},
+		{"textureInsideRT", "UserHacks_TextureInsideRt", false},
+		{"limit24BitDepth", "UserHacks_Limit24BitDepth", false},
+		{"alignSprite", "UserHacks_align_sprite_X", true},
+		{"mergeSprite", "UserHacks_merge_pp_sprite", true},
+		{"accurateAlphaTest", "HWAccurateAlphaTest", true},
+		{"forceEvenSpritePosition", "UserHacks_ForceEvenSpritePosition", true},
+		{"bilinearUpscale", "UserHacks_BilinearHack", false},
+		{"nativePaletteDraw", "UserHacks_NativePaletteDraw", true},
+		{"estimateTextureRegion", "UserHacks_EstimateTextureRegion", true},
+		{"drawBuffering", "UserHacks_DrawBuffering", true},
+		{"rewriteLargeST", "UserHacks_RewriteLargeST", true},
+		{"skipDrawStart", "UserHacks_SkipDraw_Start", false},
+		{"skipDrawEnd", "UserHacks_SkipDraw_End", false},
+		{"halfPixelOffset", "UserHacks_HalfPixelOffset", false},
+		{"roundSprite", "UserHacks_round_sprite_offset", false},
+		{"nativeScaling", "UserHacks_native_scaling", false},
+		{"cpuSpriteRenderBW", "UserHacks_CPUSpriteRenderBW", false},
+		{"cpuSpriteRenderLevel", "UserHacks_CPUSpriteRenderLevel", false},
+		{"cpuCLUTRender", "UserHacks_CPUCLUTRender", false},
+		{"gpuTargetCLUT", "UserHacks_GPUTargetCLUTMode", false},
+		{"gpuPaletteConversion", "paltex", true},
+	};
+	std::vector<std::pair<std::string, std::string>> out;
+	for (const auto& [fix, value] : GameDbHwFixes(serial))
+		for (const auto& f : kFixes)
+		{
+			if (fix != f.fix)
+				continue;
+			// gpuPaletteConversion 2 means "on when texture preloading is Full", which depends on the other settings: left to
+			// PCSX2 (it then counts as switched off by manual fixes, as on a PC).
+			if (fix == "gpuPaletteConversion" && value > 1)
+				break;
+			std::string v = f.flag ? (value > 0 ? "true" : "false") : std::to_string(value);
+			bool seen = false;
+			for (auto& kv : out)
+				if (kv.first == f.key)
+				{
+					kv.second = v; // a fix listed twice: the last one, as PCSX2 applies them in order
+					seen = true;
+				}
+			if (!seen)
+				out.emplace_back(f.key, std::move(v));
+			break;
+		}
+	return out;
 }
 
 // ---- vk-285-114: the page's steps as functions, for the shelf's options sheet ---------------------------------------
@@ -458,21 +546,25 @@ bool EditSettingsFile(const std::string& path, const std::string& header_if_new,
 				error = "bad patch name";
 				return false;
 			}
+			// 2026-10-08: a cheat group the same way, on Cheats/Enable lines.
+			const bool cheat = c.kind == Change::CheatOn || c.kind == Change::CheatOff;
+			const std::string list_key = cheat ? "Cheats/Enable" : "Patches/Enable";
+			const bool turn_on = c.kind == Change::PatchOn || c.kind == Change::CheatOn;
 			bool present = false;
 			for (const IniLine& l : lines)
-				present = present || (l.kv && l.key == "Patches/Enable" && l.value == group);
-			if (c.kind == Change::PatchOn && !present)
+				present = present || (l.kv && l.key == list_key && l.value == group);
+			if (turn_on && !present)
 			{
 				IniLine l;
-				l.raw = "Patches/Enable=" + group;
-				l.key = "Patches/Enable";
+				l.raw = list_key + "=" + group;
+				l.key = list_key;
 				l.value = group;
 				l.kv = true;
 				lines.push_back(l);
 			}
-			else if (c.kind == Change::PatchOff)
+			else if (!turn_on)
 				lines.erase(std::remove_if(lines.begin(), lines.end(),
-								[&](const IniLine& l) { return l.kv && l.key == "Patches/Enable" && l.value == group; }),
+								[&](const IniLine& l) { return l.kv && l.key == list_key && l.value == group; }),
 					lines.end());
 		}
 	}

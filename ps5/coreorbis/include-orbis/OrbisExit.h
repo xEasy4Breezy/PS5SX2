@@ -4,7 +4,7 @@
 // handlers report as a crash. OrbisExitApp (main-boot.cpp) drains the logs and asks the system to close the app
 // (sceSystemServiceLoadExec("exit")), falling back to _exit() if it hasn't within 10 s.
 //
-// Copyright (C) 2026 Spyros
+// Copyright (C) 2026 swordpdf
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #pragma once

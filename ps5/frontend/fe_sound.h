@@ -2,7 +2,7 @@
 // starts (nothing is loaded from disk), and a voice mixer that the platform's audio thread pulls
 // from. The shelf only reports what happened; whether anything plays is the platform's business.
 //
-// Copyright (C) 2026 Spyros
+// Copyright (C) 2026 swordpdf
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #pragma once

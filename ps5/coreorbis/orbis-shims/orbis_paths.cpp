@@ -1,6 +1,6 @@
 // PS5 port (vk-285-33): the /data/PCSX2 folder layout (include-orbis/OrbisPaths.h).
 //
-// Copyright (C) 2026 Spyros
+// Copyright (C) 2026 swordpdf
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "OrbisPaths.h"
