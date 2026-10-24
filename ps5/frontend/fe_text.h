@@ -81,6 +81,18 @@ public:
 private:
 	const Glyph* Find(uint32_t cp) const;
 	bool AddGlyph(int font, uint32_t cp);
+	// 2.03: a glyph drawn (RenderGlyph, on any thread) and then put into the atlas (PackGlyph, one thread).
+	struct RenderedGlyph
+	{
+		int font = 0;
+		bool valid = false;
+		float advance = 0;
+		int w = 0, h = 0, xoff = 0, yoff = 0;
+		unsigned char* sdf = nullptr;
+	};
+	struct FontData;
+	static RenderedGlyph RenderGlyph(const FontData& f, int font, uint32_t cp);
+	bool PackGlyph(uint32_t cp, RenderedGlyph& r);
 
 	struct FontData;
 	std::vector<FontData*> m_fonts;

@@ -74,7 +74,7 @@ int main(int argc, char** argv)
 		std::ofstream(dir + "/Raw Mode2 (USA) (Track 2).bin", std::ios::binary).write(reinterpret_cast<const char*>(audio.data()), static_cast<std::streamsize>(audio.size()));
 	}
 	{
-		// 2026-10-08: an .elf with an ELF header is listed (no serial); one without isn't.
+		// 2.11: no .elf is listed, whatever it holds (2026-10-08 to 2.10 listed the ones with an ELF header).
 		std::string elf = std::string("\x7f" "ELF") + std::string(4092, '\0');
 		std::ofstream(dir + "/Homebrew.elf", std::ios::binary).write(elf.data(), static_cast<std::streamsize>(elf.size()));
 		std::ofstream(dir + "/Notes.elf", std::ios::binary) << "not an executable";
@@ -89,8 +89,9 @@ int main(int argc, char** argv)
 	Check(seen.find("Sub 2448 (USA).bin=SLUS-21005") != std::string::npos, "a .bin with subcode (2448)");
 	Check(seen.find("Small") == std::string::npos, "a .bin under 16 MB isn't listed");
 	Check(seen.find("Track 2") == std::string::npos, "an audio track isn't listed");
-	Check(seen.find("Homebrew.elf=;") != std::string::npos, "an ELF is listed, without a serial");
+	Check(seen.find("Homebrew.elf") == std::string::npos, "an ELF isn't listed (2.11)");
 	Check(seen.find("Notes.elf") == std::string::npos, "a file named .elf that isn't one isn't listed");
+	Check(!fe::IsDiscImageName("Homebrew.elf") && fe::IsDiscImageName("Game.iso") && fe::IsDiscImageName("Game.CHD"), "IsDiscImageName: no .elf, the others as before");
 	{
 		// vk-285-146: SYSTEM.CNF is 60-odd bytes; the drive gives only whole sectors.
 		const std::string drive = dir + "/cd0-drive";

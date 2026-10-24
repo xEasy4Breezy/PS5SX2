@@ -19,6 +19,11 @@
 #include <cstdio>
 #include <string>
 
+#ifdef ORBIS_VULKAN
+#include "ps5/coreorbis/orbis-shims/OrbisDisplayHz.h" // 2.11: the display rate frame generation paces against
+#include "ps5/coreorbis/orbis-shims/OrbisVideoOutMode.h" // 2.11: the app's own 120 Hz switch (flag fg120)
+#endif
+
 #if defined(VK_USE_PLATFORM_XLIB_KHR)
 #include <X11/Xlib.h>
 #endif
@@ -42,12 +47,20 @@ VKSwapChain::~VKSwapChain()
 }
 
 #ifdef ORBIS_VULKAN
+// 2.11: the refresh rate of the mode the swapchain was made for, in millihertz (0 before the first); GSDeviceVK.cpp's frame
+// generation takes it as the display's rate when the driver measures none (OrbisDisplayHz.h).
+uint32_t g_orbis_display_refresh_mhz = 0;
+
 // PS5: no window system; the one display is VideoOut, driven through VK_KHR_display
 // as mihawk-99's vkQuake and RetroArch ports do. The driver reports one 3840x2160
 // mode and refuses a surface of any other extent, so the swapchain is that size and
 // the present pass scales the frame into it.
 static VkSurfaceKHR CreateOrbisDisplaySurface(VkInstance instance, VkPhysicalDevice physical_device)
 {
+	// 2.11: the app's own switch to the 120 Hz output (flag fg120; main-boot.cpp starts it beside the VM's boot) comes before the
+	// driver looks at the display, and the driver's own open of VideoOut 5 s after it.
+	OrbisVideoOutWait();
+
 	if (!vkGetPhysicalDeviceDisplayPropertiesKHR || !vkGetPhysicalDeviceDisplayPlanePropertiesKHR ||
 		!vkGetDisplayModePropertiesKHR || !vkCreateDisplayPlaneSurfaceKHR)
 	{
@@ -153,9 +166,18 @@ static VkSurfaceKHR CreateOrbisDisplaySurface(VkInstance instance, VkPhysicalDev
 	}
 	Console.WriteLn("VK: display surface %ux%u on plane %u (%.2f Hz)", chosen_mode.parameters.visibleRegion.width,
 		chosen_mode.parameters.visibleRegion.height, chosen_plane, chosen_mode.parameters.refreshRate / 1000.0);
+	// 2.11: the chosen mode's rate is the display's for frame generation's pacing when the driver measures none: a driver that lists
+	// the 119.88 Hz mode (the upstream PS5_Vulkan's, RADV) gets two refreshes a 60 fps game's frame, one that lists 60 Hz does not.
+	g_orbis_display_refresh_mhz = chosen_mode.parameters.refreshRate;
+	// The rate frame generation paces against is not named here: the driver has not opened the output yet (a listed 119.88 Hz mode is no
+	// promise). The "[display] swapchain:" and "[display] frame generation paces against" lines after the swapchain say what it is.
 	printf("[display] modes offered: %s; %s: %.2f Hz\n", offered.c_str(),
 		g_orbis_fg_wanted ? "frame generation is on, so the one nearest 120 Hz" : "the one nearest 60 Hz",
 		chosen_mode.parameters.refreshRate / 1000.0);
+	if (g_orbis_fg_wanted && chosen_mode.parameters.refreshRate < 100000)
+		printf("[display] frame generation is on but no mode at 100 Hz or more is listed, so the output may stay at 60 Hz (with ps5vk, the "
+			   "title's param.json has to declare attribute3 0x80040: see the [boot] param.json line; the [display] swapchain and \"frame "
+			   "generation paces against\" lines below have the driver's own verdict)\n");
 	fflush(stdout);
 	return surface;
 }
@@ -163,6 +185,9 @@ static VkSurfaceKHR CreateOrbisDisplaySurface(VkInstance instance, VkPhysicalDev
 // vk-285-133 (AI-assisted): what ps5vk's output did with the swapchain (the param.json it read, 119.88 Hz selected, refused
 // with the system's code, ...), for boot.log: the driver's own lines go to stderr.log. Weak: the RADV eboot has no such call.
 extern "C" const char* ps5vk_output_status(void) __attribute__((weak));
+// 2.11: and its measured refresh of that output (59940 after a fallback, 119880 when the output was taken, 0 before the open and after the close).
+extern "C" uint32_t ps5vk_output_refresh_millihertz(void) __attribute__((weak));
+extern bool g_orbis_fg_wanted;
 #endif
 
 VkSurfaceKHR VKSwapChain::CreateVulkanSurface(VkInstance instance, VkPhysicalDevice physical_device, WindowInfo* wi)
@@ -263,6 +288,9 @@ VkSurfaceKHR VKSwapChain::CreateVulkanSurface(VkInstance instance, VkPhysicalDev
 void VKSwapChain::DestroyVulkanSurface(VkInstance instance, WindowInfo* wi, VkSurfaceKHR surface)
 {
 	vkDestroySurfaceKHR(GSDeviceVK::GetInstance()->GetVulkanInstance(), surface, nullptr);
+#ifdef ORBIS_VULKAN
+	OrbisVideoOutNoteSurfaceClosed(); // 2.11: the driver closed VideoOut with the swapchain; with the output at 120 Hz, 5 s before it opens again
+#endif
 
 #if defined(__APPLE__)
 	if (wi->type == WindowInfo::Type::MacOS && wi->surface_handle)
@@ -282,6 +310,20 @@ std::unique_ptr<VKSwapChain> VKSwapChain::Create(const WindowInfo& wi, VkSurface
 	if (ps5vk_output_status)
 	{
 		printf("[display] swapchain: %s\n", ps5vk_output_status());
+		fflush(stdout);
+	}
+	// 2.11 (swordpdf on build 175: "framegen at 50fps doesn't seem to work"): the rate frame generation paces against, now that the output
+	// has been opened: the driver's own word for it beside the listed mode's, so a refused 120 Hz output shows at a glance.
+	if (g_orbis_fg_wanted)
+	{
+		const uint32_t driver_mhz = ps5vk_output_refresh_millihertz ? ps5vk_output_refresh_millihertz() : 0u;
+		const orbis_fg::DisplayHz hz =
+			orbis_fg::PickDisplayHzSource(driver_mhz, OrbisVideoOutRefreshMilliHz(), g_orbis_display_refresh_mhz);
+		printf("[display] frame generation paces against %.2f Hz (%s; %s, the listed mode %.2f Hz)%s\n", hz.hz,
+			orbis_fg::DisplayHzSourceName(hz.source),
+			driver_mhz ? fmt::format("the driver says {:.2f} Hz", driver_mhz / 1000.0).c_str() : "the driver gives no rate",
+			g_orbis_display_refresh_mhz / 1000.0,
+			hz.hz < 90.0 ? ": no room for a generated frame between the frames of a 60 fps (or PAL 50 fps) game" : "");
 		fflush(stdout);
 	}
 #endif

@@ -41,6 +41,16 @@ for c in "$la"/libarchive/*.c; do
   [[ -f $o && ! $c -nt $o ]] || "$CC" -O1 -w -DHAVE_CONFIG_H -I"$la" -I"$la/libarchive" -c "$c" -o "$o"
   la_objs+=("$o")
 done
+# b176: the 7z reader (fe_sevenzip.c) and the LZMA SDK files it needs (14: this harness links chd_stub.c, not libchdr, so LzmaDec.c is built here too).
+sdk="$pcsx2/3rdparty/lzma"
+sz_objs=()
+for s in 7zArcIn 7zBuf 7zCrc 7zCrcOpt 7zDec 7zStream Bcj2 Bra Bra86 BraIA64 CpuArch Delta Lzma2Dec LzmaDec; do
+  o="$obj/sz_$s.o"
+  [[ -f $o && ! $sdk/src/$s.c -nt $o ]] || "$CC" -O1 -w -DZ7_ST -I"$sdk/include" -c "$sdk/src/$s.c" -o "$o"
+  sz_objs+=("$o")
+done
+"$CC" -O1 -Wall -Wextra -Wno-unused-parameter -DZ7_ST -I"$sdk/include" -c "$fe/fe_sevenzip.c" -o "$obj/fe_sevenzip.o"
+sz_objs+=("$obj/fe_sevenzip.o")
 "$CXX" -std=c++20 "${flags[@]}" -c "$here/fe_host.cpp" -o "$obj/fe_host.o"
-"$CXX" -o "$here/fe_host" "$obj/fe_host.o" "${objs[@]}" "$obj/qrcodegen.o" "$obj/lz4.o" "$obj/chd_stub.o" "${la_objs[@]}" -lz -ldl -lpthread
+"$CXX" -o "$here/fe_host" "$obj/fe_host.o" "${objs[@]}" "$obj/qrcodegen.o" "$obj/lz4.o" "$obj/chd_stub.o" "${la_objs[@]}" "${sz_objs[@]}" -lz -ldl -lpthread
 echo "built $here/fe_host"

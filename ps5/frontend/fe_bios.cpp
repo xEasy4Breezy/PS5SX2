@@ -219,7 +219,8 @@ std::string ExtractBiosFromArchives(const std::vector<std::string>& dirs, const 
 std::string DescribeBiosProblem(const std::string& bios_dir, const std::string& top_dir, const std::vector<std::string>& dirs,
 	const std::function<bool(const std::string&)>& is_bios)
 {
-	const std::string wanted = top_dir + "/bios";
+	// 2026-10-16: a BIOS folder the player set (PS5SX2/BiosFolder, the only place looked in now) that isn't there is the one to make.
+	const std::string wanted = bios_dir != top_dir && !bios_dir.empty() ? bios_dir : top_dir + "/bios";
 	std::vector<Entry> entries;
 	const bool no_folder = bios_dir == top_dir || !IsDir(bios_dir);
 	if (!no_folder)

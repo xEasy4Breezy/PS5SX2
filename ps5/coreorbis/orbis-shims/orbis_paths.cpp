@@ -32,6 +32,43 @@ std::string OrbisDir(const char* sub)
 	return IsDir(dir) ? dir : std::string(kRoot);
 }
 
+// 2026-10-16: the games folders the player set, for the disc copier (ProsperoDiscDump.cpp). Asked from its threads, set from the main one.
+namespace
+{
+std::mutex s_game_dirs_mutex;
+bool s_game_dirs_only_set = false;
+std::vector<std::string> s_game_dirs_search;
+std::string s_game_dirs_copy_to;
+} // namespace
+
+void OrbisSetGameDirs(bool only_set, const std::vector<std::string>& search, const std::string& copy_to)
+{
+	std::lock_guard<std::mutex> lock(s_game_dirs_mutex);
+	s_game_dirs_only_set = only_set;
+	s_game_dirs_search = search;
+	s_game_dirs_copy_to = copy_to;
+}
+
+std::string OrbisGamesDestDir()
+{
+	{
+		std::lock_guard<std::mutex> lock(s_game_dirs_mutex);
+		if (s_game_dirs_only_set)
+			return s_game_dirs_copy_to; // "" when none of the folders set can be written to
+	}
+	return OrbisDir("games");
+}
+
+std::vector<std::string> OrbisGameSearchDirs()
+{
+	{
+		std::lock_guard<std::mutex> lock(s_game_dirs_mutex);
+		if (s_game_dirs_only_set)
+			return s_game_dirs_search;
+	}
+	return {OrbisDir("games")};
+}
+
 // vk-285-46: stat(), not access(). Before the HEN jailbreak the app's sandbox answers access() on a
 // file that exists with EPERM (vk-285-45's log: the flags folder stats fine, mode 777, and access
 // fails with errno 1), so every flag read as absent there -- in vk-285-43/44 that set the driver's
@@ -200,5 +237,11 @@ char g_orbis_pf_log[160] = "/data/PCSX2/pf.log";
 
 std::string OrbisLogPath(const char* name)
 {
+	// 2026-10-16 (build 175): the disc helper no longer makes logs/ (its log files are off), but the notes the app and the helper leave each other
+	// (ps5sx2-alive.txt, disc-launch.txt, disc-ask-choice.txt, disc-playing.txt) are only looked for there. A console without the folder (a new
+	// install) would have the app write them to /data/PCSX2/ while the helper looks in logs/: they would never meet. So the app makes it.
+	const std::string logs = std::string(kRoot) + "/logs";
+	if (!IsDir(logs))
+		mkdir(logs.c_str(), 0777);
 	return OrbisDir("logs") + "/" + name;
 }

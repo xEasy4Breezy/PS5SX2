@@ -16,11 +16,15 @@
 #include "OrbisDiscDrive.h"
 
 #include <fcntl.h>
+#include <sys/disk.h>
+#include <sys/ioctl.h>
 #include <sys/time.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <thread>
 #include <vector>
 
 // PCSX2's Error, as far as OrbisIOCtlSrc.cpp uses it (always with no Error here).
@@ -57,6 +61,195 @@ static double Now()
 	timeval tv;
 	gettimeofday(&tv, nullptr);
 	return tv.tv_sec + tv.tv_usec / 1e6;
+}
+
+static void SleepUntil(double t)
+{
+	const double d = t - Now();
+	if (d > 0)
+		usleep(static_cast<useconds_t>(d * 1e6));
+}
+
+// 2.11, the disc lag round: what the console has to answer. Run against the first IOCtlSrc (`src`, opened by main), which took Sony's 3.2x in Reopen when this is the
+// PS5's own drive with a DVD in it.
+//   - the throughput after that command (>= 4.0 MB/s on a PS-SYSTEM drive and a DVD; 2.0x is 2.8);
+//   - the missing data for the "does TEST UNIT READY answer NOT READY 2/04 after the speed command" question: the drive is put back to 2.0x, given 3 s, sent
+//     the 3.2x command again, and asked TEST UNIT READY 100 ms, 600 ms, 1.2 s and 3 s after it; each answer is logged (key/asc/ascq);
+//   - DiscReady every 100 ms for 60 s while a game-like read of 128 KiB comes every 200 ms: never false;
+//   - ReadTrackSubQ on a DVD says no at once (no command);
+//   - the cost of what the disc helper does while a game plays (opens the drive's node and asks its size four times a second): 20 s of sequential reading
+//     and 10 s of two streams in turn, with and without such a loop. Logged, not asserted.
+static void DiscLagTests(const std::string& dev, IOCtlSrc& src, s32 media, u32 sectors)
+{
+	const int fd = open(dev.c_str(), O_RDONLY);
+	const int pass = fd >= 0 ? OrbisDiscDrive::OpenPassThrough(fd) : -1;
+	const std::string drive = pass >= 0 ? OrbisDiscDrive::Describe(pass) : std::string();
+	const bool sony = drive.find("PS-SYSTEM") != std::string::npos && media >= 0;
+	std::printf("INFO disc lag tests: drive '%s'%s\n", drive.c_str(), sony ? " (the PS5's own, a DVD in it: 3.2x expected)" : " (not the PS5's own drive with a DVD: no speed command is sent)");
+	std::vector<uint8_t> buf(64 * 2048);
+	char detail[200];
+
+	// 1. throughput after the speed command Reopen sent: 24 MiB in a row in the CDVD thread's 32 KiB steps, the first MiB (the seek) not counted
+	{
+		uint64_t bytes = 0;
+		double t0 = 0;
+		bool ok = true;
+		const u32 start = sectors > 200000 ? 120000 : 16;
+		for (u32 i = 0; i < 768 && ok; i++)
+		{
+			ok = src.ReadSectors2048(start + i * 16, 16, buf.data());
+			if (i == 32)
+			{
+				t0 = Now();
+				bytes = 0;
+			}
+			else if (i > 32)
+				bytes += 16 * 2048;
+		}
+		const double mbs = ok && Now() > t0 ? bytes / (Now() - t0) / 1e6 : 0;
+		std::snprintf(detail, sizeof(detail), "%.2f MB/s over 23 MiB (2.0x: 2.8, 3.2x: 4.4)", mbs);
+		if (sony)
+			Check(ok && mbs >= 4.0, "the PS5's drive reads a DVD at 3.2x after IOCtlSrc::Reopen (at least 4.0 MB/s)", detail);
+		else
+			std::printf("INFO %s\n", detail);
+	}
+
+	// 2. TEST UNIT READY after the speed command, at 100 ms, 600 ms, 1.2 s and 3 s
+	if (sony && pass >= 0)
+	{
+		orbis_mmc::Sense s;
+		OrbisDiscDrive::Command(pass, orbis_mmc::SieSetReadSpeed(0, 0x20), nullptr, 0, 10000, &s); // back to 2.0x ...
+		usleep(3000000);                                                                           // ... and a rest
+		for (int i = 0; i < 3 && !OrbisDiscDrive::Ready(pass, &s) && s.valid && s.key == 6; i++)
+		{
+		}
+		const double t0 = Now();
+		const bool taken = OrbisDiscDrive::Command(pass, orbis_mmc::SieSetReadSpeed(0, 0x32), nullptr, 0, 10000, &s);
+		Check(taken, "Sony's speed command DB 00 00 32 is taken", taken ? std::string() : orbis_mmc::SenseText(s));
+		for (const int ms : {100, 600, 1200, 3000})
+		{
+			SleepUntil(t0 + ms / 1000.0);
+			orbis_mmc::Sense q;
+			const bool ready = OrbisDiscDrive::Ready(pass, &q);
+			std::printf("INFO TEST UNIT READY %d ms after the speed command: %s\n", ms, ready ? "ready" : orbis_mmc::SenseText(q).c_str());
+		}
+		std::fflush(stdout);
+	}
+
+	// 3. DiscReady every 100 ms for 60 s, a read of 128 KiB every 200 ms: never false
+	{
+		bool never_false = true;
+		bool reads_ok = true;
+		int calls = 0;
+		u32 at = sectors > 400000 ? 300000 : 64;
+		const double t0 = Now();
+		for (int tick = 0; tick < 600; tick++)
+		{
+			SleepUntil(t0 + tick * 0.1);
+			never_false &= src.DiscReady();
+			calls++;
+			if (tick % 2 == 0)
+			{
+				reads_ok &= src.ReadSectors2048(at, 64, buf.data());
+				at += 64;
+			}
+		}
+		std::snprintf(detail, sizeof(detail), "%d calls, 300 reads of 128 KiB", calls);
+		Check(never_false && reads_ok, "60 s of DiscReady every 100 ms with a 128 KiB read every 200 ms: never 'not ready'", detail);
+	}
+
+	// 4. the DVD's sub-channel is not asked
+	if (media >= 0)
+	{
+		cdvdSubQ q = {};
+		const double t0 = Now();
+		const bool got = src.ReadTrackSubQ(&q);
+		const double ms = (Now() - t0) * 1000;
+		std::snprintf(detail, sizeof(detail), "%.3f ms", ms);
+		Check(!got && ms < 5, "ReadTrackSubQ on a DVD says no at once, without a command", detail);
+	}
+
+	// 5. what the helper's polling costs
+	if (sectors > 600000)
+	{
+		struct Result
+		{
+			double mbs = 0, slowest_ms = 0;
+			u64 over_100ms = 0;
+		};
+		auto sequential = [&](double seconds) {
+			Result r;
+			const double t0 = Now();
+			u32 at = 40000;
+			uint64_t bytes = 0;
+			while (Now() - t0 < seconds)
+			{
+				const double a = Now();
+				if (!src.ReadSectors2048(at, 16, buf.data()))
+					break;
+				const double d = (Now() - a) * 1000;
+				r.slowest_ms = d > r.slowest_ms ? d : r.slowest_ms;
+				r.over_100ms += d > 100;
+				at += 16;
+				bytes += 16 * 2048;
+			}
+			r.mbs = bytes / (Now() - t0) / 1e6;
+			return r;
+		};
+		auto two_streams = [&](double seconds) {
+			Result r;
+			const double t0 = Now();
+			u32 a = 100000, b = sectors / 2;
+			uint64_t bytes = 0;
+			while (Now() - t0 < seconds)
+			{
+				for (u32* p : {&a, &b})
+				{
+					const double x = Now();
+					if (!src.ReadSectors2048(*p, 16, buf.data()))
+						return r;
+					const double d = (Now() - x) * 1000;
+					r.slowest_ms = d > r.slowest_ms ? d : r.slowest_ms;
+					r.over_100ms += d > 100;
+					*p += 16;
+					bytes += 16 * 2048;
+				}
+			}
+			r.mbs = bytes / (Now() - t0) / 1e6;
+			return r;
+		};
+		std::atomic<bool> stop{false};
+		auto poll = [&] {
+			while (!stop.load())
+			{
+				const int f = open(dev.c_str(), O_RDONLY);
+				if (f >= 0)
+				{
+					off_t bytes = 0;
+					ioctl(f, DIOCGMEDIASIZE, &bytes);
+					close(f);
+				}
+				usleep(250000);
+			}
+		};
+		const Result s0 = sequential(20), t_0 = two_streams(10);
+		stop = false;
+		std::thread poller(poll);
+		const Result s1 = sequential(20), t_1 = two_streams(10);
+		stop = true;
+		poller.join();
+		std::printf("INFO helper-like polling (open + DIOCGMEDIASIZE + close of %s four times a second):\n", dev.c_str());
+		std::printf("INFO   sequential 20 s: without %.2f MB/s (slowest read %.0f ms, %llu over 100 ms), with %.2f MB/s (slowest %.0f ms, %llu over 100 ms)\n", s0.mbs,
+			s0.slowest_ms, (unsigned long long)s0.over_100ms, s1.mbs, s1.slowest_ms, (unsigned long long)s1.over_100ms);
+		std::printf("INFO   two streams 10 s: without %.2f MB/s (slowest read %.0f ms, %llu over 100 ms), with %.2f MB/s (slowest %.0f ms, %llu over 100 ms)\n", t_0.mbs,
+			t_0.slowest_ms, (unsigned long long)t_0.over_100ms, t_1.mbs, t_1.slowest_ms, (unsigned long long)t_1.over_100ms);
+		std::fflush(stdout);
+	}
+
+	if (pass >= 0)
+		close(pass);
+	if (fd >= 0)
+		close(fd);
 }
 
 int main()
@@ -162,6 +355,8 @@ int main()
 	const double sequential = seq / (Now() - t0) / 1e6;
 	std::snprintf(detail, sizeof(detail), "%.2f MB/s scattered, %.2f MB/s in a row (a PS2's DVD reads up to 5.3)", scattered, sequential);
 	Check(bytes == 256 * a.size() && seq == 512 * a.size(), "reading speed", detail);
+
+	DiscLagTests(dev, src, media, sectors); // 2.11
 
 	const std::string serial = fe::ReadSerial(dev);
 	Check(OrbisDiscDrive::SafeSerial(serial), "fe::ReadSerial on the device: a serial fit for a settings file's name",

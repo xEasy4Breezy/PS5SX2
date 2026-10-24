@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "fe_options.h"
+#include "fe_roots.h" // 2026-10-16: the Folders switches' keys (kScanUsbKey, kScanSubfoldersKey)
 #include "fe_text.h" // vk-285-116: the buttons' symbols (icon::)
 
 #include <algorithm>
@@ -298,8 +299,9 @@ std::string CardSize(uint64_t bytes)
 }
 } // namespace
 
-// The settings page's GROUPS (assets/web/index.html), in its order, with its labels, defaults and hints. The text field
-// (PS5SX2/TexturesDir) stays on the page: the console has no keyboard for a path.
+// The settings page's GROUPS (assets/web/index.html), in its order, with its labels, defaults and hints. The text fields
+// (the Folders group's paths) are rows of their own on the sheet, picked with the app's folder picker (BuildRows): the console
+// has no keyboard for a path. 2026-10-16: the Textures folder is one of them; its switches below are plain options.
 std::vector<std::string> SplitFolderList(const std::string& list)
 {
 	std::vector<std::string> items;
@@ -332,6 +334,22 @@ std::string JoinFolderList(const std::vector<std::string>& items)
 const std::vector<OptionGroup>& OptionGroups()
 {
 	static const std::vector<OptionGroup> groups = {
+		// 2026-10-16 (AI-assisted; swordpdf, a tester: "PCSX2 will mount everything on the USB drive regardless of me setting a folder",
+		// "do not scan root paths recursively"): the two switches of the Folders group (the page's first group), on the sheet for all
+		// games. The folder rows before them are the app's (BuildRows: game folders, BIOS folder, NFS shares, textures folder).
+		{"Folders",
+			{
+				Toggle(kScanUsbKey, "Scan USB drives", "true", "USB scan %",
+					"On: games and the BIOS are also looked for on every USB, extended storage and M.2 drive (/mnt/usb0-7, /mnt/ext0-1) when no game "
+					"folder or BIOS folder is set. Off: not for games or the BIOS (texture packs on a drive are still found). A folder you add "
+					"yourself, on a drive too, is still used. Read when PS5SX2 starts.",
+					true),
+				Toggle(kScanSubfoldersKey, "Scan subfolders", "true", "Subfolders %",
+					"On: each games folder is listed together with the folders inside it, one level down. Off: only the disc images directly in "
+					"the folder itself. Read when PS5SX2 starts.",
+					true),
+			},
+			kTabSettings, false, true},
 		// vk-285-137 (AI-assisted; swordpdf: "add an option to hide games from the shelf"): a game off the shelf (its own file
 		// only), and the switch for all games that puts hidden games back on it, dimmed, so their sheets can turn it off again.
 		// First, so neither is far down the sheet (the Folders rows come before them on the sheet for all games).
@@ -368,11 +386,12 @@ const std::vector<OptionGroup>& OptionGroups()
 				Seg("TVShader", "Display filter", "0", "%", {{"6", "FSR"}, {"7", "FSR soft"}, {"0", "Classic"}, {"5", "CRT"}, {"1", "Scanlines"}, {"2", "VHS soft"}, {"3", "VHS"}},
 					"How the picture reaches the TV. FSR sharpens the upscale; CRT is a curved tube with beam lines; Scanlines draws a thin dark line between the 480 lines; VHS soft and VHS look like a tape (VHS: a worn one that wobbles)."),
 				// 2026-10-08 (AI-assisted): frame generation (GSDeviceVK.cpp), read when the game starts (main-boot.cpp).
+				// review 2026-10-16 (lens 3): the sheet's help box shows four lines and cut the earlier, longer text after "Video Output with 120 Hz" (the
+				// settings page has the whole text); this one fits, and the box adds "Used when a game starts." itself.
 				Toggle("PS5SX2/FrameGeneration", "Frame generation", "false", "Frame gen %",
-					"Shows a frame made between two of the game's: a 60 fps game at 120 on a TV that takes 120 Hz (the TV switches to "
-					"120 Hz for the game), a 30 fps game at 60. Only while the game holds its frame rate (an uneven one shows the game's own "
-					"frames); the FPS box then counts what the TV gets. A little more input lag, and small smears at the edges of fast "
-					"movement. Experimental. Takes effect when the game starts.",
+					"Shows a frame made between two of the game's: a 60 fps game at 120, a PAL game at 50 fps at 100, a 30 fps game at 60. "
+					"The 120 Hz output needs a TV that takes it and 120 Hz Output on in the PS5's Video Output settings (not at 1080p); without it "
+					"only games at 30 fps or less get frames. Only while the game holds its frame rate. Experimental.",
 					true),
 			}},
 		{"Graphics",
@@ -387,7 +406,7 @@ const std::vector<OptionGroup>& OptionGroups()
 				Toggle("hw_mipmap", "Mipmapping", "true", "Mipmaps %"),
 				Toggle("LoadTextureReplacements", "Texture replacements", "false", "Replacements %",
 					"Loads a texture pack's PNG and DDS files from <game serial>/replacements/ in a USB drive's PS5SX2/textures (or textures) "
-					"folder, else in /data/PCSX2/textures. Another folder can be named on the settings page (Textures folder)."),
+					"folder, else in /data/PCSX2/textures. The Textures folder (Folders, in the settings for all games) names the one folder to read from instead."),
 			}},
 		{"Performance",
 			{
@@ -597,6 +616,12 @@ void OptionsSheet::BuildRows()
 		add(Kind::GameFolders, "Game folders");
 		add(Kind::BiosFolder, "BIOS folder");
 		add(Kind::NfsShares, "NFS shares");
+		add(Kind::TexturesFolder, "Textures folder"); // 2026-10-16
+		// 2026-10-16: and the Folders group's two switches (Scan USB drives, Scan subfolders), plain option rows
+		for (const OptionGroup& g : OptionGroups())
+			if (g.title == "Folders")
+				for (const OptionDef& d : g.items)
+					add(Kind::Option, d.label).def = &d;
 	}
 	// 2026-10-08 (AI-assisted; testers: "ELF properties: disc path"): an ELF's disc, first, as PCSX2's ELF properties have it.
 	if (settings && m_elf)
@@ -608,12 +633,20 @@ void OptionsSheet::BuildRows()
 	{
 		if (g.tab != m_tab || (g.game_only && m_global) || (g.global_only && !m_global))
 			continue;
+		if (g.title == "Folders" && settings && m_global && m_folder_rows)
+			continue; // 2026-10-16: its rows came with the folder rows above
 		add(Kind::Header, g.title);
 		// vk-285-139: the cheat disc itself, on the sheet for all games, before its switch.
 		if (g.title == "Discs" && m_global)
 			add(Kind::CheatDisc, "Cheat disc");
 		for (const OptionDef& d : g.items)
 			add(Kind::Option, d.label).def = &d;
+		// 2.12: the game's tile on the PS5 home screen, under the Shelf group of a game's sheet (the group for all games is skipped above).
+		if (g.title == "Shelf" && !m_global && m_home_tile_row)
+		{
+			add(Kind::Header, "Home screen");
+			add(Kind::HomeTile, "Home screen tile");
+		}
 		// 2026-10-05 (AI-assisted): the game's HD texture pack, under Texture replacements.
 		if (g.title == "Graphics" && m_texture_pack_row && !m_global && !m_serial.empty())
 			add(Kind::TexturePack, "HD texture pack");
@@ -725,13 +758,19 @@ std::string OptionsSheet::Value(const Row& r) const
 			return "Start";
 		case Kind::GameFolders: // vk-285-135
 		{
-			const size_t n = SplitFolderList(OwnValue(kGameFoldersKey)).size();
-			return n == 0 ? "Add a folder" : n == 1 ? "1 folder" : std::to_string(n) + " folders";
+			// 2026-10-16: none = the usual places (games/, /data/PCSX2, the drives); one or more = those folders only
+			const std::vector<std::string> list = SplitFolderList(OwnValue(kGameFoldersKey));
+			return list.empty() ? "All the usual places" : list.size() == 1 ? list[0] : std::to_string(list.size()) + " folders";
 		}
 		case Kind::BiosFolder:
 		{
 			const std::string v = OwnValue(kBiosFolderKey);
 			return v.empty() ? "PCSX2/bios" : v;
+		}
+		case Kind::TexturesFolder: // 2026-10-16
+		{
+			const std::string v = OwnValue(kTexturesDirKey);
+			return v.empty() ? "PCSX2/textures" : v;
 		}
 		case Kind::NfsShares:
 		{
@@ -761,6 +800,7 @@ std::string OptionsSheet::Value(const Row& r) const
 		case Kind::ResetAll:
 		case Kind::TexturePack: // the app's (fe_app.cpp, from fe_texpacks.h)
 		case Kind::OnlinePatches: // the app's (fe_app.cpp, from fe_patchdl.h)
+		case Kind::HomeTile: // 2.12: the app's too (fe_app.cpp, from fe_gametile.h)
 			return {};
 	}
 	return {};
@@ -794,6 +834,8 @@ OptionsSheet::From OptionsSheet::Source(const Row& r) const
 			return OwnValue(kGameFoldersKey).empty() ? From::Default : From::Own;
 		case Kind::BiosFolder:
 			return OwnValue(kBiosFolderKey).empty() ? From::Default : From::Own;
+		case Kind::TexturesFolder: // 2026-10-16
+			return OwnValue(kTexturesDirKey).empty() ? From::Default : From::Own;
 		case Kind::NfsShares:
 			return OwnValue(kNfsSharesKey).empty() ? From::Default : From::Own;
 		default:
@@ -857,7 +899,8 @@ std::string OptionsSheet::Help(const Row& r) const
 				from = "The default.";
 			else
 				from = "PCSX2's default.";
-			if (r.def->restart)
+			// review 2026-10-16: the Folders switches say themselves that they are read when PS5SX2 starts (not when a game does)
+			if (r.def->restart && h.find("when PS5SX2 starts") == std::string::npos)
 				from += " Used when a game starts.";
 			return h.empty() ? from : h + " " + from;
 		}
@@ -892,17 +935,23 @@ std::string OptionsSheet::Help(const Row& r) const
 			       "with its own disc, or homebrew that reads one. No disc: the ELF alone. Used when it starts.";
 		case Kind::GameFolders: // vk-285-135
 		{
-			std::string h = "Cross: pick a folder on any drive or NFS share to list games from (and the folders in it); the ones added "
-			                "are at the top there, Triangle removes one. Without them PS5SX2 looks in /data/PCSX2/games, /data/PCSX2 and "
-			                "every USB, extended storage and M.2 drive. Read when PS5SX2 starts.";
+			// 2026-10-16: the folders added are the only ones listed (was: more places beside the usual ones)
+			// (review: the help line shows four lines; the longer text of the first version lost its end, "Read when PS5SX2 starts")
+			std::string h = "Cross: pick the folders games are listed from (and the folders in them). Once one is added ONLY the folders added "
+			                "(and NFS shares) are listed, not /data/PCSX2/games, /data/PCSX2 or the drives. Triangle there removes one; with none, "
+			                "the usual places. Read when PS5SX2 starts.";
 			const std::vector<std::string> list = SplitFolderList(OwnValue(kGameFoldersKey));
 			if (!list.empty())
 				h += " Now: " + JoinFolderList(list) + ".";
 			return h;
 		}
 		case Kind::BiosFolder:
-			return "Cross: pick the folder where the BIOS is looked for first. Triangle: back to /data/PCSX2/bios (then /data/PCSX2 and "
-			       "the drives' bios folders). Read when PS5SX2 starts.";
+			// 2026-10-16: the folder picked is the only place (was: looked in first, the usual places after it)
+			return "Cross: pick the only folder the BIOS is looked for in (and the folders inside it). Triangle: back to /data/PCSX2/bios, "
+			       "then /data/PCSX2 and the drives' bios folders. Read when PS5SX2 starts.";
+		case Kind::TexturesFolder: // 2026-10-16
+			return "Cross: pick the folder texture packs are read from, and HD texture packs are put in (<game serial>/replacements there). "
+			       "Triangle: back to /data/PCSX2/textures (and a drive's PS5SX2/textures folder first). Read when PS5SX2 starts.";
 		case Kind::NfsShares:
 		{
 			std::string h = "Cross: the NFS shares, and Add a share with the PS5's keyboard: nfs://<server>/<shared folder> (NFS v3, else "
@@ -1162,6 +1211,10 @@ bool OptionsSheet::Reset(const Row& r)
 			if (OwnValue(kBiosFolderKey).empty())
 				return false;
 			return SetOwn(kBiosFolderKey, "", "BIOS folder back to /data/PCSX2/bios");
+		case Kind::TexturesFolder: // 2026-10-16
+			if (OwnValue(kTexturesDirKey).empty())
+				return false;
+			return SetOwn(kTexturesDirKey, "", "Textures folder back to /data/PCSX2/textures");
 		case Kind::GameFolders:
 		case Kind::NfsShares:
 			m_status = "Cross: the list (Triangle there removes one)";
@@ -1224,6 +1277,7 @@ bool OptionsSheet::Activate(const Row& r, double now)
 		}
 		case Kind::GameFolders: // vk-285-135: the app opens its picker or the share list (TakeFolderRequest)
 		case Kind::BiosFolder:
+		case Kind::TexturesFolder: // 2026-10-16
 		case Kind::NfsShares:
 			m_folder_request = r.kind;
 			return true;

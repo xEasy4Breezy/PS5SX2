@@ -113,6 +113,8 @@ const char* const kKeys[kCount] = {
 	"achievements.unreachable",
 	"achievements.unsent",
 	"shelf.no_bios",
+	"notify.tile_game_missing",
+	"notify.tile_game_invalid",
 };
 
 const char* const kEnglish[kCount] = {
@@ -211,6 +213,8 @@ const char* const kEnglish[kCount] = {
 	"Couldn't reach RetroAchievements. You're still signed in: achievements come back with the next game.",
 	"An unlock couldn't be sent to RetroAchievements before closing (no connection). It won't be on your account.",
 	"No PS2 BIOS found: games can't start. Copy your BIOS file (4 MB, e.g. SCPH-70012.bin) to %s",
+	"PS5SX2: the game of this home screen tile was not found (%s). Is its drive connected? The shelf opens instead.",
+	"PS5SX2: this home screen tile doesn't name a game PS5SX2 can start. The shelf opens instead.",
 };
 
 const char* const kSpanish[kCount] = {
@@ -309,6 +313,8 @@ const char* const kSpanish[kCount] = {
 	"No se pudo conectar con RetroAchievements. Sigues con la sesión iniciada: los logros volverán en el próximo juego.",
 	"No se pudo enviar un logro a RetroAchievements antes de cerrar (sin conexión). No aparecerá en tu cuenta.",
 	"No se encontró BIOS de PS2: los juegos no pueden iniciarse. Copia tu archivo de BIOS (4 MB, p. ej. SCPH-70012.bin) en %s",
+	"PS5SX2: no se ha encontrado el juego de este icono de la pantalla de inicio (%s). ¿Está conectada su unidad? Se abre el menú.",
+	"PS5SX2: este icono de la pantalla de inicio no indica un juego que PS5SX2 pueda iniciar. Se abre el menú.",
 };
 
 const char* const kSpanishLatAm[kCount] = {
@@ -407,6 +413,8 @@ const char* const kSpanishLatAm[kCount] = {
 	"No se pudo conectar con RetroAchievements. Tu sesión sigue iniciada: los logros volverán en el próximo juego.",
 	"No se pudo enviar un logro a RetroAchievements antes de cerrar (sin conexión). No va a aparecer en tu cuenta.",
 	"No se encontró un BIOS de PS2: los juegos no pueden iniciar. Copia tu archivo de BIOS (4 MB, p. ej. SCPH-70012.bin) a %s",
+	"PS5SX2: no se encontró el juego de este mosaico de la pantalla de inicio (%s). ¿Está conectada su unidad? Se abre el menú.",
+	"PS5SX2: este mosaico de la pantalla de inicio no indica un juego que PS5SX2 pueda iniciar. Se abre el menú.",
 };
 
 const char* const kFrench[kCount] = {
@@ -505,6 +513,8 @@ const char* const kFrench[kCount] = {
 	"Impossible de joindre RetroAchievements. Tu restes connecté : les succès reviendront au prochain jeu.",
 	"Un succès n'a pas pu être envoyé à RetroAchievements avant la fermeture (pas de connexion). Il ne sera pas sur ton compte.",
 	"Aucun BIOS PS2 trouvé : les jeux ne peuvent pas démarrer. Copiez votre fichier BIOS (4 Mo, p. ex. SCPH-70012.bin) dans %s",
+	"PS5SX2 : le jeu de cette vignette de l'écran d'accueil est introuvable (%s). Son lecteur est-il branché ? Le menu s'ouvre à la place.",
+	"PS5SX2 : cette vignette de l'écran d'accueil n'indique pas de jeu que PS5SX2 peut lancer. Le menu s'ouvre à la place.",
 };
 
 const char* const kGerman[kCount] = {
@@ -603,6 +613,8 @@ const char* const kGerman[kCount] = {
 	"RetroAchievements ist nicht erreichbar. Du bleibst angemeldet: Die Erfolge sind beim nächsten Spiel wieder da.",
 	"Ein Erfolg konnte vor dem Schließen nicht an RetroAchievements gesendet werden (keine Verbindung). Er fehlt in deinem Konto.",
 	"Kein PS2-BIOS gefunden: Spiele können nicht starten. Kopiere deine BIOS-Datei (4 MB, z. B. SCPH-70012.bin) nach %s",
+	"PS5SX2: Das Spiel dieser Kachel auf dem Startbildschirm wurde nicht gefunden (%s). Ist das Laufwerk angeschlossen? Stattdessen öffnet sich das Menü.",
+	"PS5SX2: Diese Kachel auf dem Startbildschirm nennt kein Spiel, das PS5SX2 starten kann. Stattdessen öffnet sich das Menü.",
 };
 
 const char* const kItalian[kCount] = {
@@ -701,6 +713,8 @@ const char* const kItalian[kCount] = {
 	"Impossibile raggiungere RetroAchievements. Resti connesso: gli obiettivi torneranno con il prossimo gioco.",
 	"Un obiettivo non è stato inviato a RetroAchievements prima della chiusura (nessuna connessione). Non comparirà sul tuo account.",
 	"Nessun BIOS PS2 trovato: i giochi non possono avviarsi. Copia il tuo file BIOS (4 MB, es. SCPH-70012.bin) in %s",
+	"PS5SX2: il gioco di questo riquadro della schermata Home non è stato trovato (%s). L'unità è collegata? Si apre il menu.",
+	"PS5SX2: questo riquadro della schermata Home non indica un gioco che PS5SX2 possa avviare. Si apre il menu.",
 };
 
 const char* const kDutch[kCount] = {
@@ -799,6 +813,8 @@ const char* const kDutch[kCount] = {
 	"RetroAchievements is niet bereikbaar. Je blijft aangemeld: de prestaties zijn er bij het volgende spel weer.",
 	"Een prestatie kon voor het afsluiten niet naar RetroAchievements worden verstuurd (geen verbinding). Ze staat niet op je account.",
 	"Geen PS2-BIOS gevonden: games kunnen niet starten. Kopieer je BIOS-bestand (4 MB, bijv. SCPH-70012.bin) naar %s",
+	"PS5SX2: de game van deze tegel op het startscherm is niet gevonden (%s). Is het station aangesloten? In plaats daarvan gaat het menu open.",
+	"PS5SX2: deze tegel op het startscherm wijst geen game aan die PS5SX2 kan starten. In plaats daarvan gaat het menu open.",
 };
 
 const char* const kPortuguese[kCount] = {
@@ -897,6 +913,8 @@ const char* const kPortuguese[kCount] = {
 	"Não foi possível contactar o RetroAchievements. Continuas com a sessão iniciada: as conquistas voltam no próximo jogo.",
 	"Não foi possível enviar uma conquista ao RetroAchievements antes de fechar (sem ligação). Não vai aparecer na tua conta.",
 	"Nenhuma BIOS da PS2 encontrada: os jogos não podem arrancar. Copie o seu ficheiro de BIOS (4 MB, p. ex. SCPH-70012.bin) para %s",
+	"PS5SX2: o jogo deste mosaico do ecrã principal não foi encontrado (%s). A unidade está ligada? O menu abre-se em vez disso.",
+	"PS5SX2: este mosaico do ecrã principal não indica um jogo que o PS5SX2 consiga iniciar. O menu abre-se em vez disso.",
 };
 
 const char* const kPortugueseBrazil[kCount] = {
@@ -995,6 +1013,8 @@ const char* const kPortugueseBrazil[kCount] = {
 	"Não foi possível acessar o RetroAchievements. Você continua conectado: as conquistas voltam no próximo jogo.",
 	"Não foi possível enviar uma conquista ao RetroAchievements antes de fechar (sem conexão). Ela não vai aparecer na sua conta.",
 	"Nenhuma BIOS do PS2 encontrada: os jogos não podem iniciar. Copie seu arquivo de BIOS (4 MB, ex.: SCPH-70012.bin) para %s",
+	"PS5SX2: o jogo deste ícone da tela inicial não foi encontrado (%s). A unidade está conectada? O menu abre no lugar.",
+	"PS5SX2: este ícone da tela inicial não indica um jogo que o PS5SX2 possa iniciar. O menu abre no lugar.",
 };
 
 // The region names fe_games.cpp takes from a file name's first group (kRegions there), in its order.

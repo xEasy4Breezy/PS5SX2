@@ -3,6 +3,8 @@
 // Copyright (C) 2026 swordpdf
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <thread>
+#include <chrono>
 #include "fe_renderer.h"
 
 #include <algorithm>
@@ -267,6 +269,11 @@ bool Renderer::CreateBoxMesh()
 					v.uv[0] = (p[0] + h[0]) / (2 * h[0]);
 					v.uv[1] = (h[1] - p[1]) / (2 * h[1]);
 				}
+				else if (f.face_id == 1) // 2.11: back: seen from behind, u runs towards -X, v down
+				{
+					v.uv[0] = (h[0] - p[0]) / (2 * h[0]);
+					v.uv[1] = (h[1] - p[1]) / (2 * h[1]);
+				}
 				else if (f.face_id == 2) // spine: u from the back (-Z) to the front (+Z), v down
 				{
 					v.uv[0] = (p[2] + h[2]) / (2 * h[2]);
@@ -443,8 +450,29 @@ bool Renderer::CreatePipelines()
 		&vec2_binding, 1, &vec2_attr, 1, PipelineDesc::None, false, false, m_final_pass};
 	const PipelineDesc ui = {fe_spv_ui_vert, sizeof(fe_spv_ui_vert), fe_spv_ui_frag, sizeof(fe_spv_ui_frag),
 		&ui_binding, 1, ui_attrs, 4, PipelineDesc::Alpha, false, false, m_final_pass};
-	return make(bg, m_bg) && make(box, m_box) && make(box_reflect, m_box_reflect) && make(halo, m_halo) &&
-	       make(post, m_post) && make(ui, m_ui);
+	// 2.03: the six pipelines are made side by side, one thread each (about 70 ms apiece when made in turn: 430 ms of the shelf's 510 ms
+	// start). vkCreateGraphicsPipelines may be called from several threads when the pipeline cache is not shared (VK_NULL_HANDLE here).
+	struct Job
+	{
+		const PipelineDesc* desc;
+		VkPipeline* out;
+		bool ok = false;
+	};
+	Job jobs[6] = {{&bg, &m_bg}, {&box, &m_box}, {&box_reflect, &m_box_reflect}, {&halo, &m_halo}, {&post, &m_post}, {&ui, &m_ui}};
+	const auto t0 = std::chrono::steady_clock::now();
+	{
+		std::thread workers[5];
+		for (int i = 1; i < 6; i++)
+			workers[i - 1] = std::thread([&make, &jobs, i]() { jobs[i].ok = make(*jobs[i].desc, *jobs[i].out); });
+		jobs[0].ok = make(*jobs[0].desc, *jobs[0].out);
+		for (std::thread& w : workers)
+			w.join();
+	}
+	std::printf("[frontend] pipelines: 6 made in %.0f ms (side by side)\n", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+	for (const Job& j : jobs)
+		if (!j.ok)
+			return false;
+	return true;
 }
 
 bool Renderer::Init(Vk* vk, VkPhysicalDevice physical_device, VkDevice device, uint32_t queue_family, VkQueue queue,
@@ -611,10 +639,10 @@ bool Renderer::Init(Vk* vk, VkPhysicalDevice physical_device, VkDevice device, u
 		r = m_vk->vkCreateDescriptorSetLayout(m_dev, &li, nullptr, &m_set0_layout);
 		if (r != VK_SUCCESS)
 			return Fail("vkCreateDescriptorSetLayout (0)", r);
-		VkDescriptorSetLayoutBinding b1[3];
-		for (uint32_t i = 0; i < 3; i++)
+		VkDescriptorSetLayoutBinding b1[4]; // 2.11: the case's back (binding 3) joined cover, placeholder and spine
+		for (uint32_t i = 0; i < 4; i++)
 			b1[i] = {i, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
-		li.bindingCount = 3;
+		li.bindingCount = 4;
 		li.pBindings = b1;
 		r = m_vk->vkCreateDescriptorSetLayout(m_dev, &li, nullptr, &m_set1_layout);
 		if (r != VK_SUCCESS)
@@ -630,7 +658,7 @@ bool Renderer::Init(Vk* vk, VkPhysicalDevice physical_device, VkDevice device, u
 		if (r != VK_SUCCESS)
 			return Fail("vkCreatePipelineLayout", r);
 		const VkDescriptorPoolSize sizes[2] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 8},
-			{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3 * 1024}};
+			{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 4 * 1024}};
 		VkDescriptorPoolCreateInfo pi = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
 		pi.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
 		pi.maxSets = 1024 + 8;
@@ -762,7 +790,7 @@ Renderer::Slot& Renderer::RetireSlot()
 	return m_slots[(m_slot + kSlots - 1) % kSlots];
 }
 
-VkDescriptorSet Renderer::AllocTextureSet(Texture* t0, Texture* t1, Texture* t2)
+VkDescriptorSet Renderer::AllocTextureSet(Texture* t0, Texture* t1, Texture* t2, Texture* t3)
 {
 	VkDescriptorSet set = VK_NULL_HANDLE;
 	VkDescriptorSetAllocateInfo di = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
@@ -775,10 +803,10 @@ VkDescriptorSet Renderer::AllocTextureSet(Texture* t0, Texture* t1, Texture* t2)
 		Fail("vkAllocateDescriptorSets (textures)", r);
 		return VK_NULL_HANDLE;
 	}
-	Texture* ts[3] = {t0 ? t0 : m_white, t1 ? t1 : m_white, t2 ? t2 : m_white};
-	VkDescriptorImageInfo ii[3];
-	VkWriteDescriptorSet w[3];
-	for (uint32_t i = 0; i < 3; i++)
+	Texture* ts[4] = {t0 ? t0 : m_white, t1 ? t1 : m_white, t2 ? t2 : m_white, t3 ? t3 : m_white};
+	VkDescriptorImageInfo ii[4];
+	VkWriteDescriptorSet w[4];
+	for (uint32_t i = 0; i < 4; i++)
 	{
 		ii[i] = {m_sampler, ts[i]->view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
 		w[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
@@ -788,7 +816,7 @@ VkDescriptorSet Renderer::AllocTextureSet(Texture* t0, Texture* t1, Texture* t2)
 		w[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
 		w[i].pImageInfo = &ii[i];
 	}
-	m_vk->vkUpdateDescriptorSets(m_dev, 3, w, 0, nullptr);
+	m_vk->vkUpdateDescriptorSets(m_dev, 4, w, 0, nullptr);
 	return set;
 }
 

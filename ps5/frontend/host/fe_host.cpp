@@ -11,6 +11,9 @@
 // lossless); "shot" steps still write their PNGs. "rec off" / "rec on" steps leave frames out (they still run).
 // --virtual-clock: the texture packs' clock is the shelf's frames and --texpacks-rate counts in it (a recorded download).
 // --places "Label=/path|...": the folder picker's places (a video shows the console's own: /data/PCSX2, /mnt/usb0).
+// --tiles: a game's sheet gets the Home screen tile row (third selectable row), answered by a stand-in for the PS5SX2 Disc Helper in <data>/tiles (FakeHelper: steps "helper ok|slow|
+//          stuck|mute|none|stale|fail <reason>|clear|seed ...", "tilepollsreset"; expect tilephase, tilerow, tilefocus, tilepolls, tilepending, tilereq, tilefile, tileentries).
+//          --own-tile <path>: this run stands for a game tile of that game (its own tile is not taken off from inside it).
 // --record-audio <out.wav>: the shelf's own sounds (fe_sound's key taps) for the frames recorded, 48 kHz stereo, in step
 // with --record's video; without --record nothing is drawn (a quick pass for a clip recorded before).
 //
@@ -30,15 +33,21 @@
 #include "../fe_games.h"
 #include "../fe_i18n.h"
 
+#include <dirent.h>
 #include <dlfcn.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
+#include <sys/time.h>
+#include <unistd.h>
 #include <zlib.h>
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cmath>
 #include <chrono>
+#include <ctime>
+#include <mutex>
 #include <thread>
 
 #include <cstdio>
@@ -207,7 +216,7 @@ struct Gpu
 
 struct Step
 {
-	std::string op, arg;
+	std::string op, arg, text;
 	double seconds = 0;
 	int count = 1;
 };
@@ -220,7 +229,7 @@ bool SetButton(Input& in, const std::string& b, bool down)
 	bool* p = b == "left" ? &in.left : b == "right" ? &in.right : b == "up" ? &in.up : b == "down" ? &in.down :
 	          b == "cross" ? &in.cross : b == "circle" ? &in.circle : b == "square" ? &in.square :
 	          b == "triangle" ? &in.triangle : b == "options" ? &in.options : b == "l1" ? &in.l1 : b == "r1" ? &in.r1 :
-	          b == "l2" ? &in.l2 : b == "r2" ? &in.r2 : nullptr; // vk-285-116
+	          b == "l2" ? &in.l2 : b == "r2" ? &in.r2 : b == "r3" ? &in.r3 : nullptr; // vk-285-116; 2.11: the right stick's click
 	if (!p)
 		return false;
 	*p = down;
@@ -245,16 +254,51 @@ bool ParseStep(const std::string& line, std::vector<Step>& out)
 		s >> st.arg >> st.seconds;
 	else if (st.op == "down" || st.op == "up") // pr9n: a button stays down until its "up" (chords pressed one after the other)
 		s >> st.arg;
-	else if (st.op == "expect") // pr9n: "expect selected=4", "account=1", "sheet=0", "tab=2"; a mismatch fails the run (vk-285-137: "shelf=4")
+	else if (st.op == "expect") // pr9n: "expect selected=4", "account=1", "sheet=0", "tab=2"; a mismatch fails the run (vk-285-137: "shelf=4"; 2.11: also "flip100>=95", "flip100<=12")
 		s >> st.arg;
+	else if (st.op == "flipreset") // 2.11: forget the fastest the case has turned so far ("expect flipspeed100<=270" is the fastest since the last one of these)
+	{
+	}
+	else if (st.op == "expectwhile") // R3: "expectwhile <condition> <must> [<must> ...]": frame by frame while the condition holds; the others must hold at every one of them
+	{
+		s >> st.arg;
+		std::getline(s, st.text);
+		while (!st.text.empty() && st.text.front() == ' ')
+			st.text.erase(0, 1);
+	}
 	else if (st.op == "sleep") // 2026-10-05: real seconds, for the texture pack worker
 		s >> st.seconds;
 	else if (st.op == "shot" || st.op == "game")
 		s >> st.arg;
 	else if (st.op == "dump") // live-22: "dump <pct>" writes the dumper's progress file, "dump off" removes it
+	s >> st.arg;
+	else if (st.op == "drive") // 2.11: "drive <serial> <title>" puts a PS2 disc in the drive (the watcher's report), "drive off" takes it out
+	{
+	s >> st.arg;
+	std::getline(s, st.text);
+	while (!st.text.empty() && st.text.front() == ' ')
+	st.text.erase(0, 1);
+	}
+	else if (st.op == "helper") // 2.12 (--tiles): "helper ok|slow|stuck|mute|none|stale|fail <reason>|clear|seed <path>|<tile>|<serial>|<title>|<status>": the stand-in helper
+	{
 		s >> st.arg;
+		std::getline(s, st.text);
+		while (!st.text.empty() && st.text.front() == ' ')
+			st.text.erase(0, 1);
+	}
+	else if (st.op == "tilepollsreset") // 2.12: zero the count of looks at the helper's state ("expect tilepolls=3")
+	{
+	}
 	else if (st.op == "rec") // 2026-10-08: "rec on" / "rec off": what --record keeps (from the start when no step says)
 		s >> st.arg;
+	else if (st.op == "stick") // 2.11: "stick <x> <y>": the right stick, held there until the next "stick"
+		s >> st.arg >> st.seconds;
+	else if (st.op == "remote") // 2.11: "remote <text>": the settings page's search box sets the shelf's search ("remote" alone clears it)
+	{
+		std::getline(s, st.arg);
+		while (!st.arg.empty() && st.arg.front() == ' ')
+			st.arg.erase(0, 1);
+	}
 	else
 	{
 		std::fprintf(stderr, "[host] unknown step: %s\n", line.c_str());
@@ -324,6 +368,297 @@ GameInfo Game(const char* title, const char* region, const char* serial, uint64_
 	g.bytes = mb << 20;
 	return g;
 }
+
+// 2.12 (--tiles): a stand-in for the PS5SX2 Disc Helper's game tile code (tile6/gametile.c), ticked every frame in the shelf's own (virtual) time. It reads and writes the
+// files of plans/gametiles_contract.md with a tiny splitter of its own -- NOT fe_gametile.h -- so a bug in the shelf's writer or reader is not hidden by the same bug here:
+// alive.txt every 20 s, state.txt (no header, one line per tile, then the failures, whole file by tmp + rename), ONE request-*.txt a second (name order; the file is
+// removed, its lines go to <data>/helper-took.txt), a tile `installing` at once and `ok` 4 s later, `removing` at once and gone 1.5 s later. Modes (the "helper" step):
+//   ok      as above                                 slow   installing and removing for ever (the console: until PS5SX2 is closed)
+//   stuck   takes the files, writes nothing          mute   alive, but never takes a file
+//   none    not running (no alive.txt)               stale  not running, alive.txt 2 minutes old
+//   fail <reason>  takes the files and answers `-<TAB>path...<TAB>failed:<reason>` for an add
+struct FakeHelper
+{
+	enum class Mode
+	{
+		Ok,
+		Slow,
+		Stuck,
+		Mute,
+		None,
+		Stale,
+		Fail,
+	};
+	struct Tile
+	{
+		std::string id, path, serial, title, status;
+		double at = 0;
+	};
+	std::string dir, took_file;
+	Mode mode = Mode::Ok;
+	std::string fail_reason = "nogame";
+	double now = 0, next_tick = 1.0, next_alive = 20.0;
+	int took = 0; // request files taken
+	std::vector<Tile> tiles, deferred; // deferred: an add that waits for the removal of the same game
+	std::vector<std::string> failures; // state lines
+	bool dirty = false;
+
+	static std::vector<std::string> Split(const std::string& s, char sep)
+	{
+		std::vector<std::string> out;
+		size_t at = 0;
+		for (;;)
+		{
+			const size_t p = s.find(sep, at);
+			if (p == std::string::npos)
+			{
+				out.push_back(s.substr(at));
+				return out;
+			}
+			out.push_back(s.substr(at, p - at));
+			at = p + 1;
+		}
+	}
+	static std::string Norm(const std::string& p)
+	{
+		std::string o;
+		for (char c : p)
+			if (!(c == '/' && !o.empty() && o.back() == '/'))
+				o += c;
+		while (o.size() > 1 && o.back() == '/')
+			o.pop_back();
+		return o;
+	}
+	static bool IsId(const std::string& s)
+	{
+		return s.size() == 9 && s.compare(0, 7, "PPSA992") == 0 && s[7] >= '5' && s[7] <= '6' && std::isdigit(static_cast<unsigned char>(s[8]));
+	}
+	void Atomic(const char* name, const std::string& text)
+	{
+		const std::string tmp = dir + "/" + name + ".tmp";
+		WriteText(tmp, text);
+		std::rename(tmp.c_str(), (dir + "/" + name).c_str());
+	}
+	void Alive() { Atomic("alive.txt", std::to_string(static_cast<long long>(std::time(nullptr))) + " " + std::to_string(static_cast<int>(getpid())) + " gametile 1\n"); }
+	void Flush()
+	{
+		std::string text;
+		for (const Tile& t : tiles)
+			text += t.id + "\t" + t.path + "\t" + t.serial + "\t" + t.title + "\t" + t.status + "\n";
+		for (const std::string& f : failures)
+			text += f + "\n";
+		Atomic("state.txt", text);
+		dirty = false;
+	}
+	void Start()
+	{
+		Alive();
+		Flush();
+	}
+	void Command(const std::string& what, const std::string& rest)
+	{
+		if (what == "seed") // "<path>|<tile>|<serial>|<title>|<status>"
+		{
+			const std::vector<std::string> f = Split(rest, '|');
+			if (f.size() >= 5)
+			{
+				if (f[4].compare(0, 7, "failed:") == 0)
+					failures.push_back("-\t" + Norm(f[0]) + "\t" + f[2] + "\t" + f[3] + "\t" + f[4]);
+				else
+					tiles.push_back({f[1], Norm(f[0]), f[2], f[3], f[4], now});
+				Flush();
+			}
+			return;
+		}
+		if (what == "clear")
+		{
+			tiles.clear();
+			deferred.clear();
+			failures.clear();
+			Flush();
+			return;
+		}
+		if (what == "ok" || what == "slow" || what == "stuck" || what == "mute" || what == "fail")
+		{
+			mode = what == "ok" ? Mode::Ok : what == "slow" ? Mode::Slow : what == "stuck" ? Mode::Stuck : what == "mute" ? Mode::Mute : Mode::Fail;
+			if (what == "fail")
+				fail_reason = rest.empty() ? "nogame" : rest;
+			Alive();
+			next_alive = now + 20;
+		}
+		else if (what == "none")
+		{
+			mode = Mode::None;
+			std::remove((dir + "/alive.txt").c_str());
+		}
+		else if (what == "stale")
+		{
+			mode = Mode::Stale;
+			Alive();
+			const struct timeval old[2] = {{static_cast<time_t>(std::time(nullptr) - 120), 0}, {static_cast<time_t>(std::time(nullptr) - 120), 0}};
+			utimes((dir + "/alive.txt").c_str(), old);
+		}
+		else
+			std::fprintf(stderr, "[host] unknown helper mode: %s\n", what.c_str());
+	}
+	std::vector<std::string> RequestNames() const
+	{
+		std::vector<std::string> names;
+		if (DIR* d = opendir(dir.c_str()))
+		{
+			while (const dirent* e = readdir(d))
+			{
+				const std::string n = e->d_name;
+				if (n.compare(0, 8, "request-") == 0 && n.size() > 4 && n.compare(n.size() - 4, 4, ".txt") == 0)
+					names.push_back(n);
+			}
+			closedir(d);
+		}
+		std::sort(names.begin(), names.end());
+		return names;
+	}
+	int RequestFiles() const { return static_cast<int>(RequestNames().size()); }
+	int StateLines() const
+	{
+		std::ifstream f(dir + "/state.txt");
+		int n = 0;
+		for (std::string l; std::getline(f, l);)
+			n += l.empty() ? 0 : 1;
+		return n;
+	}
+	Tile* Find(const std::string& key)
+	{
+		for (Tile& t : tiles)
+			if (t.id == key || t.path == key)
+				return &t;
+		return nullptr;
+	}
+	void Add(const std::string& path_in, const std::string& serial, const std::string& title)
+	{
+		const std::string path = Norm(path_in);
+		for (auto it = failures.begin(); it != failures.end();) // the old failure of this game goes when its request is read
+			it = Split(*it, '\t').size() > 1 && Split(*it, '\t')[1] == path ? failures.erase(it) : it + 1;
+		dirty = true;
+		if (mode == Mode::Fail)
+		{
+			failures.push_back("-\t" + path + "\t" + serial + "\t" + title + "\tfailed:" + fail_reason);
+			return;
+		}
+		if (Tile* t = Find(path))
+		{
+			if (t->status == "removing")
+				deferred.push_back({"", path, serial, title, "installing", now});
+			return; // a second add of a game that has its tile: nothing
+		}
+		Build(path, serial, title);
+	}
+	void Build(const std::string& path, const std::string& serial, const std::string& title)
+	{
+		for (int s = 51; s <= 60; s++)
+		{
+			const std::string id = "PPSA992" + std::to_string(s);
+			if (!Find(id))
+			{
+				tiles.push_back({id, path, serial, title, "installing", now});
+				std::stable_sort(tiles.begin(), tiles.end(), [](const Tile& a, const Tile& b) { return a.id < b.id; });
+				dirty = true;
+				return;
+			}
+		}
+		failures.push_back("-\t" + path + "\t" + serial + "\t" + title + "\tfailed:limit");
+		dirty = true;
+	}
+	void Take()
+	{
+		const std::vector<std::string> names = RequestNames();
+		if (names.empty())
+			return;
+		const std::string file = dir + "/" + names[0];
+		std::ifstream in(file, std::ios::binary);
+		std::stringstream ss;
+		ss << in.rdbuf();
+		in.close();
+		std::remove(file.c_str());
+		took++;
+		if (mode == Mode::Stuck)
+			return;
+		std::vector<std::string> lines = Split(ss.str(), '\n');
+		bool first = true;
+		for (std::string l : lines)
+		{
+			if (!l.empty() && l.back() == '\r')
+				l.pop_back();
+			if (l.empty())
+				continue;
+			if (first)
+			{
+				first = false;
+				if (l != "v1")
+					return; // not a request of this contract: dropped unread
+				continue;
+			}
+			{
+				std::ofstream log(took_file, std::ios::app | std::ios::binary);
+				log << l << "\n";
+			}
+			const std::vector<std::string> f = Split(l, '\t');
+			if (f[0] == "add" && f.size() >= 4)
+				Add(f[1], f[2], f[3]);
+			else if (f[0] == "remove" && f.size() >= 2)
+			{
+				if (Tile* t = Find(IsId(f[1]) ? f[1] : Norm(f[1])))
+					if (t->status != "removing")
+					{
+						t->status = "removing";
+						t->at = now;
+						dirty = true;
+					}
+			}
+		}
+	}
+	void Tick(double dt)
+	{
+		now += dt;
+		if (mode == Mode::None || mode == Mode::Stale)
+			return;
+		if (now >= next_alive)
+		{
+			Alive();
+			next_alive = now + 20;
+		}
+		if (now < next_tick)
+			return;
+		next_tick += 1.0;
+		for (size_t i = 0; i < tiles.size();)
+		{
+			Tile& t = tiles[i];
+			if (mode == Mode::Ok && t.status == "installing" && now - t.at >= 4.0)
+			{
+				t.status = "ok";
+				dirty = true;
+			}
+			if (mode == Mode::Ok && t.status == "removing" && now - t.at >= 1.5)
+			{
+				const std::string gone = t.path;
+				tiles.erase(tiles.begin() + static_cast<std::ptrdiff_t>(i));
+				dirty = true;
+				for (size_t k = 0; k < deferred.size(); k++) // an add that waited for this removal
+					if (deferred[k].path == gone)
+					{
+						Build(deferred[k].path, deferred[k].serial, deferred[k].title);
+						deferred.erase(deferred.begin() + static_cast<std::ptrdiff_t>(k));
+						break;
+					}
+				continue;
+			}
+			i++;
+		}
+		if (mode != Mode::Mute)
+			Take();
+		if (dirty)
+			Flush();
+	}
+};
 } // namespace
 
 int main(int argc, char** argv)
@@ -358,6 +693,8 @@ int main(int argc, char** argv)
 	std::string no_bios_problem;
 	std::string games_file, build_tag = "vk-285-114 (host)", record, record_audio; // 2026-10-08: the showcase video
 	std::string places; // 2026-10-08: --places "Label=/path|Label=/path": the folder picker's places (else the data folder's)
+	bool tiles = false; // 2.12: --tiles: the sheet's Home screen tile row, with the stand-in helper (FakeHelper) in <data>/tiles; --own-tile <path>: this run is a game tile's
+	std::string own_tile;
 	int record_fps = 30;
 	for (int i = 1; i < argc; i++)
 	{
@@ -405,6 +742,10 @@ int main(int argc, char** argv)
 			record = next();
 		else if (a == "--places")
 			places = next();
+		else if (a == "--tiles")
+			tiles = true;
+		else if (a == "--own-tile")
+			own_tile = next();
 		else if (a == "--record-audio")
 			record_audio = next();
 		else if (a == "--record-fps")
@@ -688,6 +1029,34 @@ int main(int argc, char** argv)
 	acfg.build_tag = build_tag;
 	acfg.options = op;
 	acfg.system_menu = true; // 2026-10-08: the sheet for all games' "PS2 system menu" row
+	// 2.12: --tiles: the sheet's Home screen tile row, and the stand-in helper that answers it. Without --tiles there is no row (the counted presses of the other scripts stay).
+	FakeHelper helper;
+	if (tiles)
+	{
+		helper.dir = data + "/tiles";
+		helper.took_file = data + "/helper-took.txt";
+		MakeDir(helper.dir);
+		std::remove(helper.took_file.c_str());
+		helper.Start();
+		acfg.tiles_dir = helper.dir;
+		acfg.own_tile_game = own_tile;
+		acfg.tile_cover = [data](const GameInfo& g) { // the host's covers: <data>/covers/<serial>.jpg
+			const std::string c = data + "/covers/" + g.serial + ".jpg";
+			return gametile::CoverFileOk(c) ? c : std::string();
+		};
+	}
+	// 2.11: the settings page's search box (the "remote" step)
+	std::mutex remote_mutex;
+	std::string remote_text;
+	bool remote_pending = false;
+	acfg.search_remote = [&remote_mutex, &remote_text, &remote_pending](std::string& text) {
+		std::lock_guard<std::mutex> lock(remote_mutex);
+		if (!remote_pending)
+			return false;
+		remote_pending = false;
+		text = remote_text;
+		return true;
+	};
 	// vk-285-135: the folder picker's places: the data folder (as /data/PCSX2) and two "drives" in it, when they are folders.
 	acfg.folder_places = {{"PS5SX2's folder", data}, {"USB drive 1", data + "/usb0"}, {"Extended storage", data + "/ext0"}};
 	if (!places.empty())
@@ -716,6 +1085,17 @@ int main(int argc, char** argv)
 	// live-22: the disc dumper's progress file (ProsperoDiscDump.cpp on the console); the "dump" step writes it.
 	const std::string dump_progress = data + "/disc-dump-progress.txt";
 	acfg.disc_dump_progress = dump_progress;
+	// 2.11: the disc in the drive (not copied): the "drive" step sets it; picking the entry counts as a request to be asked again.
+	std::string drive_serial, drive_title;
+	int reasks = 0;
+	acfg.drive_disc_poll = [&](std::string& title, std::string& serial) {
+	if (drive_serial.empty())
+	return false;
+	title = drive_title;
+	serial = drive_serial;
+	return true;
+	};
+	acfg.drive_disc_reask = [&] { reasks++; };
 	for (const Step& s : steps)
 		if (s.op == "game")
 			acfg.preselect = std::atoi(s.arg.c_str());
@@ -752,6 +1132,71 @@ int main(int argc, char** argv)
 			return 1;
 		}
 	}
+	// 2.11: how fast the picked case has turned over, at most, since the last "flipreset" (flips a second; the turning is capped, App kFlipMaxSpeed).
+	// (The pose repeats every two flips: angles are counted as the pose they make, -1 .. 1, and a change of the angle as the shorter way between two poses.)
+	// flip_top / flip_low: how far over it has been at most / at least, 0 .. 1, since the last "flipreset".
+	const auto pose = [](float angle) { return angle - 2.0f * std::round(angle / 2.0f); };
+	float flip_prev = 0.0f, flip_peak = 0.0f, flip_top = 0.0f, flip_low = 1.0f;
+	int held_peak = 0, count_peak = 0; // the most backheld / backcount have been since the last "flipreset"
+	// R3: what "expect" and "expectwhile" read: the shelf's state by name. backat<N>: game N holds a real back cover (1/0, -1 off the shelf); turn<N>: how far
+	// the flip turns game N's case now (degrees); setat<N>: its case has a texture set, so it is drawn (1/0); backheld: the cases that are not the picked
+	// one that still hold their back cover; backcount: all the cases (off the shelf too) that hold one; heldpeak / countpeak: the most of either since flipreset.
+	auto value_of = [&](const std::string& key) -> int {
+		return key.compare(0, 6, "backat") == 0 ? app.BackRealOf(std::atoi(key.c_str() + 6)) :
+		       key.compare(0, 4, "turn") == 0 ? app.TurnOf(std::atoi(key.c_str() + 4)) :
+		       key.compare(0, 5, "setat") == 0 ? app.SetOf(std::atoi(key.c_str() + 5)) :
+		       key == "backheld" ? app.BackHeld() :
+		       key == "backcount" ? app.BackRealCount() :
+		       key == "heldpeak" ? held_peak :
+		       key == "countpeak" ? count_peak :
+		       key == "selected" ? app.Chosen() : key == "account" ? app.AccountOpen() : key == "sheet" ? app.SheetOpen() :
+			                key == "tab"      ? app.SheetTab() :
+			                key == "done"     ? app.Done() : // 2026-10-08: the shelf closed (a game, or the PS2 system menu)
+			                key == "systemmenu" ? app.SystemMenuChosen() :
+			                key == "picker"   ? app.PickerOpen() : // vk-285-135
+			                key == "shelf"    ? app.ShelfCount() : // vk-285-137: the games on the shelf
+			                key == "typing"   ? app.SearchTyping() : // 2.11: the search keyboard is up
+				                key == "flip100"  ? static_cast<int>(std::lround(app.FlipAmount() * 100.0f)) : // 2.11: the case turned over, in percent
+				                key == "searchlen" ? static_cast<int>(app.SearchText().size()) :
+				                key == "dumppct"  ? app.DumpPercent() : // live-22: the disc dump entry's percentage (-1 when none)
+				                				                key == "driveentry" ? app.DriveEntry() : // 2.11: the disc in the drive is listed
+				                				                key == "discart"  ? app.DiscArt() : // 2.11: the disc art arrived
+				                				                key == "reasks"   ? reasks : // 2.11: how often the drive entry was picked
+				                key == "tilephase" ? app.TilePhase() : // 2.12: the Home screen tile row's phase (fe_gametile.h; -1: no row on the sheet)
+				                key == "tilerow"   ? app.TileRowShown() : // 2.12: the sheet has the row
+				                key == "tilefocus" ? app.TileFocused() : // 2.12: the focused row is it
+				                key == "tilepolls" ? app.TilePolls() : // 2.12: looks at the helper's state since the last tilepollsreset
+				                key == "tilepending" ? app.TilePending() : // 2.12: asks still followed closely
+				                key == "tilereq"   ? helper.took : // 2.12: request files the stand-in helper took
+				                key == "tilefile"  ? helper.RequestFiles() : // 2.12: request files in the folder now
+				                key == "tileentries" ? helper.StateLines() : // 2.12: lines in state.txt
+				                key == "backreal" ? app.BackReal() : // 2.11: the picked case's real back cover has arrived
+				                key == "ringcount" ? app.RingCount() : // 2.11: how many neighbours' backs were handed over to be fetched ahead
+				                key == "ringfirst" ? app.RingFirst() : // 2.11: the first of them (an index of the host's game list)
+				                key == "flipangle100" ? static_cast<int>(std::lround(pose(app.FlipAngle()) * 100.0f)) : // 2.11: the same with its side (-100 .. 100)
+				                key == "flippeak100" ? static_cast<int>(std::lround(flip_top * 100.0f)) : // 2.11: the furthest over it got since flipreset, in percent
+				                key == "flipbottom100" ? static_cast<int>(std::lround(flip_low * 100.0f)) : // 2.11: the nearest to the front it got since flipreset
+				                key == "flipspeed100" ? static_cast<int>(std::lround(flip_peak * 100.0f)) : -99;
+	};
+	// Splits "key>=N" into its parts; false when it does not parse.
+	auto split_expect = [&](const std::string& arg, std::string& key, char& cmp, int& want) {
+		const size_t eq = arg.find_first_of("=<>");
+		if (eq == std::string::npos)
+			return false;
+		key = arg.substr(0, eq);
+		cmp = '=';
+		size_t num = eq + 1;
+		if (arg[eq] != '=')
+		{
+			cmp = arg[eq];
+			num = eq + 1 < arg.size() && arg[eq + 1] == '=' ? eq + 2 : std::string::npos;
+			if (num == std::string::npos)
+				return false;
+		}
+		want = std::atoi(arg.c_str() + num);
+		return true;
+	};
+	auto holds = [&](int got, char cmp, int want) { return cmp == '=' ? got == want : cmp == '>' ? got >= want : got <= want; };
 	// Update and Build every frame, as the console's loop does (the sheet's scroll target is worked out in Build).
 	auto run = [&](double seconds) {
 		for (double t = 0; t < seconds - 1e-9; t += dt)
@@ -763,6 +1208,14 @@ int main(int argc, char** argv)
 				vclock.store(vclock.load() + dt);
 			}
 			app.Update(dt, in);
+			if (tiles)
+				helper.Tick(dt); // 2.12
+			held_peak = std::max(held_peak, app.BackHeld());
+			count_peak = std::max(count_peak, app.BackRealCount());
+			flip_peak = std::max(flip_peak, static_cast<float>(std::fabs(pose(app.FlipAngle() - flip_prev)) / dt));
+			flip_prev = app.FlipAngle();
+			flip_top = std::max(flip_top, std::fabs(pose(flip_prev)));
+			flip_low = std::min(flip_low, std::fabs(pose(flip_prev)));
 			app.Build(frame, "21:47");
 			if (mixer)
 			{
@@ -802,6 +1255,21 @@ int main(int argc, char** argv)
 				SetButton(in, s.arg, false);
 				run(dt * 2);
 			}
+		else if (s.op == "stick")
+		{
+			in.rx = static_cast<float>(std::atof(s.arg.c_str()));
+			in.ry = static_cast<float>(s.seconds);
+			run(dt);
+		}
+		else if (s.op == "remote")
+		{
+			{
+				std::lock_guard<std::mutex> lock(remote_mutex);
+				remote_text = s.arg;
+				remote_pending = true;
+			}
+			run(dt * 2);
+		}
 		else if (s.op == "rec")
 		{
 			rec_on = s.arg == "on";
@@ -809,6 +1277,18 @@ int main(int argc, char** argv)
 			if (rec)
 				std::printf("[host] rec %s at frame %u\n", rec_on ? "on" : "off", rec_frames); // where the cuts are
 		}
+		else if (s.op == "helper") // 2.12: the stand-in helper's mode or state (see FakeHelper)
+		{
+			if (!tiles)
+			{
+				std::fprintf(stderr, "[host] the helper step needs --tiles\n");
+				return 2;
+			}
+			helper.Command(s.arg, s.text);
+			run(dt);
+		}
+		else if (s.op == "tilepollsreset") // 2.12
+			app.ResetTilePolls();
 		else if (s.op == "dump") // live-22: stand in for the console's disc dumper writing its progress file
 		{
 			if (s.arg == "off")
@@ -816,6 +1296,17 @@ int main(int argc, char** argv)
 			else
 				WriteText(dump_progress, "SLUS-00000 " + s.arg + "\nHost Dump Game\n");
 			run(dt); // let the shelf poll it (PollDiscDump is throttled to ~0.5 s)
+		}
+		else if (s.op == "drive") // 2.11: stand in for the disc watcher's report of the disc in the drive
+		{
+		if (s.arg == "off")
+		drive_serial.clear();
+		else
+		{
+		drive_serial = s.arg;
+		drive_title = s.text;
+		}
+		run(dt);
 		}
 		else if (s.op == "sleep")
 		{
@@ -826,30 +1317,93 @@ int main(int argc, char** argv)
 				run(dt);
 			}
 		}
+		else if (s.op == "flipreset") // 2.11
+		{
+			flip_peak = 0.0f;
+			held_peak = app.BackHeld();
+			count_peak = app.BackRealCount();
+			flip_prev = app.FlipAngle();
+			flip_top = flip_low = std::fabs(pose(flip_prev));
+		}
+		else if (s.op == "expectwhile") // R3: runs frame by frame while the condition holds (4 s at most), the must-hold line checked before every frame
+		{
+			struct Must
+			{
+				std::string key;
+				char cmp = '=';
+				int want = 0;
+			};
+			std::string ck, word;
+			char cc = '=';
+			int cw = 0;
+			std::vector<Must> musts;
+			std::istringstream list(s.text);
+			bool parsed = split_expect(s.arg, ck, cc, cw) && value_of(ck) != -99;
+			while (parsed && list >> word)
+			{
+				Must m;
+				parsed = split_expect(word, m.key, m.cmp, m.want) && value_of(m.key) != -99;
+				musts.push_back(m);
+			}
+			if (!parsed || musts.empty())
+			{
+				std::fprintf(stderr, "[host] unknown expectwhile: %s %s\n", s.arg.c_str(), s.text.c_str());
+				return 2;
+			}
+			int frames = 0, bad = 0, first_bad = -1, got_bad = 0;
+			std::string key_bad;
+			while (frames < 240 && holds(value_of(ck), cc, cw))
+			{
+				for (const Must& m : musts)
+				{
+					const int got = value_of(m.key);
+					if (!holds(got, m.cmp, m.want) && bad++ == 0)
+					{
+						first_bad = frames;
+						got_bad = got;
+						key_bad = m.key;
+					}
+				}
+				run(dt);
+				frames++;
+			}
+			if (frames < 3 || frames >= 240 || bad > 0)
+			{
+				std::printf("[host] expect FAILED: expectwhile %s -> %s: %d frames, %d bad (the first at frame %d: %s is %d)%s\n", s.arg.c_str(), s.text.c_str(), frames, bad,
+					first_bad, key_bad.c_str(), got_bad, frames < 3 ? " (the condition hardly held)" : frames >= 240 ? " (it never ended)" : "");
+				failures++;
+			}
+			else
+				std::printf("[host] expect ok: expectwhile %s -> %s over %d frames\n", s.arg.c_str(), s.text.c_str(), frames);
+		}
 		else if (s.op == "expect")
 		{
-			const size_t eq = s.arg.find('=');
+			// 2.11: "key=N" (as always), or "key>=N" / "key<=N"
+			const size_t eq = s.arg.find_first_of("=<>");
 			const std::string key = s.arg.substr(0, eq);
-			const int want = eq == std::string::npos ? -1 : std::atoi(s.arg.c_str() + eq + 1);
-			const int got = key == "selected" ? app.Chosen() : key == "account" ? app.AccountOpen() : key == "sheet" ? app.SheetOpen() :
-			                key == "tab"      ? app.SheetTab() :
-			                key == "done"     ? app.Done() : // 2026-10-08: the shelf closed (a game, or the PS2 system menu)
-			                key == "systemmenu" ? app.SystemMenuChosen() :
-			                key == "picker"   ? app.PickerOpen() : // vk-285-135
-			                key == "shelf"    ? app.ShelfCount() : // vk-285-137: the games on the shelf
-			                key == "dumppct"  ? app.DumpPercent() : -99; // live-22: the disc dump entry's percentage (-1 when none)
-			if (got == -99 || eq == std::string::npos)
+			char cmp = '=';
+			size_t num = eq == std::string::npos ? eq : eq + 1;
+			if (eq != std::string::npos && s.arg[eq] != '=')
+			{
+				cmp = s.arg[eq];
+				num = eq + 1 < s.arg.size() && s.arg[eq + 1] == '=' ? eq + 2 : std::string::npos;
+				if (num == std::string::npos)
+					cmp = '?';
+			}
+			const int want = num == std::string::npos ? -1 : std::atoi(s.arg.c_str() + num);
+			const int got = value_of(key);
+			if (got == -99 || eq == std::string::npos || cmp == '?')
 			{
 				std::fprintf(stderr, "[host] unknown expect: %s\n", s.arg.c_str());
 				return 2;
 			}
-			if (got != want)
+			if (cmp == '=' ? got != want : cmp == '>' ? got < want : got > want)
 			{
-				std::printf("[host] expect FAILED: %s is %d, wanted %d\n", key.c_str(), got, want);
+				std::printf("[host] expect FAILED: %s is %d, wanted %s%d\n", key.c_str(), got, cmp == '=' ? "" : cmp == '>' ? ">= " : "<= ", want);
 				failures++;
 			}
 			else
-				std::printf("[host] expect ok: %s=%d\n", key.c_str(), got);
+				std::printf("[host] expect ok: %s%s%d (is %d)\n", key.c_str(), cmp == '=' ? "=" : cmp == '>' ? ">=" : "<=", want, got);
 		}
 		else if (s.op == "down" || s.op == "up")
 		{

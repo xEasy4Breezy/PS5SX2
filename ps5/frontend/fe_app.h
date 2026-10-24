@@ -9,6 +9,7 @@
 #include "fe_covers.h"
 #include "fe_achievements.h"
 #include "fe_game_achievements.h"
+#include "fe_gametile.h"
 #include "fe_games.h"
 #include "fe_options.h"
 #include "fe_patchdl.h"
@@ -30,6 +31,10 @@ struct Input
 	// vk-285-114: the options sheet's buttons.
 	bool up = false, down = false, square = false, triangle = false, circle = false;
 	bool l2 = false, r2 = false; // vk-285-116: the sheet's tabs
+	// 2.11: the right stick (-1..1, right and down positive; 0 for a pad without one, and in the host's scripts unless they move it) and
+	// its click: on the shelf the stick turns the picked case over to show its back, the click holds it there.
+	float rx = 0, ry = 0;
+	bool r3 = false;
 };
 
 struct AppConfig
@@ -55,6 +60,9 @@ struct AppConfig
 	std::function<bool()> bios_present;
 	std::function<std::string()> bios_problem;
 	std::string bios_dir;
+	// 2026-10-16: the games folder the player set (the first of them) while only those are listed; "" = the usual places. The empty
+	// shelf names it where it says /data/PCSX2/games (a typo or an unplugged drive then explains itself).
+	std::string games_folder_note;
 	// vk-285-135 (AI-assisted): the sheet for all games' Folders rows and their picker start from these places (label, path),
 	// those that are folders when it opens (the drives come and go); empty: no Folders rows.
 	std::vector<std::pair<std::string, std::string>> folder_places;
@@ -62,6 +70,26 @@ struct AppConfig
 	// While a PS2 disc is being copied, the shelf polls it and shows a spinning-disc entry with the live percentage, until
 	// the copy ends (the file is removed, and the game launches). Empty: no such entry (the host sets it for its test).
 	std::string disc_dump_progress;
+	// 2.04: a PS2 disc put in the drive that is not copied yet: the shelf asks what to do with it (play it straight from the disc, or
+	// copy it first). disc_ask_poll gives the pending question (false when there is none); disc_ask_answer takes the answer:
+	// 1 copy it, 2 play from the disc, 3 not now. Unset: no question is shown.
+	std::function<bool(std::string& title, std::string& serial)> disc_ask_poll;
+	std::function<void(int)> disc_ask_answer;
+	// 2.11: the PS2 disc in the drive that is not copied (orbis-shims/ProsperoDiscDump.cpp): the shelf lists it first. drive_disc_poll gives its title
+	// and serial (false when none); drive_disc_reask asks the watcher about it again (the question comes back as disc_ask_poll's).
+	std::function<bool(std::string& title, std::string& serial)> drive_disc_poll;
+	std::function<void()> drive_disc_reask;
+	// 2.11: the shelf's search, from the settings page on a phone or PC. search_remote gives the text the page set since the last
+	// call (true; "" clears the search); search_report tells the page what the shelf is searching for (it shows it in its box).
+	std::function<bool(std::string& text)> search_remote;
+	std::function<void(const std::string& text)> search_report;
+	// 2.12 (swordpdf: "add a game from the shelf to the xmb"): a game's sheet gets the "Home screen tile" row, which asks the PS5SX2 Disc Helper to put the
+	// game on the PS5 home screen as a tile of its own (or to take it off; fe_gametile.h). tiles_dir is the folder the two talk through (/data/PCSX2/tiles); empty:
+	// no row (the flag file flags/gametiles turns it on: fe_ps5.cpp). own_tile_game: the game this process was started from a tile for ("" outside a tile): its tile
+	// is not taken off from inside it. tile_cover: the shelf's cover file for a game (an absolute path, "" for none), sent with the request for the tile's art.
+	std::string tiles_dir;
+	std::string own_tile_game;
+	std::function<std::string(const GameInfo&)> tile_cover;
 };
 
 class App
@@ -97,6 +125,36 @@ public:
 	int ShelfCount() const { return static_cast<int>(m_games.size()); } // vk-285-137: the games on the shelf
 	// live-22: the disc dump entry's percentage (0-100) while one is on the shelf, else -1 (the host test checks it).
 	int DumpPercent() const { return m_dump_on ? m_dump_pct : -1; }
+	// 2.11: the disc in the drive is listed (1) or not (0); the disc art for the copy's or the drive's entry has arrived (1) or not (0). For the host tests.
+	int DriveEntry() const { return m_drive_on ? 1 : 0; }
+	int DiscArt() const { return m_dump_disc_set ? 1 : 0; }
+	// 2.11: the shelf's search (the host tests check them): what it is searching for, whether its keyboard is up, and how far the
+	// picked case is turned over (0 front .. 1 back).
+	const std::string& SearchText() const { return m_search.text; }
+	bool SearchTyping() const { return m_search.typing; }
+	float FlipAmount() const { return m_flip < 0 ? -m_flip : m_flip; }
+	// 2.11: the same with the side it is turned towards (-1 .. 1; the pose repeats every 2), and whether the picked case's real back cover has arrived (1) or not (0).
+	float FlipAngle() const { return m_flip * m_flip_dir; }
+	int BackReal() const { return !m_games.empty() && m_slots[static_cast<size_t>(m_selected)].back_real ? 1 : 0; }
+	// 2.11 (the host tests): whether the case of a game (an index of Init's list) holds a real back cover now (1/0, -1 when it is not on the shelf), how far
+	// the flip turns its pose at this moment (degrees, 0 when it is not on the shelf), and how many cases that are not the picked one still hold their back
+	// because they are turned over on screen; and whether the case has its texture set to be drawn with (1/0, -1 when it is not on the shelf).
+	int BackRealOf(int game) const;
+	int TurnOf(int game) const;
+	int SetOf(int game) const;
+	int BackHeld() const { return static_cast<int>(m_back_held.size()); }
+	int BackRealCount() const; // every slot, the ones off the shelf too, that holds a real back cover (the leak check of the hold)
+	// 2.11: the last list of neighbours whose backs were handed to the service for fetching ahead: how many, and the first (an index of Init's list; -1 none).
+	int RingCount() const { return m_ring_count; }
+	int RingFirst() const { return m_ring_first; }
+	// 2.12 (the host tests check them): the Home screen tile row's phase (fe_gametile.h Phase; -1 when the sheet shows no such row), whether the row is in the
+	// sheet (1) or not (0), whether it is the focused one, how many times the state was looked at (ResetTilePolls zeroes it) and how many asks are pending.
+	int TilePhase() const { return m_sheet_open && m_tile_row ? static_cast<int>(m_tile_view.phase) : -1; }
+	int TileRowShown() const { return m_sheet_open && m_tile_row ? 1 : 0; }
+	int TileFocused() const;
+	int TilePolls() const { return m_tile_polls; }
+	void ResetTilePolls() { m_tile_polls = 0; }
+	int TilePending() const { return m_tile.PendingCount(); }
 
 private:
 	struct Slot
@@ -104,6 +162,13 @@ private:
 		Texture* cover = nullptr;
 		Texture* placeholder = nullptr;
 		Texture* spine = nullptr;
+		Texture* back_ph = nullptr;   // 2.11: the case's back, painted (the cover service)
+		Texture* back_real = nullptr; // 2.11: a back cover the player supplied, held while the case is the picked one (and while it is still turned over after it)
+		bool back_wanted = false;     // 2.11: its back cover was asked of the service
+		bool back_net = false;        // 2.11: ... with the permission to download it
+		double back_asked = -1;       // 2.11: when (App::m_time), for the log
+		double back_shown = -1;       // 2.11: when (App::m_time) it was last drawn turned over, after the selection left it (m_back_held)
+		double back_left = -1;        // 2.11: when (App::m_time) the selection left it with its back held (m_back_held), for the log
 		VkDescriptorSet set = VK_NULL_HANDLE;
 		bool dirty = false;
 		float cover_mix = 0;     // animates to 1 once the cover arrives
@@ -135,6 +200,16 @@ private:
 	// shelf's line while a pack is on its way.
 	void UpdateTexturePackRow(const Input& in, double now);
 	std::string OnlinePatchValue() const; // 2026-10-08: the "Get patches and cheats" row's value
+	// 2.12: the sheet's Home screen tile row (fe_gametile.h): whether the shown game can have one, the state looked at (throttled; only with the row shown or an ask
+	// pending), a press (Cross, Left or Right add; Triangle or Cross remove), and what the row shows and says. HomeTileValue and HomeTileHelp read what PollTiles
+	// found: no file access per frame.
+	bool HomeTileEligible(const GameInfo* g) const;
+	void PollTiles(bool force);
+	bool DiskBusy() const;
+	void HomeTileToggle(int how); // 0 Cross, 1 Left or Right, 2 Triangle
+	void HomeTileSay(const std::string& text);
+	std::string HomeTileValue() const;
+	std::string HomeTileHelp() const;
 	std::string TexturePackValue(const TexturePackStatus& s, int pick) const;
 	std::string TexturePackHelp(const TexturePackStatus& s, int pick, const std::string& serial) const;
 	void BuildTexturePackActivity(std::vector<UiVertex>& ui, float x, float y, float k, uint32_t accent);
@@ -153,6 +228,27 @@ private:
 	int m_dump_pct = 0;
 	float m_dump_spin = 0;      // the disc's rotation, advanced each frame
 	double m_dump_poll = -10;   // when the status file was last read
+	// 2.11 (swordpdf: "we can also use the circular disc cover for when a game is dumping"): the disc being copied shows its own disc art (LaunchBox, or
+	// covers/<serial>_disc.png) instead of the painted disc, once the cover service has it.
+	void TakeDiscArt(const CoverImage& img);
+	void EnsureDiscArt(const std::string& serial); // asks for the art of this disc unless it has it (or asked) already
+	// 2.11 (swordpdf: "since the emulator knows what game is inside the drive, it would be cool to have the disc in the shelf as well, maybe always on
+	// first place"): the PS2 disc in the drive that is not copied is a shelf entry at the front (Init-list index kDriveIndex), with its disc art on the
+	// box. Picking it asks the disc watcher about the disc again (play from it, or copy it), which is how the question comes back after "not now".
+	void PollDriveDisc();
+	// 2.11 (review): a shelf entry that moves the selection (the copy's) or the list (the drive's) waits while a pick is launching or a panel holds the pad.
+	bool ShelfBusy() const { return m_launching || m_sheet_open || m_sheet_anim > 0.05f || m_account.open || m_picker.open || m_search.typing; }
+	void InsertDriveEntry(const std::string& serial, const std::string& title);
+	void RemoveDriveEntry();
+	int DrivePos() const; // the entry's position on the shelf, or -1
+	bool m_drive_on = false;
+	std::string m_drive_serial, m_drive_title;
+	std::string m_disc_art_serial; // the disc the art (m_dump_disc) is for, or was asked for
+	double m_art_idle = -1;        // since when no entry wants the art (it is let go after a moment: the drive's entry and the copy's hand it over)
+	void FreeDiscArt();
+	Texture* m_dump_disc = nullptr;
+	VkDescriptorSet m_dump_disc_set = VK_NULL_HANDLE;
+	float m_dump_disc_aspect = 1.0f; // width / height of the picture
 	void KeepCoversNear();                // 2026-10-10: asks for the games near the selection, drops the rest's textures
 	void DropCovers(Slot& s, int index); // its textures and set freed, the service told
 	// vk-285-135 (AI-assisted; swordpdf: "i also want to pick a folder though the browser in the shelf"): the folder picker of the
@@ -167,6 +263,7 @@ private:
 			Listed, // a game folder added already (Triangle removes it)
 			Add,    // "Add a share" (the PS5's keyboard)
 			Share,  // an NFS share's address (Triangle removes it)
+			TypePath, // 2.11: "Type a folder path" (the keyboard): any folder, however deep, without browsing to it
 		};
 		Type type = Type::Folder;
 		std::string label, path, value;
@@ -181,6 +278,7 @@ private:
 		int row = 0;
 		float scroll = 0, scroll_target = 0;
 		bool typing = false; // the PS5's keyboard is open for a share's address
+		bool path_entry = false; // 2.11: the keyboard (either) is for a folder's path, not a share's address
 		std::string editing;  // vk-285-138: the share being changed (empty: a new one)
 		// vk-285-139: the panel's own keyboard for the address, where the PS5's won't open (libSceImeDialog doesn't load in
 		// every jailbreak's process: swordpdf's 138 log, "load 0x80020063").
@@ -196,6 +294,14 @@ private:
 	void BuildPicker(std::vector<UiVertex>& ui, float x, float sw, float y, float sh, float k, uint32_t accent);
 	FolderPicker m_picker;
 	void UpdateAccount(const Input& in);
+	// 2.04: the question about a disc just put in (AppConfig::disc_ask_poll), a panel over the shelf.
+	void PollDiscAsk();
+	void UpdateDiscAsk(const Input& in);
+	void BuildDiscAsk(std::vector<UiVertex>& ui, float W, float H, float k, uint32_t accent);
+	bool m_ask_on = false;
+	std::string m_ask_title, m_ask_serial;
+	int m_ask_sel = 0;     // 0 play from the disc, 1 copy it first
+	float m_ask_anim = 0;  // the panel's fade
 	void BuildAccount(std::vector<UiVertex>& ui, float W, float H, float k, uint32_t accent);
 	void BuildAccountKeyboard(std::vector<UiVertex>& ui, float x, float y, float w, float k);
 	// vk-285-139: the panel's keyboard for any field: its title, page and focused key.
@@ -203,6 +309,52 @@ private:
 		int key_col);
 	void BuildPickerKeyboard(std::vector<UiVertex>& ui, float W, float H, float k, uint32_t accent);
 	void FinishShareText(int result, std::string text);
+	// 2.11 (swordpdf: "add a search section to the shelf, make it sleek"): R2 on the shelf opens a keyboard (the PS5's when the app can
+	// open it, else the panel's own, docked at the bottom) and the shelf narrows to the games that match as each key is typed: every
+	// word of the search must be in the title, serial, region or file name (any letter case). Circle clears it. The settings page's
+	// search box does the same from a phone (AppConfig::search_remote).
+	struct Search
+	{
+		bool typing = false;  // the keyboard is up
+		bool system = false;  // ... and it is the PS5's (it has the pad until it closes)
+		std::string text;     // as typed
+		std::string applied;  // lower case: what the shelf is narrowed by ("" for none)
+		int page = 0, row = 1, col = 0;
+		int held_x = 0, held_y = 0;
+		double held_for = 0, next_repeat = 0;
+		float kb_anim = 0;    // the keyboard's slide
+		float pill_anim = 0;  // the search line's fade
+	};
+	Search m_search;
+	int m_search_return = -1; // the game picked when a search first narrowed the shelf (an index of Init's list)
+	bool SearchMatches(const GameInfo& g) const;
+	void SetSearch(const std::string& text); // the shelf narrowed to it ("" shows every game again)
+	void OpenSearch();
+	void CloseSearch(); // the keyboard goes; the search stays
+	void UpdateSearch(const Input& in, double dt);
+	void BuildSearch(std::vector<UiVertex>& ui, float W, float H, float k, uint32_t accent);
+	// 2.11 (swordpdf: "moving the right stick would allow you to slickly flip it and see the back in the shelf"): how far the picked
+	// case is turned over, 0 front to 1 back, sprung to what the right stick (or its click, which holds it) asks.
+	float m_flip = 0, m_flip_vel = 0;
+	float m_flip_dir = 1.0f; // which way it turns: the stick's side
+	bool m_flip_latched = false;
+	// 2.11 (swordpdf: "back covers are not loading instantly"): the player is turning the case over -- the stick is past its dead zone or the click holds it
+	// -- so its back is wanted at once, network included. (m_flip itself is no sign of that: it stays above zero for a third of a second after the stick is
+	// let go.)
+	bool m_flip_wanted = false;
+	bool m_r3_prev = false;
+	int m_back_for = -2; // the game (an index of Init's list) whose back cover was asked for last
+	int m_prefetch_for = -2; // the game whose neighbours' backs were handed to the service (PrefetchBacks)
+	// 2.11 (swordpdf, build 175: "the back cover gets deloaded before the case has turned back to the front, and the user can see a black spot for a
+	// second"): m_flip turns every case near the scroll position (Pose), so the case the selection just left is still turned over -- showing its back --
+	// while it slides aside and the flip comes back. Its back cover (1.7 MB) is kept for that time: the games, not the picked one, that hold theirs.
+	std::vector<int> m_back_held; // indices of Init's list
+	float FlipTurn(float d) const;    // what the flip adds to the pose of the case d places from the scroll position (radians)
+	bool BackOnShow(int pos) const;   // the case at this position is drawn turned over by the flip (so its back may be in view)
+	void ReleaseBack(Slot& s, int index); // its back cover let go, the service told
+	void PollBackHolds(int sel_index);  // each frame: the held backs of cases that are turned back to the front go
+	int m_ring_count = 0, m_ring_first = -1;
+	int m_last_dir = 1;      // which way the selection last moved (the neighbours that way come first)
 	void Pose(float d, float t, Mat4& model, float& brightness) const;
 
 	Renderer* m_renderer = nullptr;
@@ -275,6 +427,16 @@ private:
 	// 2026-10-08: the online patches' state last seen for the sheet's game (a finished fetch reloads the sheet's rows).
 	std::string m_online_seen_serial;
 	OnlinePatchStatus::State m_online_seen = OnlinePatchStatus::State::Idle;
+	// 2.12: the Home screen tile row: every ask made (also for games whose sheet has closed), the lines of the helper's state.txt, what the sheet's game shows,
+	// and the game it is for (its normalized path, title and serial as the request carries them).
+	gametile::Tracker m_tile;
+	gametile::StateReader m_tile_state;
+	gametile::View m_tile_view;
+	bool m_tile_row = false;        // the sheet shows the row (set at OpenSheet)
+	bool m_tile_view_known = false; // m_tile_view was looked at since the sheet opened (a tile turning On is told only after that)
+	std::string m_tile_path, m_tile_title, m_tile_serial;
+	double m_tile_poll = -10;       // when the state was looked at last
+	int m_tile_polls = 0;
 
 	// vk-285-134: no PS2 BIOS (AppConfig::bios_present said so at start or at the last pick), what was found instead,
 	// and when a pick was refused for it (the line lights up).

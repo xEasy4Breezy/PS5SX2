@@ -4,7 +4,8 @@
 // /data/PCSX2/textures. Packs are big, so they can sit on a USB drive (or any folder the PS5 mounts) instead:
 // FindGameDir looks there first and gives the game's folder, or "" to leave it to PCSX2's own place.
 //
-//   1. the PS5SX2/TexturesDir setting (gs.ini or the game's settings file), when <it>/<serial> is there;
+//   1. the manual folder given (FindGameDir; main-boot.cpp passes none now: PS5SX2/TexturesDir is the textures folder itself, and
+//      FindGameDirOnly below is the only place then), when <it>/<serial> is there;
 //   2. each USB drive, /mnt/usb0 to /mnt/usb7: <drive>/PS5SX2/textures/<serial>, <drive>/PCSX2/textures/<serial>,
 //      <drive>/textures/<serial>, and <drive>/PS5SX2/<serial>, <drive>/<serial> when that folder has a
 //      "replacements" folder in it (a pack copied to the drive as it is).
@@ -132,6 +133,19 @@ inline std::string FindGameDir(const std::vector<std::string>& drive_roots, cons
 		}
 	}
 	return std::string();
+}
+
+// 2026-10-16: the textures folder the player set (PS5SX2/TexturesDir) is the only place: <it>/<serial> in any case, and never the
+// drives or the PS5SX2/textures folders there. "" when that folder has none (PCSX2 then reads its own, the same folder, and finds
+// no pack either). Unset, FindGameDir above keeps the old order.
+inline std::string FindGameDirOnly(const std::string& textures_dir, const std::string& serial, std::string* how = nullptr)
+{
+	if (serial.empty() || textures_dir.empty())
+		return std::string();
+	const std::string dir = WalkDirs(textures_dir, {serial});
+	if (!dir.empty() && how)
+		*how = "the textures folder you set (PS5SX2/TexturesDir)";
+	return dir;
 }
 
 // The mounted USB drives' roots: /mnt/usb0 to /mnt/usb7 that hold anything (2026-10-08: then /mnt/ext0 and /mnt/ext1, the

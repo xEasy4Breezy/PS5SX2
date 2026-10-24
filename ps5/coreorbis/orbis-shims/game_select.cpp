@@ -298,15 +298,9 @@ bool Step(Menu& m, uint32_t buttons, uint32_t& prev, int& held, unsigned& ticks,
 }
 } // namespace
 
-std::string orbis_select_game(const char* games_dir, const char* top_dir, const char* build_tag)
+// 2026-10-16: the menu over the images found (orbis_select_game below, and orbis_select_game_dirs for the folders the player set).
+static std::string SelectGame(const std::vector<Game>& games, const char* dir, const char* build_tag)
 {
-	const char* const dir = top_dir; // lastgame.txt stays in the top folder
-	const std::vector<Game> games = ScanAll(games_dir, top_dir);
-	std::printf("[menu] %zu disc image(s) in %s%s%s\n", games.size(), games_dir,
-		std::strcmp(games_dir, top_dir) != 0 ? " and " : "", std::strcmp(games_dir, top_dir) != 0 ? top_dir : "");
-	for (const Game& g : games)
-		std::printf("[menu]   %s/%s (%llu bytes)\n", g.dir.c_str(), g.file.c_str(), g.bytes);
-	std::fflush(stdout);
 	if (games.empty())
 		return {};
 
@@ -373,4 +367,37 @@ std::string orbis_select_game(const char* games_dir, const char* top_dir, const 
 	display.close();
 	scePadClose(pad);
 	return chosen("picked");
+}
+
+std::string orbis_select_game(const char* games_dir, const char* top_dir, const char* build_tag)
+{
+	const char* const dir = top_dir; // lastgame.txt stays in the top folder
+	const std::vector<Game> games = ScanAll(games_dir, top_dir);
+	std::printf("[menu] %zu disc image(s) in %s%s%s\n", games.size(), games_dir,
+		std::strcmp(games_dir, top_dir) != 0 ? " and " : "", std::strcmp(games_dir, top_dir) != 0 ? top_dir : "");
+	for (const Game& g : games)
+		std::printf("[menu]   %s/%s (%llu bytes)\n", g.dir.c_str(), g.file.c_str(), g.bytes);
+	std::fflush(stdout);
+	return SelectGame(games, dir, build_tag);
+}
+
+// 2026-10-16: the same over the folders the player set (PS5SX2/GameFolders: only those, and the NFS shares), each flat.
+std::string orbis_select_game_dirs(const std::vector<std::string>& dirs, const char* top_dir, const char* build_tag)
+{
+	std::vector<Game> games;
+	std::string where;
+	for (const std::string& d : dirs)
+	{
+		ScanGames(d.c_str(), games);
+		where += (where.empty() ? "" : ", ") + d;
+	}
+	std::sort(games.begin(), games.end(), [](const Game& a, const Game& b) {
+		const std::string la = Lower(a.title), lb = Lower(b.title);
+		return la != lb ? la < lb : a.title < b.title;
+	});
+	std::printf("[menu] %zu disc image(s) in the folders you set: %s\n", games.size(), where.empty() ? "(none there)" : where.c_str());
+	for (const Game& g : games)
+		std::printf("[menu]   %s/%s (%llu bytes)\n", g.dir.c_str(), g.file.c_str(), g.bytes);
+	std::fflush(stdout);
+	return SelectGame(games, top_dir, build_tag); // lastgame.txt stays in the top folder
 }

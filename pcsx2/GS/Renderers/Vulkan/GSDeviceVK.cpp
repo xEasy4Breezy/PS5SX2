@@ -47,6 +47,9 @@
 #ifdef ORBIS_VULKAN
 #include "ps5/coreorbis/orbis-shims/ps5_framegen.h" // 2026-10-08: frame generation
 #include "ps5/coreorbis/orbis-shims/OrbisFrameGenPacing.h" // vk-285-133: its pacing
+#include "ps5/coreorbis/orbis-shims/OrbisDisplayHz.h" // 2.11: the display rate it paces against
+#include "ps5/coreorbis/orbis-shims/OrbisFrameGenGate.h" // 2.11: the "[fg] status" line, the gate that stops frame generation
+#include "ps5/coreorbis/orbis-shims/OrbisVideoOutMode.h" // 2.11: the app's own 120 Hz switch (flag fg120)
 #endif
 #define printf OrbisDeferredPrintf
 #define fflush OrbisDeferredFlush
@@ -4508,6 +4511,8 @@ void OrbisVkPresentBlend(GSTexture* tex, const GSVector4& sRect, const GSVector4
 // the watermark, the QR panel) are drawn over both. The TV is in its 120 Hz mode where the console allows it (VKSwapChain.cpp picks
 // the mode, the driver configures VideoOut): a 60 fps game is shown at 120, a 30 fps one gets its generated frame twice. At 60 Hz
 // only a game at 30 fps or less gets frames made. File statics, not members: GSDeviceVK's layout stays as it was.
+// 2.11: a PAL game at 50 fps is the same case (2.4 refreshes a frame at 119.88 Hz, shown at 100). The 120 Hz output is the driver's
+// (the 2.02 build's had it; the drivers of 2.03 to 2.10 had none) or, opt-in (flags/fg120), the app's own (OrbisVideoOutMode.h).
 // vk-285-133: paced in the PS2's vsyncs (ps5/coreorbis/orbis-shims/OrbisFrameGenPacing.h; vk-285-131's wall-clock pacing slowed
 // a 60 fps game at 60 Hz to 30 fps), with a pause when the game slows while frames are generated; nothing is recorded while there
 // is no room for a generated frame (a 60 fps game at 60 Hz), and the interpolator is only made once there is.
@@ -4518,6 +4523,13 @@ bool g_orbis_fg_engaged = false; // vk-285-133: the pacing has room for generate
 // The driver's measured refresh of the output its swapchain presents to (ps5vk's high-frame-rate output, 2026-10-08); a driver
 // without it presents at 59.94 Hz.
 extern "C" uint32_t ps5vk_output_refresh_millihertz(void) __attribute__((weak));
+// 2.11: the refresh of the display mode the swapchain was made for (VKSwapChain.cpp), in millihertz: the display's rate when the
+// driver measures none and the app's own switch (OrbisVideoOutMode.cpp) did not run (OrbisDisplayHz.h has the order).
+extern uint32_t g_orbis_display_refresh_mhz;
+// 2.11: how this process was started ("main app" or "disc tile /dev/cd0"; main-boot.cpp), for the "[fg] status" line: whether the console
+// takes the 120 Hz output can depend on the title it started.
+const char* OrbisLaunchPathText();
+void OrbisOSDLabel(const char* text); // GSRenderer.cpp: a one-shot label where the FPS box is
 
 namespace
 {
@@ -4532,25 +4544,30 @@ namespace
 		bool reset_next = true;  // the interpolator was (re)made: its first frame has no neighbour
 		bool have_output = false;
 		double hz = 59.94;
+		orbis_fg::DisplayHzSource hz_source = orbis_fg::DisplayHzSource::Assumed; // 2.11: where hz came from
 		orbis_fg::Pacing pacing; // vk-285-133
 		std::chrono::steady_clock::time_point stat_start{};
 		std::chrono::steady_clock::time_point last_state_log{};
 		int logged_state = -1;   // the pacing's state the log last described
-		u64 stat_frames = 0, stat_engaged = 0, stat_made = 0, stat_presents = 0, stat_counted = 0;
-		double stat_vsyncs = 0.0;
+		orbis_fg::Window win;    // 2.11: the vsyncs since the last "[fg] status" line (OrbisFrameGenGate.h)
 	};
 
 	OrbisFrameGenState s_orbis_fg;
 
-	double OrbisFrameGenDisplayHz()
+	// 2.11: the driver's measurement, else PS5SX2's own switch's, else the rate of the mode the swapchain was made for (so a
+	// driver that lists 119.88 Hz gives a 60 fps game two refreshes a frame), else 59.94 (OrbisDisplayHz.h).
+	orbis_fg::DisplayHz OrbisFrameGenDisplayHz()
 	{
-		if (ps5vk_output_refresh_millihertz)
-		{
-			const uint32_t mhz = ps5vk_output_refresh_millihertz();
-			if (mhz >= 20000 && mhz <= 250000)
-				return mhz / 1000.0;
-		}
-		return 59.94;
+		return orbis_fg::PickDisplayHzSource(ps5vk_output_refresh_millihertz ? ps5vk_output_refresh_millihertz() : 0u,
+			OrbisVideoOutRefreshMilliHz(), g_orbis_display_refresh_mhz);
+	}
+
+	// 2.11: what the app's own 120 Hz switch did, for the frame generation lines: only when the driver has no output control of its own.
+	// With one, the switch never runs and its summary ("not switched: the driver has its own output control") reads as "the output
+	// was not switched"; the driver's verdict is the "[display] swapchain:" line (VKSwapChain.cpp).
+	std::string OrbisFrameGenVideoOut()
+	{
+		return ps5vk_output_refresh_millihertz ? std::string() : OrbisVideoOutSummary();
 	}
 }
 
@@ -4612,11 +4629,30 @@ namespace
 					p.MedianVsyncs(), ps2_hz, p.Refreshes(), s.hz, p.Repeats());
 				break;
 			case orbis_fg::State::NoRoom:
-				printf("[fg] not generating: a new frame every %.1f PS2 vsyncs (%.2f Hz) is %.2f refreshes at %.2f Hz, no room for "
-					   "another%s\n",
-					p.MedianVsyncs(), ps2_hz, p.Refreshes(), s.hz,
-					s.hz < 90.0 ? " (at 60 Hz only games at 30 fps or less get generated frames; 60 fps ones need the 120 Hz output)" : "");
+			{
+				// 2.11: a game with a new frame every vsync (60 fps; PAL's 50) on a display at 60 Hz: why, once, so that a log of
+				// "frame generation does nothing" says what the display is and where that rate came from. What the driver did with the 120 Hz
+				// output is its "[display] swapchain:" line, and the "[fg] status:" line says what stops the generator.
+				// (the words are OrbisFrameGenGate.h's FormatNoRoom, which a PC test runs)
+				const orbis_fg::NoRoomText text = orbis_fg::FormatNoRoom(p.MedianVsyncs(), ps2_hz, p.Refreshes(), s.hz, s.hz_source,
+					OrbisFrameGenVideoOut());
+				printf("%s\n", text.line.c_str());
+				if (text.needs_120hz)
+				{
+					// And once per game on the screen: "Frame generation: On" with the output at 60 Hz and a game of one vsync a
+					// frame does nothing, which a player takes for a broken setting (flag nofgnote turns the label off).
+					static bool s_note_shown = false;
+					if (!s_note_shown)
+					{
+						s_note_shown = true;
+						const bool label = !OrbisFlag("nofgnote");
+						if (label)
+							OrbisOSDLabel("FG: NO 120 HZ OUTPUT");
+						printf("[fg] on-screen label \"FG: NO 120 HZ OUTPUT\": %s\n", label ? "shown once" : "off (flag nofgnote)");
+					}
+				}
 				break;
+			}
 			case orbis_fg::State::Warming:
 				printf("[fg] not generating yet: %u of %u frames since the start or a load\n", p.WarmFrames(), orbis_fg::Pacing::kWindow);
 				break;
@@ -4664,6 +4700,49 @@ namespace
 		}
 		fflush(stdout);
 	}
+
+	// 2.11 (swordpdf on build 175: "framegen at 50fps doesn't seem to work"): the "[fg] status" line, every 10 s while frame generation is
+	// on, whatever stops the generator: the first gate that failed most in the window, the launch path, the display rate and the
+	// driver's own word for it, where the game's new frames went (OrbisFrameGenGate.h). Called from every vsync GSRenderer.cpp sees,
+	// and from Record's early return (a failed interpolator, no swapchain), so no gate goes without a line. GS thread only.
+	void OrbisFrameGenStatus(OrbisFrameGenState& s, std::chrono::steady_clock::time_point now, double ps2_hz, float speed, bool have_swapchain)
+	{
+		if (s.stat_start == std::chrono::steady_clock::time_point{})
+		{
+			s.stat_start = now;
+			return;
+		}
+		const double secs = std::chrono::duration<double>(now - s.stat_start).count();
+		if (secs < 10.0)
+			return;
+
+		orbis_fg::StatusInputs in;
+		in.w = s.win;
+		in.w.seconds = secs;
+		in.engine_failed = s.failed;
+		in.swapchain = have_swapchain;
+		in.ps2_hz = ps2_hz;
+		in.refreshes = s.pacing.Refreshes();
+		in.steady = s.pacing.SteadyFrames();
+		in.warm_frames = s.pacing.WarmFrames();
+		// The raw readings beside the rate used: the driver's word is 0 after its swapchain closed, and the pacing then falls back to
+		// the listed mode.
+		in.driver_mhz = ps5vk_output_refresh_millihertz ? ps5vk_output_refresh_millihertz() : 0u;
+		in.mode_mhz = g_orbis_display_refresh_mhz;
+		in.display = orbis_fg::PickDisplayHzSource(in.driver_mhz, OrbisVideoOutRefreshMilliHz(), g_orbis_display_refresh_mhz);
+		in.speed = speed;
+		in.launch = OrbisLaunchPathText();
+		const std::string videoout = OrbisFrameGenVideoOut();
+		in.videoout = videoout.c_str();
+		double gpu_ms = 0.0, gpu_max = 0.0, flow_ms = 0.0;
+		u32 timed = 0;
+		if (s.fg && s.fg->take_gpu_time(gpu_ms, gpu_max, timed, flow_ms))
+			in.gpu = fmt::format("; GPU {:.2f} ms a frame ({:.2f} the optical flow), most {:.2f}", gpu_ms, flow_ms, gpu_max);
+		printf("%s\n", orbis_fg::FormatStatus(in).c_str());
+		fflush(stdout);
+		s.stat_start = now;
+		s.win = orbis_fg::Window{};
+	}
 }
 
 u32 GSDeviceVK::OrbisFrameGenRecord(GSTexture* current, const GSVector4& src_uv, const GSVector4& draw_rect, PresentShader shader,
@@ -4676,46 +4755,35 @@ u32 GSDeviceVK::OrbisFrameGenRecord(GSTexture* current, const GSVector4& src_uv,
 	{
 		g_orbis_fg_engaged = false;
 		g_orbis_fg_active.store(false, std::memory_order_relaxed);
+		if (g_orbis_fg_wanted && current)
+		{
+			// 2.11: a failed interpolator or no swapchain: a new frame the generator could not take, and the status line says so.
+			s.win.unserved++;
+			OrbisFrameGenStatus(s, std::chrono::steady_clock::now(), ps2_hz, speed, m_swap_chain != nullptr);
+		}
 		return 0;
 	}
 
 	// The pacing (vk-285-133): the game's frames in PS2 vsyncs against the display's refreshes, and the speed.
 	const auto now = std::chrono::steady_clock::now();
 	const double now_s = std::chrono::duration<double>(now.time_since_epoch()).count();
-	s.hz = OrbisFrameGenDisplayHz(); // the driver's, each frame: the output goes back to 60 Hz before the process ends
+	// The driver's, each frame: the output goes back to 60 Hz before the process ends (2.11: or the switch's, or the mode's).
+	const orbis_fg::DisplayHz display = OrbisFrameGenDisplayHz();
+	s.hz = display.hz;
+	s.hz_source = display.source;
 	const orbis_fg::Decision decision = s.pacing.Frame(vsyncs, already, ps2_hz, s.hz, now_s, speed, nominal);
 	OrbisFrameGenLogEvent(s, s.pacing.TakeEvent());
 	OrbisFrameGenLogState(s, now, ps2_hz);
 	g_orbis_fg_engaged = decision.engaged;
 
-	// A status line every 10 s, generating or not.
-	if (s.stat_start == std::chrono::steady_clock::time_point{})
-		s.stat_start = now;
-	s.stat_frames++;
+	// A status line every 10 s, generating or not (OrbisFrameGenStatus; OrbisFrameGenNote counts the vsyncs that never get here).
+	s.win.Record(s.pacing.GetState());
 	if (vsyncs <= orbis_fg::Pacing::kGapVsyncs) // a load's wait isn't a frame interval
 	{
-		s.stat_vsyncs += vsyncs;
-		s.stat_counted++;
+		s.win.vsync_sum += vsyncs;
+		s.win.counted++;
 	}
-	s.stat_engaged += decision.engaged ? 1 : 0;
-	if (const double secs = std::chrono::duration<double>(now - s.stat_start).count(); secs >= 10.0)
-	{
-		double gpu_ms = 0.0, gpu_max = 0.0, flow_ms = 0.0;
-		u32 timed = 0;
-		const bool have_gpu = s.fg && s.fg->take_gpu_time(gpu_ms, gpu_max, timed, flow_ms);
-		printf("[fg] %.1f game fps (%.2f PS2 vsyncs a frame at %.2f Hz), %.1f generated frames a second, %.1f presents each, "
-			   "display %.2f Hz, speed %.0f%%, %s%s\n",
-			s.stat_frames / secs, s.stat_counted ? s.stat_vsyncs / s.stat_counted : 0.0, ps2_hz, s.stat_made / secs,
-			s.stat_made ? static_cast<double>(s.stat_presents) / s.stat_made : 0.0, s.hz, speed,
-			s.pacing.Paused() ? "paused (the game slowed)" :
-			s.stat_engaged == 0 ? "not generating" :
-			s.stat_engaged < s.stat_frames ? "generating part of the time" : "generating",
-			have_gpu ? fmt::format("; GPU {:.2f} ms a frame ({:.2f} the optical flow), most {:.2f}", gpu_ms, flow_ms, gpu_max).c_str() : "");
-		fflush(stdout);
-		s.stat_start = now;
-		s.stat_frames = s.stat_engaged = s.stat_made = s.stat_presents = s.stat_counted = 0;
-		s.stat_vsyncs = 0.0;
-	}
+	OrbisFrameGenStatus(s, now, ps2_hz, speed, true); // m_swap_chain was checked above
 
 	if (!decision.engaged)
 	{
@@ -4838,10 +4906,22 @@ u32 GSDeviceVK::OrbisFrameGenRecord(GSTexture* current, const GSVector4& src_uv,
 
 	fg.advance();
 
-	s.stat_made += s.have_output ? 1 : 0;
-	s.stat_presents += s.have_output ? decision.presents : 0;
+	s.win.made += s.have_output ? 1 : 0;
+	s.win.presents += s.have_output ? decision.presents : 0;
 	g_orbis_fg_active.store(true, std::memory_order_relaxed); // the box's "FG": generating, even on a frame too short for one
 	return s.have_output ? decision.presents : 0;
+}
+
+// 2.11: a vsync that never reached OrbisFrameGenRecord, counted for the "[fg] status" line, which is printed from here too when its
+// 10 s are over. kind 0: skipped presenting because the picture repeated the game's last frame; 1: a blank picture; 2: not a new frame
+// of the game (the internal FPS count); 3: skipped by the present throttle. GS thread only; free while frame generation is off.
+void GSDeviceVK::OrbisFrameGenNote(u32 kind, double ps2_hz, float speed)
+{
+	if (!g_orbis_fg_wanted)
+		return;
+	OrbisFrameGenState& s = s_orbis_fg;
+	(kind == 0 ? s.win.dup_skipped : kind == 1 ? s.win.blank : kind == 2 ? s.win.not_new : s.win.throttled)++;
+	OrbisFrameGenStatus(s, std::chrono::steady_clock::now(), ps2_hz, speed, m_swap_chain != nullptr);
 }
 
 void GSDeviceVK::OrbisFrameGenDraw()
@@ -4862,6 +4942,12 @@ u32 OrbisVkFrameGenRecord(GSTexture* current, const GSVector4& src_uv, const GSV
 {
 	GSDeviceVK* const dev = GSDeviceVK::GetInstance();
 	return dev ? dev->OrbisFrameGenRecord(current, src_uv, draw_rect, shader, shader_time, filter, vsyncs, already, ps2_hz, speed, nominal) : 0;
+}
+
+void OrbisVkFrameGenNote(u32 kind, double ps2_hz, float speed)
+{
+	if (GSDeviceVK* const dev = GSDeviceVK::GetInstance())
+		dev->OrbisFrameGenNote(kind, ps2_hz, speed);
 }
 
 void OrbisVkFrameGenDraw()

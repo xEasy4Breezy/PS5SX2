@@ -6,6 +6,9 @@
 #
 # Needs the payload SDK (a stock one is enough here) and socat. DISCDRIVE_BUILD_ONLY=1: build only (no console needed).
 # DISCDRIVE_DEVICE=/dev/cd1: test that drive (default: the first /dev/cdN).
+# 2.11 (disc lag round): on the PS5's own drive with a DVD the test also checks the 3.2x speed (>= 4.0 MB/s), logs what TEST UNIT READY answers 100 ms to 3 s
+# after Sony's speed command ("INFO TEST UNIT READY ..." lines: the data for the 2/04 question), runs DiscReady for 60 s against a reading game, and logs
+# what the disc helper's polling of the drive costs ("INFO helper-like polling" lines).
 #
 # Copyright (C) 2026 Heyde Moura
 # Copyright (C) 2026 swordpdf
@@ -44,6 +47,7 @@ done
 "$sdk/bin/prospero-clang++" -o "$obj/test_discdrive.elf" "${objs[@]}" -lkernel_sys
 if [[ $build_only == 1 ]]; then echo "built $obj/test_discdrive.elf (DISCDRIVE_BUILD_ONLY)"; exit 0; fi
 echo "built $obj/test_discdrive.elf; running it on $host:$port"
-out=$(timeout 180 socat -t 120 - "TCP:$host:$port" < "$obj/test_discdrive.elf")
+# (2.11: the disc lag tests take about 3 minutes: 60 s of DiscReady, the speed command's TEST UNIT READYs, and the helper-polling reads A/B)
+out=$(timeout 600 socat -t 540 - "TCP:$host:$port" < "$obj/test_discdrive.elf")
 echo "$out"
 grep -q "^ALL PASSED" <<<"$out"

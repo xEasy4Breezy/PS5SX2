@@ -593,8 +593,9 @@ std::string DescribeImage(const std::string& image_path)
 bool IsDiscImageName(const char* name)
 {
 	// 2026-10-08: .bin and .img too (raw CD images or plain ISOs under another name; PCSX2 reads both, VMManager.cpp's list).
+	// 2.11: no .elf any more (testers: PS5 payloads and PS2 executables lying in a games folder cluttered the shelf).
 	return HasExtension(name, ".iso") || HasExtension(name, ".chd") || HasExtension(name, ".cso") || HasExtension(name, ".zso") ||
-		   HasExtension(name, ".bin") || HasExtension(name, ".img") || IsElfName(name);
+		   HasExtension(name, ".bin") || HasExtension(name, ".img");
 }
 
 bool IsElfName(const char* name)
@@ -1075,18 +1076,7 @@ void ScanDir(const std::string& dir, std::vector<GameInfo>& games, std::vector<s
 		struct stat st = {};
 		if (stat(g.path.c_str(), &st) != 0 || !S_ISREG(st.st_mode))
 			continue;
-		// 2026-10-08: an .elf is listed when it is one (its first bytes "\x7fELF"): homebrew, or a game's executable that runs
-		// with a disc (the sheet's Disc image row; main-boot.cpp boots it as PCSX2 boots an ELF).
-		if (IsElfName(file.c_str()))
-		{
-			char magic[4] = {};
-			const int fd = open(g.path.c_str(), O_RDONLY);
-			const bool elf = fd >= 0 && read(fd, magic, sizeof(magic)) == 4 && std::memcmp(magic, "\x7f" "ELF", 4) == 0;
-			if (fd >= 0)
-				close(fd);
-			if (!elf)
-				continue;
-		}
+		// 2.11: an .elf is not listed (IsDiscImageName leaves it out above). 2026-10-08 to 2.10 listed the ones that were ELF files.
 		// 2026-10-08: a .bin or .img under 16 MB is no PS2 disc (a BIOS dump, a memory card), and one without an ISO 9660
 		// volume in any sector layout is no data disc (the audio tracks of a .cue/.bin set, "Game (Track 2).bin"): not listed.
 		std::string cached_serial;
@@ -1116,13 +1106,13 @@ void ScanDir(const std::string& dir, std::vector<GameInfo>& games, std::vector<s
 }
 } // namespace
 
-std::vector<GameInfo> ScanGames(const std::vector<std::string>& dirs)
+std::vector<GameInfo> ScanGames(const std::vector<std::string>& dirs, bool subfolders)
 {
 	std::vector<GameInfo> games;
 	for (const std::string& dir : dirs)
 	{
 		std::vector<std::string> subdirs;
-		ScanDir(dir, games, &subdirs);
+		ScanDir(dir, games, subfolders ? &subdirs : nullptr);
 		std::sort(subdirs.begin(), subdirs.end());
 		for (const std::string& sub : subdirs)
 			ScanDir(dir + "/" + sub, games, nullptr);

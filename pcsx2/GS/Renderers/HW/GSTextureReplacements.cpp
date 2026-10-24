@@ -408,9 +408,9 @@ std::optional<TextureName> GSTextureReplacements::ParseReplacementName(const std
 }
 
 #ifdef ORBIS_VULKAN
-// vk-285-113: a game's texture pack outside /data/PCSX2/textures: on a USB drive, or where the PS5SX2/TexturesDir
-// setting says (main-boot.cpp, orbis-shims/OrbisTextureRoots.h). Found again at each ReloadReplacementMap; empty: the
-// pack, if there is one, is in the textures folder.
+// vk-285-113: a game's texture pack outside /data/PCSX2/textures: on a USB drive (main-boot.cpp, orbis-shims/OrbisTextureRoots.h).
+// 2026-10-16: with PS5SX2/TexturesDir set, EmuFolders::Textures is that folder and no drive is looked in. Found again at each
+// ReloadReplacementMap; empty: the pack, if there is one, is in the textures folder.
 extern std::string OrbisTexturesGameDir(const std::string& serial, std::string& how);
 static std::string s_orbis_game_dir;
 #endif

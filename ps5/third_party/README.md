@@ -32,6 +32,11 @@ to the releases:
   SDK's toolchain (`prospero-cmake`, every optional library off), plus zlib switched on at its end (the inflate
   above), or `config_linux.h`, the same build on Linux for the PC preview (`ps5/frontend/host`). The official unrar
   code is not used: its licence doesn't allow combining it with GPL code. Needs proper testing on more packs.
+  libarchive has NO 7z reader here (no liblzma): the 192 `.7z` packs of the community's Google Drive folder are read by
+  `ps5/frontend/fe_sevenzip.c` (b176, AI-assisted) with the LZMA SDK that is already in `3rdparty/lzma` (26.02, public
+  domain; nothing new is vendored): `Makefile.vk` builds 13 more of its files (`SZ7_CSRCS`: 7zArcIn, 7zBuf, 7zCrc, 7zCrcOpt,
+  7zDec, 7zStream, Bcj2, Bra, Bra86, BraIA64, CpuArch, Delta, Lzma2Dec; LzmaDec.c is in `CHD_CSRCS`). It decodes one solid block
+  at a time as a stream (a refresh of the SDK needs `ps5/frontend/host/test-sevenzip.sh` again: the corpus, the fuzz, the memory bounds).
 
 - **mbedtls** (2026-10-05, AI-assisted): the frontend's own HTTPS (`ps5/frontend/fe_https.cpp`), which the texture
   pack downloads and RetroAchievements (`ps5/coreorbis/orbis-shims/ProsperoHTTPConsole.cpp`) use. After the jailbreak the console's libSceSsl can't reach its certificate store, and with roots
@@ -53,4 +58,4 @@ to the releases:
   SIGPIPE handler off); `config_linux.h` is the same build on Linux, for `ps5/coreorbis/tests/nfs/test-nfs.sh`. No
   Kerberos, no TLS, no NLM/NSM/rquota.
 
-`ps5/coreorbis/Makefile.vk` builds them (`CHD_CSRCS`, `LZ4_CSRCS`, `LIBARCHIVE_CSRCS`, `MBEDTLS_CSRCS`, `NFS_CSRCS`).
+`ps5/coreorbis/Makefile.vk` builds them (`CHD_CSRCS`, `LZ4_CSRCS`, `LIBARCHIVE_CSRCS`, `MBEDTLS_CSRCS`, `NFS_CSRCS`, and `SZ7_CSRCS` from `3rdparty/lzma`).

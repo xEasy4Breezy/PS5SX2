@@ -1,7 +1,7 @@
 #version 450
 #extension GL_GOOGLE_include_directive : require
 // PS5 port frontend: a PS2 case: the cover under a glossy sleeve on the front, the spine on the
-// left, black plastic elsewhere. Reflections (p0.z = 1) fade out below the floor.
+// left, the back cover under a sleeve on the back (2.11), black plastic elsewhere. Reflections (p0.z = 1) fade out below the floor.
 // Copyright (C) 2026 swordpdf
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "common.glsl"
@@ -18,6 +18,7 @@ layout(push_constant) uniform Push
 layout(set = 1, binding = 0) uniform sampler2D u_cover;
 layout(set = 1, binding = 1) uniform sampler2D u_placeholder;
 layout(set = 1, binding = 2) uniform sampler2D u_spine;
+layout(set = 1, binding = 3) uniform sampler2D u_back; // 2.11: the back cover (or a painted back), seen when the case is turned over
 
 layout(location = 0) in vec3 v_world;
 layout(location = 1) in vec3 v_normal;
@@ -39,6 +40,7 @@ void main()
 	vec3 cover = texture(u_cover, v_uv).rgb;
 	vec3 hold = texture(u_placeholder, v_uv).rgb;
 	vec3 spine = texture(u_spine, v_uv).rgb;
+	vec3 back = texture(u_back, v_uv).rgb;
 
 	vec3 base;
 	float gloss;
@@ -54,8 +56,8 @@ void main()
 	}
 	else if (v_face == 1)
 	{
-		base = vec3(0.030, 0.030, 0.036);
-		gloss = 0.6;
+		base = back; // 2.11: was black plastic
+		gloss = 1.0;
 	}
 	else
 	{

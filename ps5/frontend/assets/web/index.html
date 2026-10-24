@@ -61,6 +61,10 @@ header { display: flex; align-items: flex-start; justify-content: space-between;
 .discrow { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; align-items: center; }
 .discrow .pick { max-width: 100%; flex: 1 1 220px; }
 .discrow.hide { display: none; }
+/* 2.11: the shelf search box */
+.shelfsearch { margin: 0 0 14px; }
+.shelfsearch input { width: 100%; box-sizing: border-box; padding: 12px 16px 12px 44px; border-radius: 999px; border: 1px solid var(--line, rgba(255,255,255,.14)); background: rgba(255,255,255,.06) url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='18' height='18' viewBox='0 0 24 24' fill='none' stroke='%23b8b4d0' stroke-width='2.4' stroke-linecap='round'><circle cx='10.5' cy='10.5' r='6.5'/><path d='M15.5 15.5 21 21'/></svg>") no-repeat 16px 50%; color: inherit; font: inherit; }
+.shelfsearch input:focus { outline: none; border-color: rgba(160,140,255,.7); }
 /* Now playing */
 .now { margin-top: 22px; display: none; align-items: center; gap: 14px; padding: 12px; border-radius: 16px;
        background: var(--card); border: 1px solid var(--card-line); }
@@ -247,6 +251,7 @@ footer a { color: var(--dim); }
       </div>
     </div>
 
+    <div class="shelfsearch"><input id="shelfsearch" type="search" maxlength="64" autocomplete="off" placeholder="Search the console's shelf (title, serial, region)" aria-label="Search the games on the console's shelf"></div>
     <div class="flow-wrap"><div class="flow" id="flow"></div></div>
     <div class="gametitle" id="gtitle"></div>
     <div class="gameinfo" id="ginfo"></div>
@@ -273,7 +278,7 @@ footer a { color: var(--dim); }
   <footer>
     <div><b style="color:var(--dim)">PS5SX2</b> · PCSX2 for jailbroken PS5 · by swordpdf · <span id="build"></span></div>
     <div>Based on PCSX2 (GPL-3.0-or-later). Not affiliated with or endorsed by the PCSX2 team or Sony Interactive Entertainment.</div>
-    <div>Icons: Font Awesome Free (CC BY 4.0). Covers: xlenore/ps2-covers.</div>
+    <div>Icons: Font Awesome Free (CC BY 4.0). Covers: xlenore/ps2-covers and the <a href="https://gamesdb.launchbox-app.com" target="_blank" rel="noopener">LaunchBox Games Database</a> (box fronts, backs, spines and discs, fetched one at a time and kept on the console).</div>
   </footer>
 </div>
 <div class="toast" id="toast"></div>
@@ -315,9 +320,12 @@ const GROUPS = [
   // tab's first group, as on the shelf's sheet (swordpdf looked for them at the bottom); the sheet picks these folders with its
   // own picker (fe_app.cpp), the overlays folder is typed here only.
   { title: "Folders", global: true, items: [
-    { key: "PS5SX2/GameFolders", label: "More game folders", type: "text", def: "", restart: true, later: "the game folders",
+    // 2026-10-16 (AI-assisted; swordpdf, a tester: "it should only show isos and etc in the folder the user sets", "do not scan default paths
+    // if custom path set"): the folders set here are the only ones games are listed from (and the BIOS folder the only BIOS place, the
+    // textures folder the only textures place). Empty = the usual places. Scan USB drives and Scan subfolders are the sheet's switches too.
+    { key: "PS5SX2/GameFolders", label: "Game folders", type: "text", def: "", restart: true, later: "the game folders",
       placeholder: "/mnt/ext1/PS2;/mnt/usb0/My games",
-      hint: "Folders to list games from, separated by ; (and the folders inside each, one level down). PS5SX2 already looks in /data/PCSX2/games, /data/PCSX2 and every USB, extended storage and M.2 drive (their root, games/, PS2/... and PCSX2/games/). Read when PS5SX2 starts." },
+      hint: "Folders to list games from, separated by ; (and the folders inside each, one level down). When set, ONLY these folders (and NFS shares) are listed: /data/PCSX2/games, /data/PCSX2 and the drives are not looked through. Empty: PS5SX2 looks in /data/PCSX2/games, /data/PCSX2 and every USB, extended storage and M.2 drive (their root, games/, PS2/... and PCSX2/games/). Read when PS5SX2 starts." },
     // 2026-10-08: the overlay pictures' folder (PS5SX2/Bezel), read live.
     { key: "PS5SX2/BezelDir", label: "Overlays folder", type: "text", def: "", placeholder: "/mnt/usb0/PS2/overlays",
       hint: "Optional: where the overlay pictures are looked for first (<game serial>.png, default.png), before /data/PCSX2/overlays." },
@@ -328,7 +336,15 @@ const GROUPS = [
       hint: "Games on a PC or NAS shared over NFS: nfs:// addresses separated by ; (the server, then the shared folder or a folder in it). NFS v3 (Windows: WinNFSd or haneWIN; Linux, Synology, QNAP, TrueNAS), else v4. Add ?version=4, ?nfsport=2049&mountport=1058 or ?uid=1000&gid=1000 when the server needs them. Read-only. Mounted when PS5SX2 starts; boot.log says how it went." },
     { key: "PS5SX2/BiosFolder", label: "BIOS folder", type: "text", def: "", restart: true, later: "the BIOS folder",
       placeholder: "/mnt/ext1/PS2/bios",
-      hint: "Where to look for the BIOS first. Without it: /data/PCSX2/bios, then /data/PCSX2 and the drives' bios/ and PCSX2/bios/ folders. Read when PS5SX2 starts." },
+      hint: "The only folder (and the folders inside it) the BIOS is looked for in. Empty: /data/PCSX2/bios, then /data/PCSX2 and the drives' bios/ and PCSX2/bios/ folders. Read when PS5SX2 starts." },
+    // 2026-10-16: was a per-game box in Graphics that only added a first look-up; now the textures folder itself, for all games.
+    { key: "PS5SX2/TexturesDir", label: "Textures folder", type: "text", def: "", restart: true, later: "the textures folder",
+      placeholder: "/mnt/usb0/PS2/textures",
+      hint: "Texture packs are read from, and HD packs installed into, <this folder>/<game serial>/replacements. Empty: /data/PCSX2/textures (a USB drive's PS5SX2/textures folder is tried first). Read when PS5SX2 starts." },
+    { key: "PS5SX2/ScanUsb", label: "Scan USB drives", type: "toggle", def: "true", short: "USB scan %", restart: true, later: "the USB scan",
+      hint: "On: games and the BIOS are also looked for on every USB, extended storage and M.2 drive (/mnt/usb0-7, /mnt/ext0-1) when no game folder or BIOS folder is set. Off: not for games or the BIOS (texture packs on a drive are still found). A folder you add yourself, on a drive too, is still used. Read when PS5SX2 starts." },
+    { key: "PS5SX2/ScanSubfolders", label: "Scan subfolders", type: "toggle", def: "true", short: "Subfolders %", restart: true, later: "the subfolder scan",
+      hint: "On: each games folder is listed together with the folders inside it, one level down. Off: only the disc images directly in the folder itself. Read when PS5SX2 starts." },
   ]},
   // vk-285-137 (AI-assisted; swordpdf: "add an option to hide games from the shelf"): a game off the shelf (its own file only;
   // fe_games.cpp ReadBadges), and the switch for all games that puts hidden games back on it, dimmed. The sheet has the
@@ -359,7 +375,7 @@ const GROUPS = [
       hint: "How the picture reaches the TV. FSR sharpens the upscale; CRT is a curved tube with beam lines; Scanlines draws a thin dark line between the 480 lines; VHS soft and VHS look like a tape (VHS: a worn one that wobbles)." },
     // 2026-10-08 (AI-assisted): frame generation (GSDeviceVK.cpp), read when the game starts.
     { key: "PS5SX2/FrameGeneration", label: "Frame generation", type: "toggle", def: "false", short: "Frame gen %", restart: true,
-      hint: "Shows a frame made between two of the game's: a 60 fps game at 120 on a TV that takes 120 Hz (the TV switches to 120 Hz for the game), a 30 fps game at 60. Only while the game holds its frame rate (an uneven one shows the game's own frames); the FPS box then counts what the TV gets. A little more input lag, and small smears at the edges of fast movement. Experimental. Takes effect when the game starts." },
+      hint: "Shows a frame made between two of the game's: a 60 fps game at 120, a PAL game at 50 fps at 100 (the TV switches to 120 Hz for the game), a 30 fps game at 60. The 120 Hz output needs a TV that takes it and the PS5's Settings > Screen and Video > Video Output with 120 Hz Output on and a resolution of Automatic or 4K (at 1080p the console refuses it). On a 60 Hz output, or where this build cannot switch to 120 Hz, only games at 30 fps or less (25 for PAL) get frames. Only while the game holds its frame rate (an uneven one shows the game's own frames); the FPS box then counts what the TV gets. A little more input lag, and small smears at the edges of fast movement. Experimental. Takes effect when the game starts." },
   ]},
   { title: "Graphics", items: [
     { key: "PS5SX2/Renderer", label: "Renderer", type: "seg", def: "Hardware", short: "%", restart: true,
@@ -375,10 +391,7 @@ const GROUPS = [
       hint: "Higher fixes more effects and costs speed. Full and Max are left out for now: Max hung the GPU in Ratchet & Clank." },
     { key: "hw_mipmap", label: "Mipmapping", type: "toggle", def: "true", short: "Mipmaps %" },
     { key: "LoadTextureReplacements", label: "Texture replacements", type: "toggle", def: "false", short: "Replacements %",
-      hint: "Loads a texture pack's PNG and DDS files from <game serial>/replacements/ in a USB drive's PS5SX2/textures (or textures) folder, else in /data/PCSX2/textures. DDS (DXT1 to DXT5, BC7 or uncompressed) is unpacked by the CPU as a game asks for it." },
-    { key: "PS5SX2/TexturesDir", label: "Textures folder", type: "text", def: "", restart: true, later: "the textures folder",
-      placeholder: "/mnt/usb0/PS2/textures",
-      hint: "Optional: a folder that holds <game serial>/replacements/, when the pack isn't in one of the places above." },
+      hint: "Loads a texture pack's PNG and DDS files from <game serial>/replacements/ in a USB drive's PS5SX2/textures (or textures) folder, else in /data/PCSX2/textures. The Textures folder (Folders, all games) names the one folder to read from instead. DDS (DXT1 to DXT5, BC7 or uncompressed) is unpacked by the CPU as a game asks for it." },
   ]},
   { title: "Performance", items: [
     { key: "EmuCore/Speedhacks/EECycleRate", label: "EE cycle rate", type: "seg", def: "0", short: "EE %",
@@ -572,6 +585,7 @@ let tab = "settings";    // vk-285-116: the tab shown, "settings" or "controls" 
 try { const saved = localStorage.getItem("ps5sx2.tab"); if (["controls", "achievements"].includes(saved)) tab = saved; } catch (e) {}
 let achievementData = null, achievementLoading = false, achievementPage = 0, achievementFilter = "all";
 let achievementImageGeneration = 0;
+let tileInfo = null, tileTimer = 0; // 2.12: the shown game's home screen tile (/api/tile), and the re-poll while it is busy
 
 // vk-285-118: no key any more: the console's address is enough (fe_web.cpp refuses other sites' requests instead). An old
 // bookmark's ?t= is dropped from the address bar.
@@ -661,6 +675,7 @@ function onScroll() {
 // ---- A game's settings.
 async function select(id) {
   current = id;
+  tileInfo = null; clearTimeout(tileTimer); tileTimer = 0; // 2.12: the previous game's answer must not flash
   pending.clear();
   clearTimeout(recArmed); recArmed = 0;
   clearTimeout(ctlArmed); ctlArmed = 0;
@@ -682,6 +697,7 @@ async function select(id) {
     data = await api("/api/settings?id=" + encodeURIComponent(id));
     if (current === id) render();
     loadCards(); // vk-285-113: the list may have changed (a card copied in); it draws again only when it has
+    loadTile(); // 2.12: the game's home screen tile
   } catch (e) { toast("Couldn't load the settings: " + e.message); }
 }
 
@@ -944,6 +960,7 @@ function render() {
       }
     }
     html += "</div></div>";
+    if (grp.title === "Shelf" && grp.game && !isGlobal && tab === "settings") html += tileHtml(); // 2.12: the game's home screen tile, right under Shelf
   }
   if (tab === "controls") {
     // vk-285-116: every control of this file back to what it follows (two taps).
@@ -993,6 +1010,7 @@ function render() {
   $("settings").querySelectorAll("[data-pickkey]").forEach((el) => el.addEventListener("change", () => change(el.dataset.pickkey, el.value)));
   $("settings").querySelectorAll("[data-elfdisc]").forEach((el) => el.addEventListener("change", () => change("PS5SX2/ElfDisc", el.value || null)));
   $("settings").querySelectorAll("[data-cheatdisc]").forEach((el) => el.addEventListener("change", () => change("PS5SX2/CheatDisc", el.value || null)));
+  $("settings").querySelectorAll("[data-tile]").forEach((b) => b.addEventListener("click", () => tileAct(b.dataset.tile)));
   $("settings").querySelectorAll("[data-mcd]").forEach((el) => el.addEventListener("change", () => mcdChoose(SLOTS[+el.dataset.mcd - 1], el.value)));
   $("settings").querySelectorAll("[data-mcdreset]").forEach((b) => b.addEventListener("click", () => mcdChoose(SLOTS[+b.dataset.mcdreset - 1], "")));
   $("settings").querySelectorAll("[data-mcdsize]").forEach((b) => b.addEventListener("click", () => { mcdSize = +b.dataset.mcdsize; render(); }));
@@ -1079,6 +1097,44 @@ function mcdChoose(s, v) {
   if (v === "@none") { change(s.file, null); change(s.on, "false"); return; }
   change(s.file, v);
   if (!truthy(effective({ key: s.on, def: "true" }).v)) change(s.on, "true");
+}
+// ---- 2.12: the game's tile on the PS5 home screen (the shelf's "Home screen tile" row; the words come from the console, so the sheet and this page say the same).
+// /api/tile answers {"available":false} when game tiles are off (flags/gametiles) or the game is no plain image file; the row is not drawn then.
+async function loadTile() {
+  clearTimeout(tileTimer); tileTimer = 0;
+  if (!current || current === "@global" || tab !== "settings") return;
+  const id = current;
+  try {
+    const t = await api("/api/tile?id=" + encodeURIComponent(id));
+    if (current !== id) return;
+    t.id = id;
+    const changed = JSON.stringify(t) !== JSON.stringify(tileInfo);
+    tileInfo = t;
+    if (changed && data) render();
+    if (t.available && t.busy) tileTimer = setTimeout(loadTile, 1500);
+  } catch (e) { /* the row stays as it was */ }
+}
+async function tileAct(op) {
+  const id = current;
+  if (!id || id === "@global") return;
+  try {
+    const t = await api("/api/tile", { method: "POST", body: op + "\n" + id, headers: { "Content-Type": "text/plain" } });
+    if (current !== id) return;
+    t.id = id;
+    tileInfo = t;
+    if (data) render();
+    clearTimeout(tileTimer); tileTimer = setTimeout(loadTile, 1500);
+  } catch (e) { toast("Home screen tile: " + e.message); loadTile(); }
+}
+function tileHtml() {
+  const t = tileInfo;
+  if (!t || t.id !== current || !t.available) return "";
+  const can = t.busy ? "none" : t.can;
+  const label = t.busy ? "Working…" : can === "remove" ? "Remove from home screen" : "Add to home screen";
+  return '<div class="sec"><h2>Home screen</h2><div class="card"><div class="row prow"><div class="pl"><div class="label">Home screen tile</div>' +
+    '<div class="from" style="margin-top:2px">' + esc(t.value) + '</div><div class="hint">' + esc(t.help) + "</div></div>" +
+    '<button class="btn primary" style="flex:0 0 auto;max-width:46%" data-tile="' + (can === "remove" ? "remove" : "add") + '"' + (can === "none" ? " disabled" : "") + ">" +
+    label + "</button></div></div></div>";
 }
 async function mcdCreate() {
   const name = mcdName.trim();
@@ -1201,11 +1257,25 @@ $("discbtn").addEventListener("click", async () => {
   } catch (e) { toast(e.message); }
 });
 
+// 2.11: the search box narrows the shelf on the console as it is typed (a quarter of a second after the last key).
+let searchTimer = 0, searchSent = "";
+$("shelfsearch").addEventListener("input", () => {
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(async () => {
+    const v = $("shelfsearch").value.trim();
+    searchSent = v;
+    try { await api("/api/search", { method: "POST", headers: { "Content-Type": "text/plain" }, body: v }); }
+    catch (e) { toast("The console didn't answer"); }
+  }, 250);
+});
+
 async function refreshState() {
   try {
     const s = await api("/api/state");
     const changed = JSON.stringify(s.playing) !== JSON.stringify(state.playing);
     state = s;
+    // 2.11: the console's shelf search, shown in the box unless it is being typed in
+    if (typeof s.search === "string" && document.activeElement !== $("shelfsearch") && s.search !== searchSent) { $("shelfsearch").value = s.search; searchSent = s.search; }
     applyAchievementLanguage();
     $("build").textContent = s.build;
     if (s.playing) { $("now").classList.add("show"); $("nowtitle").textContent = s.playing.title; $("nowcover").src = cover(s.playing.id); }
@@ -1231,6 +1301,7 @@ document.querySelectorAll("#tabs button").forEach((b) => b.addEventListener("cli
   clearTimeout(ctlArmed); ctlArmed = 0;
   showTab();
   if (data) render();
+  if (tab === "settings") loadTile(); // 2.12
   if (tab === "achievements") refreshAchievements(true);
 }));
 showTab();

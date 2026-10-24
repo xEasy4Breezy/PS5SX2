@@ -85,6 +85,12 @@ namespace fe
 		// From another thread: fails the request in flight with kAborted. The next request starts normally.
 		void Abort();
 
+		// 2.11: what the last answer (the last redirect's) said about the file: its whole size (a 206's Content-Range total, a
+		// 200's Content-Length; 0 when it said none) and its Content-Type in lower case ("application/octet-stream",
+		// "text/html; charset=utf-8" for a page where a file was asked). Read right after Get returns.
+		uint64_t LastTotal();
+		std::string LastContentType();
+
 		// The User-Agent header (Get's and Request's).
 		std::string user_agent = "PS5SX2/1.0";
 

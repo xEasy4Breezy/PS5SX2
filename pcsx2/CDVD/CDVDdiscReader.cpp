@@ -10,6 +10,7 @@
 
 #include "fmt/format.h"
 
+#include <chrono>
 #include <condition_variable>
 #include <mutex>
 #include <thread>
@@ -118,6 +119,12 @@ std::atomic<bool> s_keepalive_is_open;
 bool disc_has_changed = false;
 bool weAreInNewDiskCB = false;
 
+// PS5SX2 (2.11, switch file discasync, off; CDVD.cpp's cdvdReadInterrupt has the other half): g_cdvd_async_enabled says the disc source was opened with
+// the switch file; g_cdvd_async_ok is true only while cdvdReadInterrupt is inside its own DoCDVDgetBuffer call, the only place that can take a -2 ("not
+// yet, ask again") and re-arm its interrupt. Nothing else that reads the disc buffer (PS1 mode, any other caller) ever gets -2.
+bool g_cdvd_async_enabled = false;
+bool g_cdvd_async_ok = false;
+
 std::unique_ptr<IOCtlSrc> src;
 
 extern u32 g_last_sector_block_lsn;
@@ -137,6 +144,16 @@ static void keepAliveThread()
 	{
 
 		//printf(" * keepAliveThread: polling drive.\n");
+#ifdef __PROSPERO__
+		// PS5SX2 (2.11): a read that really reached the drive in the last 20 s keeps it spinning already; the extra sector read here costs a seek away
+		// from where the CDVD thread is reading (OrbisIOCtlSrc.cpp: the time of the last read that went to the drive, not of one the windows served).
+		{
+			const s64 last = OrbisDiscLastReadMs();
+			const s64 now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+			if (last >= 0 && now >= last && now - last < 20000)
+				continue;
+		}
+#endif
 		if (src->GetMediaType() >= 0)
 			src->ReadSectors2048(g_last_sector_block_lsn, 1, throwaway);
 		else
@@ -191,6 +208,7 @@ static bool DISCopen(std::string filename, Error* error)
 	//setup threading manager
 	cdvdStartThread();
 	StartKeepAliveThread();
+	g_cdvd_async_enabled = cdvdAsyncOn();
 
 	cdvdRefreshData();
 	return true;
@@ -204,6 +222,7 @@ static bool DISCprecache(ProgressCallback* progress, Error* error)
 
 static void DISCclose()
 {
+	g_cdvd_async_enabled = false;
 	StopKeepAliveThread();
 	cdvdStopThread();
 	//close device
@@ -256,6 +275,16 @@ static s32 DISCgetBuffer(u8* dest)
 		lastReadInNewDiskCB = 0;
 
 		memcpy(dest, directReadSectorBuffer, csize);
+		return 0;
+	}
+
+	if (g_cdvd_async_ok && g_cdvd_async_enabled)
+	{
+		// PS5SX2 (switch file discasync): the block may not be here yet; -2 tells cdvdReadInterrupt to come back (it keeps the emulation running meanwhile)
+		u8* data = nullptr;
+		if (cdvdTryGetSector(csector, cmode, &data) == -2)
+			return -2;
+		memcpy(dest, data, csize);
 		return 0;
 	}
 

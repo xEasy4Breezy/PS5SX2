@@ -626,6 +626,10 @@ public:
 		float shader_time, Filter filter, u32 vsyncs, u32 already, double ps2_hz, float speed, bool nominal);
 	void OrbisFrameGenDraw();
 	void OrbisFrameGenRelease();
+	// 2.11: a vsync that never reached OrbisFrameGenRecord (kind 0 skipped presenting because the picture repeated the game's last frame,
+	// 1 a blank picture, 2 not a new frame of the game, 3 skipped by the present throttle), counted for the "[fg] status" line, which is
+	// printed from here too when its 10 s are over (ps5/coreorbis/orbis-shims/OrbisFrameGenGate.h).
+	void OrbisFrameGenNote(u32 kind, double ps2_hz, float speed);
 	// vk-285-94: the GPU profiler (flags/gpuprof; GSDeviceVK.cpp). OrbisGpSecond once a second on the GS thread.
 	void OrbisGpSecond();
 	void OrbisGpDestroy();

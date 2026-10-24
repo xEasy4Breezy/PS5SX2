@@ -208,6 +208,10 @@ namespace fe
 		int64_t deadline = 0; // the request's total limit (NowMs), or 0
 		int io_ms = 30000; // the limit for each wait for data
 		std::set<std::string> hosts_seen; // the TLS line once per server
+		// 2.11: what the last answer said about the file (HttpsClient::LastTotal, LastContentType): the whole size from a
+		// 206's Content-Range ("bytes 0-0/647631664") or a 200's Content-Length, and the Content-Type in lower case.
+		uint64_t last_total = 0;
+		std::string last_type;
 
 		// The socket's reads, buffered: mbedTLS asks for a record's 5-byte header, then its body.
 		std::vector<unsigned char> sock_buf = std::vector<unsigned char>(64 * 1024);
@@ -605,8 +609,10 @@ namespace fe
 			}
 
 			// The header lines this needs.
-			bool chunked = false, have_length = false, have_range = false;
-			uint64_t content_length = 0, range_start = 0;
+			bool chunked = false, have_length = false, have_range = false, have_total = false;
+			uint64_t content_length = 0, range_start = 0, range_total = 0;
+			last_total = 0;
+			last_type.clear();
 			size_t line_start = head.find("\r\n") + 2;
 			while (line_start < head.size())
 			{
@@ -626,6 +632,8 @@ namespace fe
 					have_length = ParseU64(value, content_length);
 				else if (name == "location")
 					location = value;
+				else if (name == "content-type")
+					last_type = Lower(value);
 				else if (name == "content-range")
 				{
 					// "bytes 33554432-67108863/876873405"
@@ -635,9 +643,16 @@ namespace fe
 						const size_t dash = v.find('-', 6);
 						if (dash != std::string::npos)
 							have_range = ParseU64(v.substr(6, dash - 6), range_start);
+						const size_t slash = v.find('/', 6);
+						if (slash != std::string::npos)
+							have_total = ParseU64(v.substr(slash + 1), range_total);
 					}
 				}
 			}
+			if (status == 206 && have_total)
+				last_total = range_total;
+			else if (status == 200 && have_length)
+				last_total = content_length;
 
 			if (spec.follow_redirects && (status == 301 || status == 302 || status == 303 || status == 307 || status == 308) && !location.empty())
 				return status;
@@ -719,6 +734,18 @@ namespace fe
 	}
 
 	HttpsClient::~HttpsClient() = default;
+
+	uint64_t HttpsClient::LastTotal()
+	{
+		std::lock_guard<std::mutex> lock(m->request_mutex);
+		return m->last_total;
+	}
+
+	std::string HttpsClient::LastContentType()
+	{
+		std::lock_guard<std::mutex> lock(m->request_mutex);
+		return m->last_type;
+	}
 
 	bool HttpsClient::Init(std::string& error)
 	{

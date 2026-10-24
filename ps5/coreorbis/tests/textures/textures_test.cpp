@@ -80,6 +80,18 @@ int main()
 	Check(OrbisTextures::FindGameDir({}, "", "SLUS-20265", &how).empty(), "no drives, no setting");
 	Check(OrbisTextures::FindGameDir({mnt + "/usb9"}, "/nonexistent/folder", "SLUS-20265", &how).empty(), "folders that aren't there");
 
+	// 2026-10-16: the textures folder the player set is the only place (FindGameDirOnly): <it>/<serial> in any case, never a drive
+	MkDirs(root + "/mine/slus-20265/Replacements");
+	how.clear();
+	Check(OrbisTextures::FindGameDirOnly(root + "/mine", "SLUS-20265", &how) == root + "/mine/slus-20265" && !how.empty(), "set folder: <dir>/<serial> in any case, and it says which rule found it");
+	Check(OrbisTextures::FindGameDirOnly(root + "/manual", "SLUS-20265", &how) == root + "/manual/SLUS-20265", "set folder: the exact name");
+	Check(OrbisTextures::FindGameDirOnly(root + "/mine", "SLUS-20072", &how).empty(),
+		"set folder without this game: nothing, even though a USB drive holds the pack (" + OrbisTextures::FindGameDir(drives, "", "SLUS-20072") + ")");
+	Check(!OrbisTextures::FindGameDir(drives, "", "SLUS-20072").empty(), "...while the old lookup (unset) still finds that drive pack");
+	Check(OrbisTextures::FindGameDirOnly(root + "/mine", "", &how).empty(), "set folder, no serial: nothing");
+	Check(OrbisTextures::FindGameDirOnly("", "SLUS-20265", &how).empty(), "no folder: nothing");
+	Check(OrbisTextures::FindGameDirOnly("/nonexistent/folder", "SLUS-20265", &how).empty(), "set folder that isn't there: nothing");
+
 	std::string cmd = "rm -rf '" + root + "'";
 	if (g_fails == 0)
 		(void)!system(cmd.c_str());

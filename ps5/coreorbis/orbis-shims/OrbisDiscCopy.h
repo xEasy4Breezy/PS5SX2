@@ -37,17 +37,21 @@ namespace orbis_disc
 		std::string why;          // when failed
 	};
 
-	// Copies `bytes` (a multiple of 2048, as a disc is) from the start of the source.
+	// Copies `bytes` (a multiple of 2048, as a disc is) from the start of the source (2.11: or from `start`, a copy cut short taken up again).
 	//   read(offset, buf, len) -> ssize_t, like pread (offset and len are whole 2048-byte sectors)
 	//   write(buf, len) -> bool
 	//   progress(done_bytes, bad_sectors), after each chunk is written
 	//   bad(sector), for each sector that couldn't be read (the caller logs the first few)
 	// `chunk`: bytes per read (a multiple of 2048); `depth`: how many chunks may be read ahead of the writing.
 	template <class Read, class Write, class Progress, class Bad>
-	CopyResult Copy(uint64_t bytes, size_t chunk, int depth, int tries, uint64_t max_bad, Read read, Write write,
-		Progress progress, Bad bad)
+	CopyResult CopyFrom(uint64_t start, uint64_t start_bad, uint64_t bytes, size_t chunk, int depth, int tries, uint64_t max_bad, Read read,
+	Write write, Progress progress, Bad bad)
 	{
-		CopyResult r;
+	CopyResult r;
+	// 2.11 (swordpdf: the copy dies when the app restarts, "start a game, and go back"): carrying on from `start` bytes (whole sectors; the first
+	// `start_bad` sectors already written as zeros are counted, not read again). `done` and the progress count from there.
+	start = std::min<uint64_t>(start / 2048 * 2048, bytes);
+	r.done = start;
 		chunk = std::max<size_t>(2048, chunk / 2048 * 2048);
 		depth = std::max(2, depth);
 		tries = std::max(1, tries);
@@ -64,10 +68,10 @@ namespace orbis_disc
 		std::condition_variable cv;
 		bool stop = false, read_failed = false;
 		std::string read_why;
-		std::atomic<uint64_t> bad_total{0};
+		std::atomic<uint64_t> bad_total{start_bad};
 
 		std::thread reader([&] {
-			uint64_t off = 0;
+			uint64_t off = start;
 			for (size_t i = 0; off < bytes; i++)
 			{
 				Slot& s = slots[i % slots.size()];
@@ -151,4 +155,9 @@ namespace orbis_disc
 		}
 		return r;
 	}
+template <class Read, class Write, class Progress, class Bad>
+CopyResult Copy(uint64_t bytes, size_t chunk, int depth, int tries, uint64_t max_bad, Read read, Write write, Progress progress, Bad bad)
+{
+return CopyFrom(0, 0, bytes, chunk, depth, tries, max_bad, read, write, progress, bad);
+}
 } // namespace orbis_disc

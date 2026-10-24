@@ -1,0 +1,1742 @@
+{
+ "SLPM-61035": {
+  "identity": "same",
+  "box": "different",
+  "note": "Trial/demo disc (taikenban) of Anubis ZoE; the LaunchBox box is the full retail release, not the trial disc packaging.",
+  "launchbox": "Zone of the Enders: The 2nd Runner",
+  "gameindex": [
+   "Anubis - Zone of the Enders [Trial]"
+  ],
+  "class": "t2"
+ },
+ "SLES-53640": {
+  "identity": "different",
+  "box": "different",
+  "note": "German football quiz (Das Grosse deutsche Fussball-Quiz) is a separate regional product from The Great British Football Quiz, with its own box and content.",
+  "launchbox": "The Great British Football Quiz",
+  "gameindex": [
+   "The Great German Football Quiz"
+  ],
+  "class": "alt"
+ },
+ "SCES-55419": {
+  "identity": "different",
+  "box": "different",
+  "note": "Buzz! Brain of Oz is the Australian edition and Buzz! Brain of the UK is the UK edition. They have different questions and different boxes, so the cover would be wrong.",
+  "launchbox": "Buzz! Brain of the UK",
+  "gameindex": [
+   "Buzz! Brain of Oz"
+  ],
+  "class": "alt"
+ },
+ "SLPM-61093": {
+  "identity": "same",
+  "box": "different",
+  "note": "Trial/demo disc of Ultraman Fighting Evolution 3; the LaunchBox box is the full retail release, not the trial disc.",
+  "launchbox": "Ultraman Fighting Evolution 3",
+  "gameindex": [
+   "Ultraman Fighting Evolution 3 [Trial]"
+  ],
+  "class": "t2"
+ },
+ "SLAJ-25104": {
+  "identity": "unsure",
+  "box": "different",
+  "note": "Shin Sangoku Musou 5 Special is a separate Japanese release from base Shin Sangoku Musou 5 (Dynasty Warriors 6). I could not confirm that the LaunchBox Dynasty Warriors 6 entry (2008-11-18) corresponds to the Special version, so it may carry the wrong box.",
+  "launchbox": "Dynasty Warriors 6",
+  "gameindex": [
+   "Shin Sangoku Musou 5 Special [Disc 1]"
+  ],
+  "class": "t2"
+ },
+ "SLPS-25961": {
+  "identity": "unsure",
+  "box": "unsure",
+  "note": "GameIndex English name says SEED Rengou vs. Z.A.F.T. but the native name is SEED DESTINY Rengou vs. Z.A.F.T. II Plus (the 30th Anniversary Collection reissue). LaunchBox entry is the 2005 original, so it may be the sequel II Plus instead.",
+  "launchbox": "Kidou Senshi Gundam Seed: Rengou vs. Z.A.F.T.",
+  "gameindex": [
+   "Kidou Senshi Gundam SEED - Rengou vs. Z.A.F.T. [GUNDAM 30th ANNIVERSARY COLLECTION]"
+  ],
+  "class": "t2"
+ },
+ "SLPM-66948": {
+  "identity": "same",
+  "box": "different",
+  "note": "Twin pack of Nobunaga no Yabou Kakushin with Power-Up Kit plus Sangokushi XI with Power-Up Kit; its box is a two-game pack, not the single-game Iron Triangle box.",
+  "launchbox": "Nobunaga's Ambition: Iron Triangle",
+  "gameindex": [
+   "Nobunaga no Yabou - Kakushin [with Power-Up Kit and Sangokushi XI]"
+  ],
+  "class": "t2"
+ },
+ "SLPM-65657": {
+  "identity": "unsure",
+  "box": "unsure",
+  "note": "LaunchBox title is 'Winning Eleven 8 International', a separate release from plain Winning Eleven 8, although the 2004-08-05 date matches the original JP release. Box art may differ.",
+  "launchbox": "World Soccer: Winning Eleven 8 International",
+  "gameindex": [
+   "World Soccer Winning Eleven 8"
+  ],
+  "class": "alt"
+ },
+ "PCPX-96649": {
+  "identity": "different",
+  "box": "different",
+  "note": "Trial/demo disc of Gran Turismo 4, not the retail game. Retail GT4 art would only be a fallback.",
+  "launchbox": "Gran Turismo 4",
+  "gameindex": [
+   "Gran Turismo 4 [Trial]"
+  ],
+  "class": "t2"
+ },
+ "SLPM-61087": {
+  "identity": "different",
+  "box": "different",
+  "note": "Trial/demo disc of Hagane no Renkinjutsushi 2 (Akaki Elixir no Akuma). The LaunchBox entry is the retail Fullmetal Alchemist 2 and its 2004-09-22 date looks early for it.",
+  "launchbox": "Fullmetal Alchemist 2: Curse of the Crimson Elixir",
+  "gameindex": [
+   "Hagane no Renkinjutsushi - Akaki Elixir no Akuma [Trial]"
+  ],
+  "class": "t2"
+ },
+ "PCPX-96312": {
+  "identity": "different",
+  "box": "different",
+  "note": "Autobacs in-store demo disc of Gran Turismo 3 A-Spec, not the retail game. Retail GT3 art would only be a fallback.",
+  "launchbox": "Gran Turismo 3: A-Spec",
+  "gameindex": [
+   "Gran Turismo 3 - A-Spec - Autobacs Tentou Shiyuu Disc"
+  ],
+  "class": "t2"
+ },
+ "PAPX-90511": {
+  "identity": "different",
+  "box": "different",
+  "note": "Trial/demo disc of Siren, not the retail game. Retail Siren art would only be a fallback.",
+  "launchbox": "Siren",
+  "gameindex": [
+   "Siren [Trial]"
+  ],
+  "class": "t2"
+ },
+ "SLED-53977": {
+  "identity": "same",
+  "box": "different",
+  "note": "SLED- is the European demo/preview disc prefix, so this is a Dragon Quest VIII demo-type disc, not the retail box; the retail game is a separate release.",
+  "launchbox": "Dragon Quest VIII: Journey of the Cursed King",
+  "gameindex": [
+   "Dragon Quest - The Journey of the Cursed King"
+  ],
+  "class": "alt"
+ },
+ "SLPM-61037": {
+  "identity": "same",
+  "box": "different",
+  "note": "[Trial] (taikenban) demo disc; SLPM-61xxx is the Japanese trial range. It has its own demo sleeve/label, not the retail Devil May Cry 2 box.",
+  "launchbox": "Devil May Cry 2",
+  "gameindex": [
+   "Devil May Cry 2 [Trial]"
+  ],
+  "class": "t2"
+ },
+ "SLES-54611": {
+  "identity": "unsure",
+  "box": "unsure",
+  "note": "TT Superbikes Real Road Racing Championship (PAL serial from about 2006) vs Suzuki TT Superbikes: Real Road Racing Championship dated 2009-03-05. The TT Superbikes series has several releases and the date does not fit the serial, so it may be a different edition.",
+  "launchbox": "Suzuki TT Superbikes: Real Road Racing Championship",
+  "gameindex": [
+   "TT Superbikes - Real Road Racing Championship"
+  ],
+  "class": "alt"
+ },
+ "SLES-51825": {
+  "identity": "unsure",
+  "box": "different",
+  "note": "Pop Idol (PAL) vs American Idol (US, 2003-11-11): the same TV franchise but separately licensed regional games. Likely a different product with a different box, matched only through an alternate name.",
+  "launchbox": "American Idol",
+  "gameindex": [
+   "Pop Idol"
+  ],
+  "class": "alt"
+ },
+ "SCPS-19323": {
+  "identity": "unsure",
+  "box": "unsure",
+  "note": "GameIndex names conflict. The English name says The 4th Detonator (Wild Arms 4, 2005-03-24, which is what LaunchBox matched), but the native title says Wild ARMs Advanced 3rd, which is Wild Arms 3. It may be the Wild Arms 3 PS2 the Best reprint, in which case LaunchBox is the wrong game.",
+  "launchbox": "Wild Arms 4",
+  "gameindex": [
+   "Wild ARMs - The 4th Detonator [PlayStation 2 the Best - Reprint]"
+  ],
+  "class": "t2"
+ },
+ "SLPM-62043": {
+  "identity": "same",
+  "box": "different",
+  "note": "Trial (taiken-ban) demo disc of Metro Gear Solid 2; the retail Sons of Liberty box/disc art is not this disc's artwork.",
+  "launchbox": "Metal Gear Solid 2: Sons of Liberty",
+  "gameindex": [
+   "Metal Gear Solid 2 [Trial]"
+  ],
+  "class": "t2"
+ },
+ "SLPM-60152": {
+  "identity": "same",
+  "box": "different",
+  "note": "Trial (taiken-ban) demo disc of NBA Street; the retail NBA Street box art is not this disc's artwork.",
+  "launchbox": "NBA Street",
+  "gameindex": [
+   "NBA Street [Trial]"
+  ],
+  "class": "t2"
+ },
+ "SLPM-61119": {
+  "identity": "same",
+  "box": "different",
+  "note": "Trial (taiken-ban) demo disc of Armored Core: Last Raven; the retail Last Raven box art is not this disc's artwork.",
+  "launchbox": "Armored Core: Last Raven",
+  "gameindex": [
+   "Armored Core - Last Raven [Trial]"
+  ],
+  "class": "t2"
+ },
+ "SLPS-73214": {
+  "identity": "same",
+  "box": "different",
+  "note": "Shadow Hearts II = Shadow Hearts: Covenant; disc is the Director's Cut Best re-release, but it is the same game",
+  "launchbox": "Shadow Hearts: Covenant",
+  "gameindex": [
+   "Shadow Hearts II [Director's Cut] [PlayStation2 the Best] [Disc 1 of 2]"
+  ],
+  "class": "t2"
+ },
+ "PCPX-96653": {
+  "identity": "same",
+  "box": "different",
+  "note": "Shop trial demo of Ratchet & Clank 3 (Up Your Arsenal); same game, but the disc is a demo, not the retail release",
+  "launchbox": "Ratchet & Clank: Up Your Arsenal",
+  "gameindex": [
+   "Ratchet & Clank 3 - Up Your Arsenal [ShopTrial]"
+  ],
+  "class": "t2"
+ },
+ "PAPX-90522": {
+  "identity": "same",
+  "box": "different",
+  "note": "Trial/demo disc of Genji; same game, but a demo",
+  "launchbox": "Genji: Dawn of the Samurai",
+  "gameindex": [
+   "Genji [Trial]"
+  ],
+  "class": "t2"
+ },
+ "SLPM-60135": {
+  "identity": "same",
+  "box": "different",
+  "note": "Shop demonstration movie disc for Shadow of Memories (= Shadow of Destiny); same game title, but a promo movie disc, not the game",
+  "launchbox": "Shadow of Destiny",
+  "gameindex": [
+   "Shadow of Memories [Shop Demonstration Movie]"
+  ],
+  "class": "t2"
+ },
+ "SLPM-60202": {
+  "identity": "same",
+  "box": "different",
+  "note": "Trial (taikenban) demo disc; the retail R-Type Final box and disc label do not belong to a trial disc.",
+  "launchbox": "R-Type Final",
+  "gameindex": [
+   "R-Type Final [Trial]"
+  ],
+  "class": "t2"
+ },
+ "SLPM-62316": {
+  "identity": "unsure",
+  "box": "unsure",
+  "note": "Generic title 'Mahjong'; many PS2 mahjong games exist (SuperLite 2000 Table Game Mahjong by Success vs others). Cannot confirm LaunchBox's 2003-07-31 'Mahjong' is this SuperLite 2000 title.",
+  "launchbox": "Mahjong",
+  "gameindex": [
+   "Mahjong [Superlite 2000 Series]"
+  ],
+  "class": "t2"
+ },
+ "SLPM-61110": {
+  "identity": "same",
+  "box": "different",
+  "note": "Trial (taikenban) demo disc of Enthusia Professional Racing; the retail box art does not belong to the trial disc.",
+  "launchbox": "Enthusia Professional Racing",
+  "gameindex": [
+   "Enthusia Professional Racing [Trial]"
+  ],
+  "class": "t2"
+ },
+ "SLPS-25035": {
+  "identity": "unsure",
+  "box": "unsure",
+  "note": "GameIndex title is just 'Monster Farm' (no number); LaunchBox entry is Monster Rancher 3 (Monster Farm 3). Match rests only on an alternate name; could be a different Monster Farm title.",
+  "launchbox": "Monster Rancher 3",
+  "gameindex": [
+   "Monster Farm"
+  ],
+  "class": "alt"
+ },
+ "SLPM-61154": {
+  "identity": "different",
+  "box": "different",
+  "note": "Ryu Ga Gotoku 2 [Trial] is the taiken-ban demo disc, a separate product from the retail Yakuza 2 (2006-12-07). Same game content and art style, but not the retail box.",
+  "launchbox": "Yakuza 2",
+  "gameindex": [
+   "Ryu Ga Gotoku 2 [Trial]"
+  ],
+  "class": "t2"
+ },
+ "SLPM-62396": {
+  "identity": "unsure",
+  "box": "unsure",
+  "note": "Simple 2000 Honkaku Shikou Vol. 6 The Card (Blackjack, Daifugo, Draw Poker, Speed, Page One) is a budget card-game collection. I cannot confirm that LaunchBox's 'Ultimate Casino' is the same product or only a loosely related casino title.",
+  "launchbox": "Ultimate Casino",
+  "gameindex": [
+   "Simple 2000 Honkaku Shikou Series Vol. 6 - The Card"
+  ],
+  "class": "alt"
+ },
+ "SLPM-61163": {
+  "identity": "same",
+  "box": "different",
+  "note": "Trial (taiken-ban) disc of Seaman 2; same game, retail art acceptable.",
+  "launchbox": "Seaman 2: Pekin Genjin Ikusei Kit",
+  "gameindex": [
+   "Seaman 2 - Peking Genjin Ikusei Kit [Trial]"
+  ],
+  "class": "t2"
+ },
+ "SLPM-62771": {
+  "identity": "unsure",
+  "box": "unsure",
+  "note": "Choro Q HG 3 (Japan) vs LaunchBox 'Gadget Racers (Europe)'. Gadget Racers may be the localisation of Choro Q HG 2, not HG 3, and the entry is region-specific. Cannot confirm the mapping.",
+  "launchbox": "Gadget Racers (Europe)",
+  "gameindex": [
+   "Choro Q HG 3 [Atlus Best Collection]"
+  ],
+  "class": "t2"
+ },
+ "SLPM-62401": {
+  "identity": "unsure",
+  "box": "unsure",
+  "note": "Death Crimson OX+ vs LaunchBox 'Guncom 2'. The titles differ. Guncom 2 may be a GunCon 2 controller bundle or a different product, and the box would then differ. Cannot confirm.",
+  "launchbox": "Guncom 2",
+  "gameindex": [
+   "Death Crimson OX+"
+  ],
+  "class": "alt"
+ },
+ "SLED-54925": {
+  "identity": "same",
+  "box": "different",
+  "note": "SLED prefix is a PAL demo disc; same game (FIFA 08).",
+  "launchbox": "FIFA Soccer 08",
+  "gameindex": [
+   "FIFA '08"
+  ],
+  "class": "alt"
+ },
+ "SLPM-68501": {
+  "identity": "unsure",
+  "box": "unsure",
+  "note": "Special promotional 'Kodansha 8-magazine alliance' edition of Kidou Senshi Gundam (685xx range). Unclear which PS2 Gundam game it is and whether LaunchBox's 2000 'Mobile Suit Gundam' is the same product.",
+  "launchbox": "Mobile Suit Gundam",
+  "gameindex": [
+   "Kidou Senshi Gundam [Koudansha 8-shi Rengou Kikaku Special Edition]"
+  ],
+  "class": "t2"
+ },
+ "SLES-54825": {
+  "identity": "unsure",
+  "box": "unsure",
+  "note": "Several Bob the Builder PS2 titles exist. LaunchBox's 'Bob the Builder: Eye Toy' is matched only through an alternate name, so it is unclear it is this 2007 PAL release.",
+  "launchbox": "Bob the Builder: Eye Toy",
+  "gameindex": [
+   "Bob the Builder"
+  ],
+  "class": "alt"
+ },
+ "SLES-51846": {
+  "identity": "different",
+  "box": "different",
+  "note": "Deutschland sucht den Superstar is the German TV-licence game, a separate product with its own box. It is not Konami's American Idol, even if LaunchBox lists it as an alternate name.",
+  "launchbox": "American Idol",
+  "gameindex": [
+   "Deutschland sucht den Superstar"
+  ],
+  "class": "alt"
+ },
+ "SLPM-65025": {
+  "identity": "unsure",
+  "box": "different",
+  "note": "This is disc 2 of the Devil May Cry 5th Anniversary Package (Nightmare Returns Pack) and holds a trial/demo, not the retail Devil May Cry. The LaunchBox entry is the 2001 original. I can't tell which game the trial is of, so the cover is probably wrong.",
+  "launchbox": "Devil May Cry",
+  "gameindex": [
+   "Devil May Cry [Trial] - 5th Anniversary Package - Nightmare Returns [Disc 2 of 2]"
+  ],
+  "class": "t2"
+ },
+ "SLPM-65631": {
+  "identity": "unsure",
+  "box": "unsure",
+  "note": "The native title is Saigo no Uta (the Japanese Director's Cut). LaunchBox 'Silent Hill 2' dated 2001-09-24 is the original release, and LaunchBox has a separate Director's Cut entry. The Director's Cut entry may be the better match.",
+  "launchbox": "Silent Hill 2",
+  "gameindex": [
+   "Silent Hill 2 [KONAMI The BEST]"
+  ],
+  "class": "t2"
+ },
+ "SLPM-60130": {
+  "identity": "same",
+  "box": "different",
+  "note": "This is a trial (demo) disc of the same game, so the full-game cover is acceptable but it isn't the retail product.",
+  "launchbox": "Truck Kyousokyoku",
+  "gameindex": [
+   "Truck Kyousoukyoku - Ai to Kanashimi no Rodeo [Trial]"
+  ],
+  "class": "t2"
+ },
+ "SLES-54694": {
+  "identity": "unsure",
+  "box": "unsure",
+  "note": "The PAL 'K-1 World GP' may be a localisation of K-1 World GP 2005 or a different year's game. LaunchBox dates its entry 2005-12-01, which looks like the Japanese release. I can't confirm they are the same product.",
+  "launchbox": "K-1 World GP 2005",
+  "gameindex": [
+   "K-1 World GP"
+  ],
+  "class": "alt"
+ },
+ "SLPM-65289": {
+  "identity": "same",
+  "box": "different",
+  "note": "The Entry Disc is an edition of Final Fantasy XI Online.",
+  "launchbox": "Final Fantasy XI Online",
+  "gameindex": [
+   "Final Fantasy XI [Entry Disc]"
+  ],
+  "class": "t2"
+ },
+ "SLPS-20011": {
+  "identity": "unsure",
+  "box": "unsure",
+  "note": "Japanese 'American Arcade' (SLPS-20011, an early 2000-era PS2 JP serial) matched to the generic title 'Pinball' dated 2004-01-11; the 4-year gap and the generic name suggest this could be a different pinball product, and I cannot confirm 'Pinball' is a localisation of American Arcade.",
+  "launchbox": "Pinball",
+  "gameindex": [
+   "American Arcade"
+  ],
+  "class": "alt"
+ },
+ "SLPM-61050": {
+  "identity": "unsure",
+  "box": "different",
+  "note": "The disc is a Trial (demo) release of Hanjuku Hero Tai 3D. The title matches the full game, but a trial disc is a separate product with its own cover.",
+  "launchbox": "Hanjuku Hero Tai 3D",
+  "gameindex": [
+   "Hanjuku Hero VS 3-D [Trial]"
+  ],
+  "class": "t2"
+ },
+ "SLPM-62442": {
+  "identity": "unsure",
+  "box": "unsure",
+  "note": "Youkoso Hitsuji-Mura is the Japanese title of the Shepherd's Crossing series. The LaunchBox date of 2008-08-19 looks like the Wii/DS western release, not this PS2 disc. I cannot confirm that the PS2 version is the same entry.",
+  "launchbox": "Shepherd's Crossing",
+  "gameindex": [
+   "Youkoso Hitsuji-Mura"
+  ],
+  "class": "alt"
+ },
+ "SCKA-20112": {
+  "identity": "same",
+  "box": "different",
+  "note": "This is the [Append] edition (The Answer expansion only) with its own box; the LaunchBox entry is the complete Persona 3 FES (Journey + Answer) NA release.",
+  "launchbox": "Shin Megami Tensei: Persona 3 FES",
+  "gameindex": [
+   "Shin Megami Tensei Persona 3 FES [Append]"
+  ],
+  "class": "t2"
+ },
+ "SLPM-74286": {
+  "identity": "unsure",
+  "box": "different",
+  "note": "Shin Sangoku Musou 5 Special is the enhanced/expansion release of Shin Sangoku Musou 5 (Dynasty Warriors 6). Whether the PS2 Dynasty Warriors 6 is that Special or the base game, and whether it has its own box, is unclear. LaunchBox's Dynasty Warriors 6 may be the base game.",
+  "launchbox": "Dynasty Warriors 6",
+  "gameindex": [
+   "Shin Sangoku Musou 5 Special [PlayStation2 the Best] [Disc 1]"
+  ],
+  "class": "t2"
+ },
+ "SLPM-61010": {
+  "identity": "same",
+  "box": "different",
+  "note": "Trial disc of Devil May Cry; same game identity, the demo has its own sleeve but the full-game cover is the sensible match.",
+  "launchbox": "Devil May Cry",
+  "gameindex": [
+   "Devil May Cry [Trial Ver.2]"
+  ],
+  "class": "t2"
+ },
+ "SLPM-62711": {
+  "identity": "unsure",
+  "box": "different",
+  "note": "Shepherd's Crossing is the Natsume localisation of Success's Youkoso Hitsujimura; the date 2008-08-19 looks like the Wii release, so this PS2 SuperLite 2000 budget disc may be a different platform release.",
+  "launchbox": "Shepherd's Crossing",
+  "gameindex": [
+   "Youkoso Hitsuji Mura [Superlite 2000 Series]"
+  ],
+  "class": "t2"
+ },
+ "SLES-53470": {
+  "identity": "unsure",
+  "box": "different",
+  "note": "Dutch-content football quiz (PAL-NL) vs The Great British Football Quiz; likely a localised variant with different questions and box, LaunchBox only lists it as an alternate name. Leaning different.",
+  "launchbox": "The Great British Football Quiz",
+  "gameindex": [
+   "De Grote Nederlandse Voetbalquiz"
+  ],
+  "class": "alt"
+ },
+ "PCPX-96657": {
+  "identity": "same",
+  "box": "different",
+  "note": "Store demo of Saru Get You 3 (Ape Escape 3); same game, demo sleeve differs.",
+  "launchbox": "Ape Escape 3",
+  "gameindex": [
+   "Saru! Get You! 3 [Demo]"
+  ],
+  "class": "t2"
+ },
+ "SLPM-60248": {
+  "identity": "same",
+  "box": "different",
+  "note": "Trial disc of Dororo, which was released in the West as Blood Will Tell; same game, demo sleeve differs.",
+  "launchbox": "Blood Will Tell: Tezuka Osamu's Dororo",
+  "gameindex": [
+   "Dororo [Trial]"
+  ],
+  "class": "t2"
+ },
+ "SLPM-60177": {
+  "identity": "same",
+  "box": "different",
+  "note": "Trial disc of Kengo 2, whose Western release is Sword of the Samurai; same game, demo sleeve differs.",
+  "launchbox": "Sword of the Samurai",
+  "gameindex": [
+   "Kengō 2 [Trial]"
+  ],
+  "class": "t2"
+ },
+ "SCES-52828": {
+  "identity": "unsure",
+  "box": "unsure",
+  "note": "SingStar NRJ Music Tour is a French edition with its own track list; SingStar Party may be the same disc under a French name, but the match rests only on an alternate name.",
+  "launchbox": "Singstar Party",
+  "gameindex": [
+   "SingStar - NRJ Music Tour"
+  ],
+  "class": "alt"
+ },
+ "SLPM-65978": {
+  "identity": "same",
+  "box": "different",
+  "note": "Kurogane no Houkou 2: Warship Gunner is Naval Ops: Warship Gunner.",
+  "launchbox": "Naval Ops: Warship Gunner",
+  "gameindex": [
+   "Kurogane no Houkou 2 - Warship Gunner [Koei The Best]"
+  ],
+  "class": "t2"
+ },
+ "SLPS-20374": {
+  "identity": "same",
+  "box": "different",
+  "note": "Trial edition of Football Kingdom; same game, demo sleeve differs.",
+  "launchbox": "Football Kingdom",
+  "gameindex": [
+   "Football Kingdom - Trial Edition"
+  ],
+  "class": "alt"
+ },
+ "SLED-52879": {
+  "identity": "same",
+  "box": "different",
+  "note": "Same game (PES 4 = Winning Eleven 8 International). The SLED prefix marks a demo disc, so the full-game cover is only a stand-in.",
+  "launchbox": "World Soccer: Winning Eleven 8 International",
+  "gameindex": [
+   "Pro Evolution Soccer 4"
+  ],
+  "class": "alt"
+ },
+ "SLPM-60162": {
+  "identity": "same",
+  "box": "different",
+  "note": "Trial disc of the same game (Guilty Gear X Plus); it has no cover of its own, so the full-game cover is a stand-in.",
+  "launchbox": "Guilty Gear X Plus",
+  "gameindex": [
+   "Guilty Gear X Plus [Trial]"
+  ],
+  "class": "t2"
+ },
+ "SCED-52818": {
+  "identity": "same",
+  "box": "different",
+  "note": "Light/demo disc of EyeToy: Chat; same game.",
+  "launchbox": "EyeToy: Chat",
+  "gameindex": [
+   "EyeToy - Chat [Light]"
+  ],
+  "class": "t2"
+ },
+ "SLKA-25146": {
+  "identity": "unsure",
+  "box": "unsure",
+  "note": "Kaido Battle 2 - Chain Reaction may be a sequel to the game behind 'Kaido Racer' (Kaido Racer 2 in the West). I cannot tell whether LaunchBox's 'Kaido Racer' is the original or this one.",
+  "launchbox": "Kaido Racer",
+  "gameindex": [
+   "Kaido Battle 2 - Chain Reaction"
+  ],
+  "class": "alt"
+ },
+ "SLPM-62762": {
+  "identity": "different",
+  "box": "different",
+  "note": "Sangokushi VIII 'with Power-Up Kit' is a separate expanded release with its own title and box. LaunchBox's Romance of the Three Kingdoms VIII is the base game.",
+  "launchbox": "Romance of the Three Kingdoms VIII",
+  "gameindex": [
+   "Sangokushi VIII [with Power-Up Kit] [Koei Selection Series]"
+  ],
+  "class": "t2"
+ },
+ "SLAJ-35007": {
+  "identity": "unsure",
+  "box": "unsure",
+  "note": "The disc is Zhen San Guo Wu Shuang 5 Special (Shin Sangoku Musou 5 Special) and LaunchBox has Dynasty Warriors 6. They may be the same PS2 game under different regional numbering, but the title and year do not match on their face.",
+  "launchbox": "Dynasty Warriors 6",
+  "gameindex": [
+   "Zhen San Guo Wu Shuang 5 Special"
+  ],
+  "class": "alt"
+ },
+ "SLKA-25077": {
+  "identity": "different",
+  "box": "different",
+  "note": "Culdcept II Expansion is a follow-up with its own title. LaunchBox's 'Culdcept' is the original or base game, not this one.",
+  "launchbox": "Culdcept",
+  "gameindex": [
+   "Culdcept II Expansion"
+  ],
+  "class": "alt"
+ },
+ "SLPM-66165": {
+  "identity": "same",
+  "box": "different",
+  "note": "Otome wa Oneesama ni Koishiteru (Maria-sama parody game) is a different title from Otome wa Boku ni Koishiteru.",
+  "launchbox": "Otome wa Boku ni Koishiteru",
+  "gameindex": [
+   "Otome ha Oneesama ni Koi Shiteru"
+  ],
+  "class": "alt"
+ },
+ "SLPM-61086": {
+  "identity": "same",
+  "box": "different",
+  "note": "Trial/demo disc (taikenban) of Kengo 3; the retail box art is not this disc's.",
+  "launchbox": "Kengo III",
+  "gameindex": [
+   "Kengō 3 [Trial]"
+  ],
+  "class": "t2"
+ },
+ "PCPX-96314": {
+  "identity": "same",
+  "box": "different",
+  "note": "Trial/demo disc of Sky Odyssey; retail box art is not this disc's.",
+  "launchbox": "Sky Odyssey",
+  "gameindex": [
+   "The Sky Odyssey [Trial]"
+  ],
+  "class": "t2"
+ },
+ "PCPX-96316": {
+  "identity": "same",
+  "box": "different",
+  "note": "Trial disc of Phase Paradox; same title, so the full game's cover is a stand-in.",
+  "launchbox": "Phase Paradox",
+  "gameindex": [
+   "Phase Paradox [Dengeki PlayStation D-Edition Trial]"
+  ],
+  "class": "t2"
+ },
+ "SLAJ-25105": {
+  "identity": "different",
+  "box": "different",
+  "note": "Shin Sangoku Musou 5 Special is the 'Special' edition (2 discs) of Shin Sangoku Musou 5. The base game is Dynasty Warriors 6, so the Special has its own title and box. Only moderately sure, since the Western PS2 Dynasty Warriors 6 may be built on the Special.",
+  "launchbox": "Dynasty Warriors 6",
+  "gameindex": [
+   "Shin Sangoku Musou 5 Special [Disc 2]"
+  ],
+  "class": "t2"
+ },
+ "PCPX-96636": {
+  "identity": "same",
+  "box": "different",
+  "note": "Shop trial disc of SIREN; same title, so the full game's cover is a stand-in.",
+  "launchbox": "Siren",
+  "gameindex": [
+   "SIREN [ShopTrial]"
+  ],
+  "class": "t2"
+ },
+ "SLPM-65564": {
+  "identity": "same",
+  "box": "different",
+  "note": "Premium BOX bundles Shin Sangoku Musou 3 Empires with Moushouden (Xtreme Legends); its box art differs from the standalone Dynasty Warriors 4: Empires release.",
+  "launchbox": "Dynasty Warriors 4: Empires",
+  "gameindex": [
+   "Shin Sangoku Musou 3 - Empires [Premium Box]"
+  ],
+  "class": "t2"
+ },
+ "SLPM-65023": {
+  "identity": "different",
+  "box": "different",
+  "note": "This is the Devil May Cry [Trial] demo bundled as a bonus disc with Biohazard Code Veronica Kanzenban, not the retail game, so the retail Devil May Cry box art is the wrong product.",
+  "launchbox": "Devil May Cry",
+  "gameindex": [
+   "Devil May Cry [Trial] [BioHazard - Code Veronica Kanzenban - Bonus Disc]"
+  ],
+  "class": "t2"
+ },
+ "SLPM-60198": {
+  "identity": "different",
+  "box": "different",
+  "note": "This is a [Trial] demo disc of MotoGP 3 (the 60xxx trial serial range), a separate product from the retail MotoGP 3 release.",
+  "launchbox": "MotoGP 3",
+  "gameindex": [
+   "MotoGP 3 [Trial]"
+  ],
+  "class": "t2"
+ },
+ "SLPM-62244": {
+  "identity": "unsure",
+  "box": "unsure",
+  "note": "Gadget Racers is the Western release of a Choro Q HG game, but I think it is Choro Q HG 2 (Japan Dec 2001), not HG 3 (Japan late 2002); a 2002-12-12 Europe date fits that. Could be a wrong sequel match.",
+  "launchbox": "Gadget Racers (Europe)",
+  "gameindex": [
+   "Choro Q HG 3"
+  ],
+  "class": "alt"
+ },
+ "SLPM-62642": {
+  "identity": "different",
+  "box": "different",
+  "note": "This is the Ranseiki 'with Power-Up Kit' release (own title, own box, Koei The Best). The LaunchBox entry is the base Ranseiki of 2002-04-04, which is SLPM-62148.",
+  "launchbox": "Nobunaga no Yabou: Ranseiki",
+  "gameindex": [
+   "Nobunaga no Yabou - Ranseiki [with Power-Up Kit] [Koei The Best]"
+  ],
+  "class": "t2"
+ },
+ "SLPM-62595": {
+  "identity": "unsure",
+  "box": "unsure",
+  "note": "Takara The Best reissue of Choro Q HG 3. Same doubt as SLPM-62244: Gadget Racers (Europe) is probably the localised Choro Q HG 2, not HG 3.",
+  "launchbox": "Gadget Racers (Europe)",
+  "gameindex": [
+   "Choro Q HG 3 [Takara The Best]"
+  ],
+  "class": "t2"
+ },
+ "SLPM-64540": {
+  "identity": "unsure",
+  "box": "unsure",
+  "note": "Title is The Sims, but the LaunchBox release date 2000-02-04 is the PC release; the PS2 version came out in 2003. This is probably the PC entry, which has different box art.",
+  "launchbox": "The Sims",
+  "gameindex": [
+   "The Sims"
+  ],
+  "class": "own"
+ },
+ "SLPM-60241": {
+  "identity": "unsure",
+  "box": "different",
+  "note": "A Trial (demo) disc, matched to the retail game; the LaunchBox release year 2010 also looks wrong for a PS2 trial of this era. Same game family, but the demo disc is its own product.",
+  "launchbox": "Sakurazaka Shouboutai",
+  "gameindex": [
+   "Sakurazaka Shouboutai [Trial]"
+  ],
+  "class": "t2"
+ },
+ "SCED-51305": {
+  "identity": "same",
+  "box": "different",
+  "note": "Press Kit disc (SCED = promo/demo-style serial). It has no retail box; the retail WRC II Extreme box art is not this disc's packaging.",
+  "launchbox": "WRC II Extreme",
+  "gameindex": [
+   "WRC II Extreme [Press Kit]"
+  ],
+  "class": "t2"
+ },
+ "SLPM-61137": {
+  "identity": "same",
+  "box": "different",
+  "note": "Trial disc of the same game.",
+  "launchbox": "Sega Rally 2006",
+  "gameindex": [
+   "Sega Rally 2006 [Trial]"
+  ],
+  "class": "t2"
+ },
+ "SLPM-65286": {
+  "identity": "different",
+  "box": "different",
+  "note": "Auto Modellista U.S.-Tuned is a separate Japanese release with its own title and box. The LaunchBox entry is the 2002 original.",
+  "launchbox": "Auto Modellista",
+  "gameindex": [
+   "Auto Modellista - U.S.-Tuned"
+  ],
+  "class": "alt"
+ },
+ "SLPM-61092": {
+  "identity": "same",
+  "box": "different",
+  "note": "Trial disc of the same game.",
+  "launchbox": "Driv3r",
+  "gameindex": [
+   "Driv3r [Trial]"
+  ],
+  "class": "t2"
+ },
+ "SLED-51178": {
+  "identity": "same",
+  "box": "different",
+  "note": "Demo disc of TOCA Race Driver, which is the UK title of Pro Race Driver.",
+  "launchbox": "Pro Race Driver",
+  "gameindex": [
+   "TOCA Race Driver"
+  ],
+  "class": "alt"
+ },
+ "SLPM-61008": {
+  "identity": "same",
+  "box": "different",
+  "note": "This disc is a Devil May Cry trial (demo) disc. The game is the same, but the retail box art is not the demo sleeve.",
+  "launchbox": "Devil May Cry",
+  "gameindex": [
+   "Devil May Cry [Trial Ver.2]"
+  ],
+  "class": "t2"
+ },
+ "PCPX-96302": {
+  "identity": "same",
+  "box": "different",
+  "note": "This disc is a Fantavision trial (demo) disc. The game is the same, but the retail box art is not the demo sleeve.",
+  "launchbox": "Fantavision",
+  "gameindex": [
+   "Fantavision [Trial]"
+  ],
+  "class": "t2"
+ },
+ "SCES-55423": {
+  "identity": "unsure",
+  "box": "unsure",
+  "note": "Buzz! Brain of the World (PAL D/E/NW) versus Buzz! Brain of the UK look like regional variants of the same quiz. I cannot tell whether they share a box, and the covers differ.",
+  "launchbox": "Buzz! Brain of the UK",
+  "gameindex": [
+   "Buzz! Brain of the World"
+  ],
+  "class": "alt"
+ },
+ "SLPS-25650": {
+  "identity": "unsure",
+  "box": "unsure",
+  "note": "Disc title is 'Metal Slug 3D' but LaunchBox entry is plain 'Metal Slug' (the first game); the native name is truncated to 'Metal Slug' so the alternate-name hit may be coincidental. Likely a different numbered entry of the series (this 2006-06-29 PS2 Japan release may be Metal Slug 3 or 6), so the cover may not match.",
+  "launchbox": "Metal Slug",
+  "gameindex": [
+   "Metal Slug 3D"
+  ],
+  "class": "alt"
+ },
+ "SLPM-60176": {
+  "identity": "same",
+  "box": "different",
+  "note": "Trial disc ([Trial]) of U -underwater unit- (Sub Rebellion); the retail box art belongs to the full game, not this trial disc.",
+  "launchbox": "Sub Rebellion",
+  "gameindex": [
+   "U - Underwater Unit [Trial]"
+  ],
+  "class": "t2"
+ },
+ "SLPM-60181": {
+  "identity": "same",
+  "box": "different",
+  "note": "Trial disc of Street Golfer; the retail box belongs to the full game, not the [Trial] disc.",
+  "launchbox": "Street Golfer",
+  "gameindex": [
+   "Street Golfer [Trial]"
+  ],
+  "class": "t2"
+ },
+ "SLED-51993": {
+  "identity": "same",
+  "box": "different",
+  "note": "SLED- prefix is a PAL demo disc of Pro Evolution Soccer 3; LaunchBox entry is the Japanese retail Winning Eleven 7 International, whose box art does not belong to this disc.",
+  "launchbox": "Winning Eleven 7 International",
+  "gameindex": [
+   "Pro Evolution Soccer 3"
+  ],
+  "class": "alt"
+ },
+ "SLED-51994": {
+  "identity": "same",
+  "box": "different",
+  "note": "SLED- prefix is a PAL demo disc of Pro Evolution Soccer 3; LaunchBox entry is the Japanese retail Winning Eleven 7 International, whose box art does not belong to this disc.",
+  "launchbox": "Winning Eleven 7 International",
+  "gameindex": [
+   "Pro Evolution Soccer 3"
+  ],
+  "class": "alt"
+ },
+ "SLPM-60175": {
+  "identity": "same",
+  "box": "different",
+  "note": "Trial disc of Wangan Midnight; the retail box belongs to the full game, not the [Trial] disc.",
+  "launchbox": "Wangan Midnight",
+  "gameindex": [
+   "Wangan Midnight [Trial]"
+  ],
+  "class": "t2"
+ },
+ "SLES-53465": {
+  "identity": "unsure",
+  "box": "unsure",
+  "note": "French football quiz 'Maxi Quiz du Foot Francais' matched to 'The Great British Football Quiz'. They may share an engine or publisher, but the French edition has its own title and French-specific content and packaging, so it is probably a separate localised product. Cannot confirm.",
+  "launchbox": "The Great British Football Quiz",
+  "gameindex": [
+   "Maxi Quiz du Foot Français"
+  ],
+  "class": "alt"
+ },
+ "SLPM-60122": {
+  "identity": "same",
+  "box": "different",
+  "note": "Trial disc of Ring of Red; the retail box belongs to the full game, not the [Trial] disc.",
+  "launchbox": "Ring of Red",
+  "gameindex": [
+   "Ring of Red [Trial]"
+  ],
+  "class": "t2"
+ },
+ "SLPM-66793": {
+  "identity": "same",
+  "box": "different",
+  "note": "Disc 2 of the Japanese 20th Anniversary set is the bonus disc 'The Document of Metal Gear Solid 2', not the 2001 Sons of Liberty game; the original MGS2 box art does not belong to it.",
+  "launchbox": "Metal Gear Solid 2: Sons of Liberty",
+  "gameindex": [
+   "Metal Gear Solid 2 - Sons of Liberty [20th Anniversary Edition] [Disc 2 of 2]"
+  ],
+  "class": "t2"
+ },
+ "SCES-55387": {
+  "identity": "different",
+  "box": "different",
+  "note": "Buzz! Deutschlands Superquiz is the German-edition quiz with its own box; Buzz! Brain of the UK is the UK-specific edition.",
+  "launchbox": "Buzz! Brain of the UK",
+  "gameindex": [
+   "Buzz! Deutschlands Superquiz"
+  ],
+  "class": "alt"
+ },
+ "SCES-51610": {
+  "identity": "unsure",
+  "box": "unsure",
+  "note": "This Is Football 2004 (EU, Belgian Red Devils edition) vs World Tour Soccer 2005: the years differ, and it looks like a mis-association with the 2005 game. The 2004 disc has its own box.",
+  "launchbox": "World Tour Soccer 2005",
+  "gameindex": [
+   "This is Football 2004 [Red Devils 2004]"
+  ],
+  "class": "t2"
+ },
+ "SLPM-61084": {
+  "identity": "same",
+  "box": "different",
+  "note": "Meiwaku Seijin Panic Maker is the Japanese title of Under the Skin. This disc is a [Trial] demo of that game, so the retail cover is an approximation.",
+  "launchbox": "Under the Skin",
+  "gameindex": [
+   "Meiwaku Seijin Panic Maker [Trial]"
+  ],
+  "class": "t2"
+ },
+ "SCCS-40006": {
+  "identity": "different",
+  "box": "different",
+  "note": "Chinese 真·三国无双2 follows the Japanese numbering (Shin Sangoku Musou 2), which is Dynasty Warriors 3 in the West. Dynasty Warriors 2 is JP Shin Sangoku Musou, with no number. The right game is probably Dynasty Warriors 3.",
+  "launchbox": "Dynasty Warriors 2",
+  "gameindex": [
+   "Zhen Sanguo Wushuang 2"
+  ],
+  "class": "alt"
+ },
+ "SCES-55424": {
+  "identity": "different",
+  "box": "different",
+  "note": "Buzz! Brain of the World is a separate edition from Buzz! Brain of the UK, which is the UK-specific one. The two have different boxes and question sets.",
+  "launchbox": "Buzz! Brain of the UK",
+  "gameindex": [
+   "Buzz! Brain of the World"
+  ],
+  "class": "alt"
+ },
+ "PCPX-96306": {
+  "identity": "same",
+  "box": "different",
+  "note": "Shop-trail (store demo) disc with its own label and no retail box; retail Bikkuri Mouse art does not belong to it.",
+  "launchbox": "Bikkuri Mouse",
+  "gameindex": [
+   "Bikkuri Mouse [ShopTrail]"
+  ],
+  "class": "t2"
+ },
+ "PAPX-90203": {
+  "identity": "same",
+  "box": "different",
+  "note": "Trial (taikenban) promo disc, not the retail Gran Turismo 2000 release (which also never shipped as a retail box); retail box art would not belong to this disc.",
+  "launchbox": "Gran Turismo 2000",
+  "gameindex": [
+   "Gran Turismo 2000 [Trial]"
+  ],
+  "class": "t2"
+ },
+ "SLUS-20911": {
+  "identity": "unsure",
+  "box": "unsure",
+  "note": "US Shin Megami Tensei: Nocturne is the localisation of the Japanese expanded Maniax edition, so the content matches. The LaunchBox entry is the Japanese-titled Maniax and its 2004-01-29 date matches neither the JP (2003) nor the US (2004-02-17) release, so the box art may be the Japanese one.",
+  "launchbox": "Shin Megami Tensei III: Nocturne Maniax",
+  "gameindex": [
+   "Shin Megami Tensei - Nocturne"
+  ],
+  "class": "alt"
+ },
+ "SLES-52061": {
+  "identity": "different",
+  "box": "unsure",
+  "note": "French Star Academy is a separate regional TV-franchise product with its own French branding and track list. The LaunchBox entry is the UK Fame Academy: Dance Edition, whose box carries different branding, so it is the wrong cover for this disc.",
+  "launchbox": "Fame Academy: Dance Edition",
+  "gameindex": [
+   "Star Academy"
+  ],
+  "class": "alt"
+ },
+ "SLED-53440": {
+  "identity": "same",
+  "box": "different",
+  "note": "SLED- is the Sony Europe demo-disc prefix: this is a PAL Area 51 demo, not the retail game box.",
+  "launchbox": "Area-51",
+  "gameindex": [
+   "Area 51"
+  ],
+  "class": "own"
+ },
+ "SLED-51992": {
+  "identity": "same",
+  "box": "different",
+  "note": "SLED- demo disc (Pro Evolution Soccer 3 demo); the LaunchBox entry is the retail Japanese Winning Eleven 7 International, a different box.",
+  "launchbox": "Winning Eleven 7 International",
+  "gameindex": [
+   "Pro Evolution Soccer 3"
+  ],
+  "class": "alt"
+ },
+ "SLES-55103": {
+  "identity": "different",
+  "box": "different",
+  "note": "The GameIndex tag [2007] is there to tell this PAL release apart from the older 2002 Cabela's Big Game Hunter. The LaunchBox entry is the 2002 original (release 2002-11-26), not the 2007 budget re-release or retitle.",
+  "launchbox": "Cabela's Big Game Hunter",
+  "gameindex": [
+   "Cabela's Big Game Hunter [2007]"
+  ],
+  "class": "t2"
+ },
+ "SLPM-65635": {
+  "identity": "unsure",
+  "box": "unsure",
+  "note": "Bakuen Kakusei Neverland Senki Zero does not read as the same game as 'Realm of the Dead', and the LaunchBox year (2006) looks far from this serial's era; the match rests only on an alternate name. Leaning different.",
+  "launchbox": "Realm of the Dead",
+  "gameindex": [
+   "Bakuen Kakusei Neverland Senki Zero"
+  ],
+  "class": "alt"
+ },
+ "SLPM-60184": {
+  "identity": "unsure",
+  "box": "different",
+  "note": "Trial (demo) disc of Gungrave. Same title, but a demo is a separate product from the retail game and has no retail box of its own.",
+  "launchbox": "Gungrave",
+  "gameindex": [
+   "Gungrave [Trial]"
+  ],
+  "class": "t2"
+ },
+ "SLPM-66689": {
+  "identity": "unsure",
+  "box": "different",
+  "note": "Persona 3 FES [Append Edition] is the Japanese stand-alone 'The Answer' add-on disc. It is the same game family as P3 FES, but it has its own Japanese box, and the LaunchBox date (2008-04-22) is the Western release.",
+  "launchbox": "Shin Megami Tensei: Persona 3 FES",
+  "gameindex": [
+   "Persona 3 FES [Append Edition]"
+  ],
+  "class": "t2"
+ },
+ "SLED-52899": {
+  "identity": "different",
+  "box": "different",
+  "note": "Killzone [Bonus Disc] is a separate bonus/extras disc (SLED serial), not the Killzone game disc. The right game is Killzone only for the main disc.",
+  "launchbox": "Killzone",
+  "gameindex": [
+   "Killzone [Bonus Disc]"
+  ],
+  "class": "t2"
+ },
+ "SLPM-55083": {
+  "identity": "different",
+  "box": "unsure",
+  "note": "Shin Sangoku Musou 5 Special is the Japanese enhanced/expansion release (this is Disc 2) with its own title and box. The LaunchBox entry Dynasty Warriors 6 corresponds to the base Shin Sangoku Musou 5.",
+  "launchbox": "Dynasty Warriors 6",
+  "gameindex": [
+   "Shin Sangoku Musou 5 Special [Disc 2]"
+  ],
+  "class": "t2"
+ },
+ "SCES-53180": {
+  "identity": "different",
+  "box": "different",
+  "note": "SingStar The Dome is the German Dome-compilation edition with its own track list and box; SingStar Popworld is a separate UK release.",
+  "launchbox": "SingStar: Popworld",
+  "gameindex": [
+   "SingStar - The Dome"
+  ],
+  "class": "alt"
+ },
+ "SLPM-60267": {
+  "identity": "same",
+  "box": "different",
+  "note": "Trial (demo) disc of the same game.",
+  "launchbox": "Garouden Breakblow",
+  "gameindex": [
+   "Garouden Break Blow [Trial]"
+  ],
+  "class": "t2"
+ },
+ "SLPM-66778": {
+  "identity": "unsure",
+  "box": "unsure",
+  "note": "English name says Eternal Lovers but the native title says Moonlit Lovers; Galaxy Angel Moonlit Lovers and Eternal Lovers are separate PS2 releases, so the Eternal Lovers entry may be the wrong one.",
+  "launchbox": "Galaxy Angel: Eternal Lovers",
+  "gameindex": [
+   "Galaxy Angel - Eternal Lovers [Broccoli Best Quality]"
+  ],
+  "class": "t2"
+ },
+ "SLPM-60193": {
+  "identity": "same",
+  "box": "different",
+  "note": "Trial disc of Guilty Gear XX The Midnight Carnival (Japanese PS2 release of Guilty Gear X2); same game.",
+  "launchbox": "Guilty Gear X2",
+  "gameindex": [
+   "Guilty Gear XX - The Midnight Carnival [Trial]"
+  ],
+  "class": "t2"
+ },
+ "SCUS-97117": {
+  "identity": "unsure",
+  "box": "unsure",
+  "note": "A multi-game demo compilation disc, not a retail game; the Need for Speed Underground demo (2003) does not fit a 2000-dated Demo Disc 2.1 entry, so this may be a different demo disc.",
+  "launchbox": "Demo Disc 2.1",
+  "gameindex": [
+   "PlayStation 2 Demo Disc Version 2.1 [Need for Speed - Underground]"
+  ],
+  "class": "t2"
+ },
+ "PCPX-96315": {
+  "identity": "different",
+  "box": "different",
+  "note": "PCPX is a shop-trial demo disc (store demo kiosk disc) of Phase Paradox, not the retail release; it is the same game but a different product, so the retail box art would not match.",
+  "launchbox": "Phase Paradox",
+  "gameindex": [
+   "Phase Paradox [ShopTrail]"
+  ],
+  "class": "t2"
+ },
+ "SCED-52899": {
+  "identity": "different",
+  "box": "different",
+  "note": "SCED-52899 is the Killzone bonus disc (extras/making-of disc packaged with the game), not the Killzone game disc itself; LaunchBox's Killzone entry is the main game.",
+  "launchbox": "Killzone",
+  "gameindex": [
+   "Killzone [Bonus Disc]"
+  ],
+  "class": "t2"
+ },
+ "SLPM-74287": {
+  "identity": "unsure",
+  "box": "unsure",
+  "note": "Shin Sangoku Musou 5 Special is a separate Japanese 'Special' release (2 discs, own title and box). Dynasty Warriors 6 is the Western equivalent of Shin Sangoku Musou 5, but I cannot confirm the Special is the same product as the Western 2008 release.",
+  "launchbox": "Dynasty Warriors 6",
+  "gameindex": [
+   "Shin Sangoku Musou 5 Special [PlayStation2 the Best] [Disc 2]"
+  ],
+  "class": "t2"
+ },
+ "SCES-55389": {
+  "identity": "unsure",
+  "box": "different",
+  "note": "Italian-localised Buzz! quiz title; 'Buzz! Brain of the UK' is a UK-specific edition. It may be the Italian counterpart of a country-specific Buzz quiz or another Buzz quiz release (Quiz World / Quiz TV), so the match cannot be confirmed from the data.",
+  "launchbox": "Buzz! Brain of the UK",
+  "gameindex": [
+   "Buzz! Il Quizzone Nazionale"
+  ],
+  "class": "alt"
+ },
+ "SCED-51165": {
+  "identity": "same",
+  "box": "different",
+  "note": "SCED prefix = Sony Europe demo disc of This Is Football 2003; the LaunchBox entry (World Tour Soccer 2003, the US retitle) is the retail game with its own box.",
+  "launchbox": "World Tour Soccer 2003",
+  "gameindex": [
+   "This is Football 2003"
+  ],
+  "class": "alt"
+ },
+ "SLED-52873": {
+  "identity": "same",
+  "box": "different",
+  "note": "SLED prefix = European demo disc of Pro Evolution Soccer 4; LaunchBox entry is the full retail game (Winning Eleven 8 International is the US name), not the demo.",
+  "launchbox": "World Soccer: Winning Eleven 8 International",
+  "gameindex": [
+   "Pro Evolution Soccer 4"
+  ],
+  "class": "alt"
+ },
+ "PCPX-96321": {
+  "identity": "same",
+  "box": "different",
+  "note": "Shop trial disc of the same game.",
+  "launchbox": "SkyGunner",
+  "gameindex": [
+   "SkyGunner [ShopTrial]"
+  ],
+  "class": "t2"
+ },
+ "SLPM-60251": {
+  "identity": "same",
+  "box": "different",
+  "note": "Trial disc of Devil May Cry 3.",
+  "launchbox": "Devil May Cry 3: Dante's Awakening",
+  "gameindex": [
+   "Devil May Cry 3 [Trial]"
+  ],
+  "class": "t2"
+ },
+ "PAPX-90503": {
+  "identity": "unsure",
+  "box": "different",
+  "note": "Promotional fan-limited disc (PAPX serial) for PoPoLoCrois: Hajimari no Bouken; title matches but contents may not be the retail game.",
+  "launchbox": "PoPoLoCrois: Hajimari no Bouken",
+  "gameindex": [
+   "PoPoLoCrois - Hajimari no Bouken [Fan Gentei Disc]"
+  ],
+  "class": "t2"
+ },
+ "SLPM-61158": {
+  "identity": "same",
+  "box": "different",
+  "note": "Trial disc of Saint Seiya: Meiou Hades Juunikyuu Hen (The Hades).",
+  "launchbox": "Saint Seiya: The Hades",
+  "gameindex": [
+   "Saint Seiya - Meiou Hades Juunikyuu Hen [Trial]"
+  ],
+  "class": "t2"
+ },
+ "SCES-55420": {
+  "identity": "unsure",
+  "box": "different",
+  "note": "Dutch/Flemish 'De Slimste van Nederland' Buzz! edition matched to the UK Buzz! Brain of the UK; likely a regional version of the same quiz but cannot confirm.",
+  "launchbox": "Buzz! Brain of the UK",
+  "gameindex": [
+   "Buzz! De Slimste van Nederland"
+  ],
+  "class": "alt"
+ },
+ "SLPM-66971": {
+  "identity": "different",
+  "box": "unsure",
+  "note": "Disc is Sangokushi IX with Power-Up Kit (Koei Selection re-release of the PUK edition), a separate product and box from base Sangokushi IX / Romance of the Three Kingdoms IX; edition note was dropped by the matcher.",
+  "launchbox": "Romance of the Three Kingdoms IX",
+  "gameindex": [
+   "Sangokushi IX [with Power-Up Kit] [Koei Selection]"
+  ],
+  "class": "t2"
+ },
+ "SLPM-61106": {
+  "identity": "unsure",
+  "box": "different",
+  "note": "Disc is the Rumble Roses Trial (taiken-ban) demo; same game as the retail LaunchBox entry, but a demo is its own product with its own box.",
+  "launchbox": "Rumble Roses",
+  "gameindex": [
+   "Rumble Roses [Trial]"
+  ],
+  "class": "t2"
+ },
+ "SLPM-61114": {
+  "identity": "different",
+  "box": "different",
+  "note": "This is the [Trial] (体験版) demo disc of Shadow of Rome, not the retail game's box. The 61xxx serial range also fits a demo.",
+  "launchbox": "Shadow of Rome",
+  "gameindex": [
+   "Shadow of Rome [Trial]"
+  ],
+  "class": "t2"
+ },
+ "SLPM-60219": {
+  "identity": "unsure",
+  "box": "different",
+  "note": "The [Appendix Version] (ふろく版) with a 60xxx serial looks like a magazine-bundled or bonus edition of Shadow Hearts II, not the retail release. It may be a demo-like product; the data does not settle it.",
+  "launchbox": "Shadow Hearts: Covenant",
+  "gameindex": [
+   "Shadow Hearts II [Appendix Version]"
+  ],
+  "class": "t2"
+ },
+ "SLPM-62159": {
+  "identity": "unsure",
+  "box": "unsure",
+  "note": "Konami released both World Soccer Winning Eleven 6 and a separate, retitled 'Winning Eleven 6 International' (the basis of PES2). The disc is titled plain WE6 while LaunchBox is the International edition, and the data does not show which is which.",
+  "launchbox": "World Soccer: Winning Eleven 6 International",
+  "gameindex": [
+   "World Soccer Winning Eleven 6"
+  ],
+  "class": "alt"
+ },
+ "SLPM-66794": {
+  "identity": "unsure",
+  "box": "unsure",
+  "note": "The [Metal Gear 20th Anniversary] release is split over 2 discs, but the original Snake Eater is a single disc. It may be the Subsistence-based package, which has its own title and box, so it may not be the 2004 Snake Eater.",
+  "launchbox": "Metal Gear Solid 3: Snake Eater",
+  "gameindex": [
+   "Metal Gear Solid 3 - Snake Eater [METAL GEAR 20th ANNIVERSARY] [Disc 1/2]"
+  ],
+  "class": "t2"
+ },
+ "PAPX-90211": {
+  "identity": "same",
+  "box": "different",
+  "note": "Trial/demo disc (PAPX promo serial); the retail Extermination box art does not belong to the trial disc.",
+  "launchbox": "Extermination",
+  "gameindex": [
+   "Extermination [Trial]"
+  ],
+  "class": "t2"
+ },
+ "SLPM-65024": {
+  "identity": "same",
+  "box": "different",
+  "note": "BioHazard 5th Anniversary Package Nightmare Returns is a 2-disc bundle with its own box (second disc is not Code Veronica X); the standalone Code Veronica X box (SLPM-65022) is a different product.",
+  "launchbox": "Resident Evil: Code: Veronica X",
+  "gameindex": [
+   "BioHazard Code:Veronica Kanzenaban - 5th Anniversary Package - Nightmare Returns [Disc 1 of 2]"
+  ],
+  "class": "t2"
+ },
+ "SLPS-25022": {
+  "identity": "different",
+  "box": "different",
+  "note": "Cool Boarders: Code Alien is the Japan-only PS2 entry; the LaunchBox entry 'Cool Boarders 2001' dated 2000-10-31 is the separate PS1 game (Idol Minds). Different game and platform; the right entry would be 'Cool Boarders: Code Alien' if LaunchBox has it.",
+  "launchbox": "Cool Boarders 2001",
+  "gameindex": [
+   "Cool Boarders - Code Alien"
+  ],
+  "class": "alt"
+ },
+ "SLES-51510": {
+  "identity": "different",
+  "box": "unsure",
+  "note": "Dancing Stage MegaMix is its own European release (2003-ish) with its own box, not DDRMAX (whose European counterpart is Dancing Stage Max); the 2002-05-16 date also fits DDRMAX, not MegaMix. Fairly but not fully certain.",
+  "launchbox": "DDRMAX: Dance Dance Revolution",
+  "gameindex": [
+   "Dancing Stage MegaMix"
+  ],
+  "class": "alt"
+ },
+ "SLPM-60218": {
+  "identity": "same",
+  "box": "different",
+  "note": "Trial disc ([Trial] / taikenban) of Gungrave O.D.; the retail Gungrave: Overdose box and disc label are not this disc's artwork.",
+  "launchbox": "Gungrave: Overdose",
+  "gameindex": [
+   "Gungrave O.D. [Trial]"
+  ],
+  "class": "t2"
+ },
+ "SLPM-60165": {
+  "identity": "same",
+  "box": "different",
+  "note": "Trial disc ([Trial] / taikenban) of Maximo; the retail Maximo: Ghosts to Glory box (a US/EU release) is not this demo disc's artwork.",
+  "launchbox": "Maximo: Ghosts to Glory",
+  "gameindex": [
+   "Maximo [Trial]"
+  ],
+  "class": "t2"
+ },
+ "SLES-51057": {
+  "identity": "unsure",
+  "box": "unsure",
+  "note": "GameIndex says 'Hard Hitter 2' (a numbered sequel title on a late-2002-range serial) but LaunchBox's 'Hard Hitter Tennis' is dated 2001-06-28 and the only link is an alternate name. It may be a sequel or a separate release rather than a retitle; I cannot confirm they are the same game.",
+  "launchbox": "Hard Hitter Tennis",
+  "gameindex": [
+   "Hard Hitter 2"
+  ],
+  "class": "alt"
+ },
+ "SLPM-61076": {
+  "identity": "different",
+  "box": "different",
+  "note": "This disc is a trial/demo (taikenban) of Panzer Front Ausf.B, a separate product from the retail game; the retail box art would only be an approximate fallback.",
+  "launchbox": "Panzer Front: Ausf.B",
+  "gameindex": [
+   "Panzer Frony - Ausf. B [Trial]"
+  ],
+  "class": "t2"
+ },
+ "SCED-50907": {
+  "identity": "different",
+  "box": "different",
+  "note": "Beyond Final Fantasy is a separate bonus/promo disc with its own sleeve, not the Final Fantasy X game disc.",
+  "launchbox": "Final Fantasy X",
+  "gameindex": [
+   "Final Fantasy X [Bonus Disc - Beyond Final Fantasy]"
+  ],
+  "class": "t2"
+ },
+ "SLPM-62490": {
+  "identity": "different",
+  "box": "different",
+  "note": "The Dragon Quest VIII Premium Disc is a separate promotional video disc, not the game itself (Dragon Quest VIII: Journey of the Cursed King).",
+  "launchbox": "Dragon Quest VIII: Journey of the Cursed King",
+  "gameindex": [
+   "Dragon Quest VIII [Premium Disc]"
+  ],
+  "class": "t2"
+ },
+ "SLPS-25837": {
+  "identity": "unsure",
+  "box": "different",
+  "note": "Narutimate Accel 2 may correspond to Ultimate Ninja 4 rather than Ultimate Ninja 5 (which may be Accel 3); the Accel numbering to Ultimate Ninja numbering mapping is uncertain.",
+  "launchbox": "Naruto Shippuden: Ultimate Ninja 5",
+  "gameindex": [
+   "Naruto Shippuuden - Narutimate Accel 2"
+  ],
+  "class": "alt"
+ },
+ "SCES-55425": {
+  "identity": "unsure",
+  "box": "unsure",
+  "note": "'Brain of the World' vs the UK-specific 'Brain of the UK' Buzz! quiz; these may be regional variants of one game or two separate releases.",
+  "launchbox": "Buzz! Brain of the UK",
+  "gameindex": [
+   "Buzz! Brain of the World"
+  ],
+  "class": "alt"
+ },
+ "SLPM-60258": {
+  "identity": "same",
+  "box": "different",
+  "note": "Trial (demo) disc. The retail Typing of the Dead: Zombie Panic box does not belong to it.",
+  "launchbox": "The Typing of the Dead: Zombie Panic",
+  "gameindex": [
+   "Typing of the Dead - Zombie Panic [Trial]"
+  ],
+  "class": "t2"
+ },
+ "SLES-51862": {
+  "identity": "unsure",
+  "box": "unsure",
+  "note": "'Bass Master Fishing' (PAL) vs 'Fisherman's Bass Club': I cannot confirm from memory that these are the same game rather than two different bass fishing titles.",
+  "launchbox": "Fisherman's Bass Club",
+  "gameindex": [
+   "Bass Master Fishing"
+  ],
+  "class": "alt"
+ },
+ "SLPM-61060": {
+  "identity": "same",
+  "box": "different",
+  "note": "Trial (demo) disc. The retail BUSIN 0 box does not belong to it.",
+  "launchbox": "BUSIN 0 Wizardry Alternative NEO",
+  "gameindex": [
+   "BUSIN 0 ～Wizardry Alternative NEO～ [Trial]"
+  ],
+  "class": "t2"
+ },
+ "SLPS-25652": {
+  "identity": "same",
+  "box": "different",
+  "note": "This is the 'Terminal Disc - The End of the World' bonus disc, a separate product from the retail .hack//G.U. Vol.1 Rebirth game disc. The retail box art does not belong to it.",
+  "launchbox": ".hack//G.U. Vol. 1: Rebirth",
+  "gameindex": [
+   ".hack//G.U. Vol.1 - Rebirth [Terminal Disc - The End of the World]"
+  ],
+  "class": "t2"
+ },
+ "SLUS-21625": {
+  "identity": "different",
+  "box": "different",
+  "note": "The [2007] Cabela's Big Game Hunter is a separate game from the 2002 title (release 2002-11-26) that the LaunchBox entry describes.",
+  "launchbox": "Cabela's Big Game Hunter",
+  "gameindex": [
+   "Cabela's Big Game Hunter [2007]"
+  ],
+  "class": "t2"
+ },
+ "SLPM-61018": {
+  "identity": "different",
+  "box": "different",
+  "note": "This is a trial/demo disc (Abarenbou Princess [Trial]) with its own packaging; the LaunchBox entry is the full retail game.",
+  "launchbox": "Abarenbou Princess",
+  "gameindex": [
+   "Abarenbou Princess [Trial]"
+  ],
+  "class": "t2"
+ },
+ "SLPM-61043": {
+  "identity": "different",
+  "box": "different",
+  "note": "This disc is a Trial/demo of Devil May Cry 2, a separate product from the retail game (LaunchBox release is the full game).",
+  "launchbox": "Devil May Cry 2",
+  "gameindex": [
+   "Devil May Cry 2 [Trial]"
+  ],
+  "class": "t2"
+ },
+ "PCPX-96322": {
+  "identity": "different",
+  "box": "different",
+  "note": "ICO [Trial] is a demo disc, a separate product from the retail ICO.",
+  "launchbox": "ICO",
+  "gameindex": [
+   "ICO [Trial]"
+  ],
+  "class": "t2"
+ },
+ "SLPM-60134": {
+  "identity": "different",
+  "box": "different",
+  "note": "Technictix [Trial] is a demo disc, not the retail game.",
+  "launchbox": "Technictix",
+  "gameindex": [
+   "Technictix [Treial]"
+  ],
+  "class": "t2"
+ },
+ "SLPM-60278": {
+  "identity": "different",
+  "box": "different",
+  "note": "Wrestle Kingdom [Trial] is a demo disc, not the retail game.",
+  "launchbox": "Wrestle Kingdom",
+  "gameindex": [
+   "Wrestle Kingdom [Trial]"
+  ],
+  "class": "t2"
+ },
+ "SLPM-61118": {
+  "identity": "different",
+  "box": "different",
+  "note": "Famitsu Limited Trial of Armored Core: Last Raven is a demo disc, a separate product from the retail game.",
+  "launchbox": "Armored Core: Last Raven",
+  "gameindex": [
+   "Armored Core - Last Raven [Famitsu Limited Trial]"
+  ],
+  "class": "t2"
+ },
+ "SLPM-61096": {
+  "identity": "same",
+  "box": "different",
+  "note": "Trial disc of the same game; full-game art is appropriate",
+  "launchbox": "Fu-un Bakumatsu-den",
+  "gameindex": [
+   "Fu-un Bakumatsu-den [Trial]"
+  ],
+  "class": "t2"
+ },
+ "SLPM-68523": {
+  "identity": "same",
+  "box": "different",
+  "note": "Premiere Disc is a pre-release/starter disc of Phantasy Star Universe; same game identity",
+  "launchbox": "Phantasy Star Universe",
+  "gameindex": [
+   "Phantasy Star Universe [Premiere Disc]"
+  ],
+  "class": "t2"
+ },
+ "SLPM-60216": {
+  "identity": "same",
+  "box": "different",
+  "note": "Trial disc of the same game; full-game art is appropriate",
+  "launchbox": "R:Racing Evolution",
+  "gameindex": [
+   "R:Racing Evolution [Trial]"
+  ],
+  "class": "t2"
+ },
+ "SCES-55077": {
+  "identity": "unsure",
+  "box": "unsure",
+  "note": "SingStar Party Hits vs SingStar Summer Party: possibly the same product under a regional name, but they may be separate releases with different track lists",
+  "launchbox": "Singstar: Summer Party",
+  "gameindex": [
+   "SingStar - Party Hits"
+  ],
+  "class": "alt"
+ },
+ "SLPM-66912": {
+  "identity": "unsure",
+  "box": "unsure",
+  "note": "The disc is the Append Version of Kakera Asobi, which may be a separate release with its own title and box from the original 2007-12-20 game",
+  "launchbox": "Higurashi no Naku Koro ni Matsuri: Kakera Asobi",
+  "gameindex": [
+   "Higurashi no Naku Koro ni Matsuri - Kakera Asobi [Append Version]"
+  ],
+  "class": "t2"
+ },
+ "SLPM-61140": {
+  "identity": "same",
+  "box": "different",
+  "note": "Trial disc of Ryu ga Gotoku (Yakuza); full-game art is appropriate",
+  "launchbox": "Yakuza",
+  "gameindex": [
+   "Ryu Ga Gotoku [Trial]"
+  ],
+  "class": "t2"
+ },
+ "SLPM-65706": {
+  "identity": "unsure",
+  "box": "different",
+  "note": "Disc is the Japanese 'Final Fantasy XI All-in-One Pack 2004' (bundle box that also carries the base game and Rise of Zilart); LaunchBox entry is the standalone Chains of Promathia expansion, so the box art may belong to a different product.",
+  "launchbox": "Final Fantasy XI Online: Chains of Promathia",
+  "gameindex": [
+   "Final Fantasy XI - Chains of Promathia [All-in-One Pack]"
+  ],
+  "class": "t2"
+ },
+ "SLPM-65002": {
+  "identity": "unsure",
+  "box": "unsure",
+  "note": "English name '0 Story' conflicts with the native title 'Love Story'; the 2000-04-27 LaunchBox date is also implausibly early for serial SLPM-65002 (a 2-disc PS2 release). The match rests on an alternate name only, so it may be a different 'Love Story'.",
+  "launchbox": "Love Story",
+  "gameindex": [
+   "0 Story [Disc 1 of 2]"
+  ],
+  "class": "t2"
+ },
+ "SLAJ-25036": {
+  "identity": "different",
+  "box": "different",
+  "note": "Zhen Sanguo Wushuang 2 = Shin Sangoku Musou 2 = Dynasty Warriors 3, not Dynasty Warriors 2 (which is the first Shin Sangoku Musou on PS2)",
+  "launchbox": "Dynasty Warriors 2",
+  "gameindex": [
+   "Zhen Sanguo Wushuang 2"
+  ],
+  "class": "alt"
+ },
+ "SLED-51264": {
+  "identity": "same",
+  "box": "different",
+  "note": "PES2 = Winning Eleven 6 International; SLED prefix suggests a demo disc, but it is the same game",
+  "launchbox": "World Soccer: Winning Eleven 6 International",
+  "gameindex": [
+   "Pro Evolution Soccer 2"
+  ],
+  "class": "alt"
+ },
+ "SLPM-65953": {
+  "identity": "same",
+  "box": "different",
+  "note": "FFXI Entry Disc 2005 is a re-issue of the base game client; same game, different box",
+  "launchbox": "Final Fantasy XI Online",
+  "gameindex": [
+   "Final Fantasy XI [Entry Disc 2005]"
+  ],
+  "class": "t2"
+ },
+ "SLES-53363": {
+  "identity": "different",
+  "box": "same",
+  "note": "Lucifer's Call is the PAL/Western title of the Maniax edition, a separate release with its own box. LaunchBox's 2003 Nocturne is the Japanese original. The right entry is Shin Megami Tensei III: Nocturne Maniax (or the Western Nocturne entry).",
+  "launchbox": "Shin Megami Tensei III: Nocturne",
+  "gameindex": [
+   "Shin Megami Tensei - Lucifer's Call"
+  ],
+  "class": "alt"
+ },
+ "SLPM-55082": {
+  "identity": "different",
+  "box": "different",
+  "note": "Shin Sangoku Musou 5 Special is a standalone expansion with its own title and box. Dynasty Warriors 6 is the base game (Shin Sangoku Musou 5). Edition notes were ignored by the matcher.",
+  "launchbox": "Dynasty Warriors 6",
+  "gameindex": [
+   "Shin Sangoku Musou 5 Special [Disc 1]"
+  ],
+  "class": "t2"
+ },
+ "SLED-54327": {
+  "identity": "same",
+  "box": "different",
+  "note": "SLED- prefix is a European demo disc; the LaunchBox entry is the retail FIFA Soccer 07 box, which a player holding the demo disc would not consider theirs.",
+  "launchbox": "FIFA Soccer 07",
+  "gameindex": [
+   "FIFA 07"
+  ],
+  "class": "alt"
+ },
+ "SLPM-61109": {
+  "identity": "same",
+  "box": "different",
+  "note": "Trial (taikenban) disc of Shadow of Rome; the retail box art is not the trial disc's packaging.",
+  "launchbox": "Shadow of Rome",
+  "gameindex": [
+   "Shadow of Rome [Trial]"
+  ],
+  "class": "t2"
+ },
+ "SLPM-61001": {
+  "identity": "same",
+  "box": "different",
+  "note": "Trial (taikenban) disc of Onimusha; the Onimusha: Warlords retail box is not this disc's packaging.",
+  "launchbox": "Onimusha: Warlords",
+  "gameindex": [
+   "Onimusha [Trial]"
+  ],
+  "class": "t2"
+ },
+ "SLPM-60114": {
+  "identity": "same",
+  "box": "different",
+  "note": "Trial (taikenban) disc of Magical Sports 2000 Koushien; the retail box is not this disc's packaging.",
+  "launchbox": "Magical Sports 2000 Koushien",
+  "gameindex": [
+   "Magical Sports - 2000 Koushien [Trial]"
+  ],
+  "class": "t2"
+ },
+ "SCED-52461": {
+  "identity": "same",
+  "box": "different",
+  "note": "SingStar press-kit disc (not for resale, SCED promo prefix); the retail SingStar box art is not its packaging.",
+  "launchbox": "SingStar",
+  "gameindex": [
+   "SingStar [Press Kit]"
+  ],
+  "class": "t2"
+ }
+}

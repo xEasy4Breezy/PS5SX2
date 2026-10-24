@@ -268,30 +268,18 @@ static void LoadIrx(const std::string& filename, u8* dest, size_t maxSize)
 #include <algorithm>
 #include <vector>
 #include "fmt/format.h"
+// 2026-10-16: the folders searched after the BIOS folder's own files, as a header (a PC test builds it). g_orbis_bios_only: the player set
+// PS5SX2/BiosFolder, so that folder (and the folders inside it) is the only place; g_orbis_scan_usb: PS5SX2/ScanUsb (main-boot.cpp).
+#include "ps5/coreorbis/orbis-shims/OrbisBiosRoots.h"
+
+extern bool g_orbis_bios_only;
+extern bool g_orbis_scan_usb;
 
 namespace
 {
-std::vector<std::string> OrbisNames(const std::string& dir)
-{
-	std::vector<std::string> names;
-	if (DIR* d = opendir(dir.c_str()))
-	{
-		while (const dirent* e = readdir(d))
-		{
-			if (e->d_name[0] != '.' && e->d_name[0] != '$')
-				names.emplace_back(e->d_name);
-		}
-		closedir(d);
-	}
-	std::sort(names.begin(), names.end());
-	return names;
-}
+std::vector<std::string> OrbisNames(const std::string& dir) { return OrbisBios::Names(dir); }
 
-bool OrbisIsDir(const std::string& path)
-{
-	struct stat st = {};
-	return stat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
-}
+bool OrbisIsDir(const std::string& path) { return OrbisBios::IsDir(path); }
 
 // A BIOS among the files directly in `dir`. `seen` collects what was looked at, for the log.
 std::string OrbisBiosIn(const std::string& dir, std::string* seen)
@@ -319,64 +307,8 @@ std::string OrbisBiosIn(const std::string& dir, std::string* seen)
 
 std::string OrbisFindBiosElsewhere(std::string* seen)
 {
-	std::vector<std::string> dirs;
-	const std::string& bios = EmuFolders::Bios;
-	// vk-285-134 (AI-assisted): the BIOS folder's folders three levels down (64 at most), not one: build 130's logs had
-	// BIOS packs unpacked as folders of folders ("ps2 bios usa/", "SCPH-30003_BIOS_V3_UK_120_(PAL)/", ...).
-	{
-		std::vector<std::pair<std::string, int>> todo = {{bios, 0}};
-		for (size_t i = 0; i < todo.size() && dirs.size() < 64; i++)
-		{
-			const auto [dir, depth] = todo[i];
-			if (depth >= 3)
-				continue;
-			for (const std::string& name : OrbisNames(dir))
-			{
-				if (dirs.size() >= 64)
-					break;
-				if (OrbisIsDir(dir + "/" + name))
-				{
-					dirs.push_back(dir + "/" + name);
-					todo.emplace_back(dir + "/" + name, depth + 1);
-				}
-			}
-		}
-	}
-	const std::string top = "/data/PCSX2";
-	if (bios != top)
-		dirs.push_back(top);
-	for (const std::string& name : OrbisNames(top))
-	{
-		if (strcasecmp(name.c_str(), "bios") == 0 && top + "/" + name != bios && OrbisIsDir(top + "/" + name))
-			dirs.push_back(top + "/" + name);
-	}
-	// 2026-10-08 (AI-assisted): and the PS5's extended storage / M.2 drives (/mnt/ext0, /mnt/ext1), as the USB drives.
-	for (int i = 0; i < 10; i++)
-	{
-		const std::string root = i < 8 ? fmt::format("/mnt/usb{}", i) : fmt::format("/mnt/ext{}", i - 8);
-		const std::vector<std::string> names = OrbisNames(root);
-		if (names.empty())
-			continue;
-		dirs.push_back(root);
-		for (const std::string& name : names)
-		{
-			const bool is_bios = strcasecmp(name.c_str(), "bios") == 0;
-			// vk-285-118 (AI-assisted): PCSX2/bios too, a drive laid out like /data/PCSX2 (as its games/ and textures/).
-			const bool is_ps5sx2 = strcasecmp(name.c_str(), "ps5sx2") == 0 || strcasecmp(name.c_str(), "pcsx2") == 0;
-			if (!(is_bios || is_ps5sx2) || !OrbisIsDir(root + "/" + name))
-				continue;
-			dirs.push_back(root + "/" + name);
-			if (is_ps5sx2)
-			{
-				for (const std::string& sub : OrbisNames(root + "/" + name))
-				{
-					if (strcasecmp(sub.c_str(), "bios") == 0 && OrbisIsDir(root + "/" + name + "/" + sub))
-						dirs.push_back(root + "/" + name + "/" + sub);
-				}
-			}
-		}
-	}
-	for (const std::string& dir : dirs)
+	// 2026-10-16: the folders to look in are OrbisBios::SearchDirs (orbis-shims/OrbisBiosRoots.h; the moved code, and the two switches).
+	for (const std::string& dir : OrbisBios::SearchDirs(EmuFolders::Bios, g_orbis_bios_only, g_orbis_scan_usb))
 	{
 		std::string path = OrbisBiosIn(dir, seen);
 		if (!path.empty())

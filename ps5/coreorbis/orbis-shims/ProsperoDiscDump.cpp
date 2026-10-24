@@ -71,6 +71,9 @@
 #include "ProsperoDiscDump.h"
 #include "ProsperoDiscSpeed.h"
 #include "OrbisDiscCopy.h"
+#include "OrbisDiscPlaying.h"
+#include "OrbisDiscExec.h" // 2.11 (dumpxmb): when the disc helper's exec signal is honoured
+#include "OrbisDiscResume.h"
 #include "ProsperoNotify.h"
 
 #include "OrbisPaths.h"
@@ -117,6 +120,21 @@ namespace
 		std::lock_guard<std::mutex> lock(s_drive_mutex);
 		return path == s_claimed;
 	}
+	// 2.11 (disc lag round): logs/disc-playing.txt, "<unix time> <device> play\n", for the disc helper (the payload that runs beside the app and polls the
+	// drives): it leaves the drive a game plays from alone while the stamp is fresh (a few seconds old at most), so its own commands to the drive (and a copy
+	// of a USB disc) don't come in the middle of the game's reads. Written when a drive is claimed and every 2 s by the alive thread while it is, removed when
+	// it is released (and any left by an earlier run when this one starts). Atomic: written to a temporary file and renamed over it, so the helper never reads
+	// half a line. Called with s_drive_mutex held.
+	void StampPlayingLocked()
+	{
+		const std::string path = OrbisLogPath("disc-playing.txt");
+		if (s_claimed.empty())
+		{
+			unlink(path.c_str());
+			return;
+		}
+		orbis_disc::WritePlayingStamp(path, static_cast<long long>(time(nullptr)), s_claimed); // (OrbisDiscPlaying.h: tmp + rename)
+	}
 	bool BeginCopy(const std::string& path)
 	{
 		std::lock_guard<std::mutex> lock(s_drive_mutex);
@@ -141,6 +159,37 @@ namespace
 		va_end(ap);
 		printf("[disc] %s\n", line);
 		fflush(stdout);
+	}
+
+	// 2.11 (dumpxmb): state for the disc helper's exec signal and for the timeline after a copy (see OrbisDiscExec.h).
+	std::atomic<bool> s_game_starting{false}; // a game is being started (or runs) in this process
+	std::atomic<bool> s_tile_process{false};  // main-boot: this process is a disc tile
+	std::atomic<long long> s_game_starting_ms{0}, s_copy_end_ms{0}; // steady clock in ms; 0 = never
+	long long NowMs()
+	{
+		return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+	}
+	void NoteGameStarting(const char* how)
+	{
+		if (!s_game_starting.exchange(true))
+		{
+			s_game_starting_ms.store(NowMs());
+			Log("a game is being started (%s): the disc helper's disc-launch-exec.txt is ignored from now on (flag discexec: honoured as before)", how);
+		}
+	}
+	std::string AgeOf(const char* name) // how old a file in logs/ is ("-" when it is not there)
+	{
+		struct stat st{};
+		if (stat(OrbisLogPath(name).c_str(), &st) != 0)
+			return "-";
+		return std::to_string(static_cast<long long>(time(nullptr)) - static_cast<long long>(st.st_mtime)) + "s";
+	}
+	void LogSignalFiles(const std::string& what) // `what` is the line's lead, e.g. "at start" or "endcopy +3012 ms: media /dev/cd0=2874605568"
+	{
+		Log("%s: signal files: launch %s exec %s autostart %s refg %s relaunch %s; stamps: app %s helper %s; game starting %d, tile %d", what.c_str(),
+			AgeOf("disc-launch.txt").c_str(), AgeOf("disc-launch-exec.txt").c_str(), AgeOf("disc-autostart.txt").c_str(), AgeOf("disc-refg.txt").c_str(),
+			AgeOf("relaunch.txt").c_str(), AgeOf("ps5sx2-alive.txt").c_str(), AgeOf("disc-auto-alive.txt").c_str(), s_game_starting.load() ? 1 : 0,
+			s_tile_process.load() ? 1 : 0);
 	}
 
 	bool LooksOptical(const std::string& n)
@@ -240,6 +289,23 @@ namespace
 		return (r == 0 && media > 0) ? static_cast<uint64_t>(media) : 0;
 	}
 
+	// 2.11 (dumpxmb): for a minute after a copy ended, one line per pass of the watcher (every 1-3 s): what the app and the disc helper are doing, seen from
+	// the app's side, WITHOUT asking the drive anything (the media sizes are the ones this pass already read). The next tester log then shows whether the
+	// disc went away from the app after the copy (media 0, or another size), which signal files were there, and how old they were.
+	void EndCopyTimeline(const std::map<std::string, ProbeCache>& probes)
+	{
+		const long long end = s_copy_end_ms.load();
+		if (!end)
+			return;
+		const long long since = NowMs() - end;
+		if (since > 60000)
+			return;
+		std::string lead = "endcopy +" + std::to_string(since) + " ms: media";
+		for (const auto& kv : probes)
+			lead += " " + kv.first + "=" + std::to_string(static_cast<unsigned long long>(kv.second.media));
+		LogSignalFiles(lead);
+	}
+
 	std::vector<std::string> Candidates(bool log)
 	{
 		std::vector<std::string> out;
@@ -330,6 +396,19 @@ namespace
 		return found;
 	}
 
+	// 2026-10-16: the same in every folder games are listed from (OrbisGameSearchDirs: games/ as before; with games folders set, those and
+	// the NFS shares, each flat), the first copy found.
+	std::string FindExistingAnywhere(const std::string& serial, uint64_t bytes)
+	{
+		for (const std::string& dir : OrbisGameSearchDirs())
+		{
+			const std::string found = FindExisting(dir, serial, bytes);
+			if (!found.empty())
+				return found;
+		}
+		return {};
+	}
+
 	// vk-285-150: flag disc_readtest: for a disc that's already copied, ask the drive for speed as a copy would and time
 	// 256 MB at its start and its end (a drive that spins freely reads the end faster), once per disc.
 	void ReadTestOnce(const Node& node, const std::string& serial)
@@ -375,6 +454,78 @@ namespace
 	}
 	void ClearDumpProgress() { unlink(DumpProgressPath().c_str()); }
 
+	// 2.04: the disc's name as the shelf and its copy show it.
+	std::string DiscTitle(const std::string& serial)
+	{
+		fe::GameInfo gi;
+		gi.serial = serial;
+		gi.title = serial;
+		fe::ApplyGameDbTitle(gi);
+		return gi.title.empty() || gi.title == serial ? std::string("PS2 disc") : gi.title;
+	}
+
+	// 2.11 (swordpdf: "if you're copying a disc, start a game, and go back, it asks you again"): going back to the menu from a game starts the app afresh
+	// (the console only lets it return to the shelf by re-executing itself). What the person chose for the disc in the drive is kept in
+	// logs/disc-ask-kept.txt ("<serial> copy|play|later <time>", removed when the disc leaves), and a start that is such a re-exec with that disc still in
+	// goes on from it: a copy is taken up again (OrbisDiscResume.h), "play" and "not now" are not asked again (the disc waits on the shelf).
+	std::string KeptChoicePath() { return OrbisLogPath("disc-ask-kept.txt"); }
+	void ClearKeptChoice() { unlink(KeptChoicePath().c_str()); }
+	bool ReadKeptChoice(std::string& serial, std::string& word)
+	{
+		FILE* f = fopen(KeptChoicePath().c_str(), "r");
+		if (!f)
+			return false;
+		char s[64] = {}, w[16] = {};
+		long long when = 0;
+		const int got = fscanf(f, "%63s %15s %lld", s, w, &when);
+		fclose(f);
+		const long long now = static_cast<long long>(time(nullptr));
+		if (got != 3 || now < when || now - when > 6 * 3600)
+			return false;
+		serial = s;
+		word = w;
+		return true;
+	}
+	bool ReadSmallFile(const std::string& path, std::string& out)
+	{
+		FILE* f = fopen(path.c_str(), "r");
+		if (!f)
+			return false;
+		char buf[256] = {};
+		const size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+		fclose(f);
+		out.assign(buf, n);
+		return n > 0;
+	}
+
+	// 2.04: the shelf's answer for the disc daemon (disclaunch/disc_launch.c): "<serial> copy|play|later", removed when the disc leaves.
+	void WriteAskChoice(const std::string& serial, const char* word)
+	{
+	if (FILE* f = fopen(OrbisLogPath("disc-ask-choice.txt").c_str(), "w"))
+	{
+	fprintf(f, "%s %s\n", serial.c_str(), word);
+	fclose(f);
+	}
+	// 2.11: and for the next start of the app (see KeptChoice)
+	if (FILE* f = fopen(KeptChoicePath().c_str(), "w"))
+	{
+	fprintf(f, "%s %s %lld\n", serial.c_str(), word, static_cast<long long>(time(nullptr)));
+	fclose(f);
+	}
+	}
+
+	// 2.04: games/ already holds this disc (the copy's own name at the disc's size, or an image of the same serial): no question is
+	// asked, its game starts from the copy as before.
+	bool AlreadyCopied(const Node& node, const std::string& serial)
+	{
+		const std::string games = OrbisGamesDestDir(); // 2026-10-16: the games folder set, else games/; "" with none that can be written to
+		const std::string iso = games + "/" + Clean(DiscTitle(serial) + " (" + serial + ")") + ".iso";
+		struct stat st;
+		if (!games.empty() && stat(iso.c_str(), &st) == 0 && static_cast<uint64_t>(st.st_size) == node.bytes)
+			return true;
+		return !FindExistingAnywhere(serial, node.bytes).empty();
+	}
+
 	// Copies the disc unless games/ has it. The copy's path when it's there in full at the end, else empty. vk-285-155:
 	// `clean` is set false when the copy had unreadable sectors (the caller then doesn't auto-start it).
 	std::string Dump(const Node& node, const std::string& serial, bool& clean)
@@ -385,15 +536,16 @@ namespace
 		gi.title = serial;
 		fe::ApplyGameDbTitle(gi);
 		const std::string title = gi.title.empty() || gi.title == serial ? std::string("PS2 disc") : gi.title;
-		const std::string games = OrbisDir("games");
-		mkdir(games.c_str(), 0777);
+		const std::string games = OrbisGamesDestDir(); // 2026-10-16: the games folder set (the first that is no NFS share), else games/
+		if (!games.empty())
+			mkdir(games.c_str(), 0777);
 		const std::string name = Clean(title + " (" + serial + ")");
 		const std::string iso = games + "/" + name + ".iso", part = iso + ".part";
 		// vk-285-155: an ".incomplete" marker beside a copy that was made with unreadable sectors, so it stays off auto-start
 		// across sessions (the caller's `clean` goes false), not only in the session that made it.
 		auto has_holes = [](const std::string& image) { struct stat s; return stat((image + ".incomplete").c_str(), &s) == 0; };
 		struct stat st;
-		if (stat(iso.c_str(), &st) == 0 && static_cast<uint64_t>(st.st_size) == node.bytes)
+		if (!games.empty() && stat(iso.c_str(), &st) == 0 && static_cast<uint64_t>(st.st_size) == node.bytes)
 		{
 			clean = !has_holes(iso);
 			static std::string s_said;
@@ -405,7 +557,7 @@ namespace
 			}
 			return iso;
 		}
-		const std::string existing = FindExisting(games, serial, node.bytes);
+		const std::string existing = FindExistingAnywhere(serial, node.bytes);
 		if (!existing.empty())
 		{
 			clean = !has_holes(existing);
@@ -419,11 +571,38 @@ namespace
 			}
 			return existing;
 		}
+		if (games.empty())
+		{
+			// 2026-10-16: games folders are set (PS5SX2/GameFolders) and none of them can take a copy (a missing folder, or only NFS
+			// shares, which are read-only): the disc is not copied, and plays from the drive.
+			static std::string s_said_none;
+			if (s_said_none != serial)
+			{
+				s_said_none = serial;
+				Log("%s: not copied: none of the games folders set can be written to; the disc plays from the drive", serial.c_str());
+				OrbisNotifyPlain("PS2 disc: set a games folder that can be written to");
+			}
+			return {};
+		}
+		// 2.11: a copy the app's restart cut short (OrbisDiscResume.h) is taken up again a little before where its state says.
+		const std::string state_file = part + ".state";
+		uint64_t resume_at = 0, resume_bad = 0, held = 0; // held: bytes the .part occupies already (a resumed copy needs only the rest of the room)
+		{
+			orbis_disc::ResumeState st;
+			std::string text;
+			struct stat ps;
+			if (stat(part.c_str(), &ps) == 0 && ReadSmallFile(state_file, text) && orbis_disc::ParseResumeState(text, st))
+			{
+				resume_at = orbis_disc::ResumeOffset(st, serial, node.bytes, static_cast<uint64_t>(ps.st_size));
+				resume_bad = resume_at ? st.bad : 0;
+				held = resume_at ? std::min<uint64_t>(static_cast<uint64_t>(ps.st_size), node.bytes) : 0;
+			}
+		}
 		// vk-285-145: libkernel's _fstatfs (fe_ps5), never libc's statfs. UINT64_MAX: not known, copied anyway.
 		const uint64_t free_bytes = orbis_frontend_free_bytes(games);
 		if (free_bytes != UINT64_MAX)
 		{
-			if (free_bytes < node.bytes + (256ull << 20))
+			if (free_bytes + held < node.bytes + (256ull << 20)) // (2.11: a resumed copy already holds `held` of it)
 			{
 				Log("%s: %llu MB needed, %llu MB free: not copied", serial.c_str(), static_cast<unsigned long long>(node.bytes >> 20),
 					static_cast<unsigned long long>(free_bytes >> 20));
@@ -436,7 +615,18 @@ namespace
 			}
 		}
 		const int in = open(node.path.c_str(), O_RDONLY);
-		const int out = open(part.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
+		const int out = open(part.c_str(), O_WRONLY | O_CREAT | (resume_at ? 0 : O_TRUNC), 0666);
+		if (resume_at && out >= 0 && lseek(out, static_cast<off_t>(resume_at), SEEK_SET) != static_cast<off_t>(resume_at)) // (no truncation: a second cut before the next state keeps the .part as long as the state says)
+		{
+			Log("%s: the unfinished copy could not be taken up (errno %d): starting over", serial.c_str(), errno);
+			resume_at = resume_bad = 0;
+			if (ftruncate(out, 0) != 0 || lseek(out, 0, SEEK_SET) != 0)
+			{
+				close(out);
+				if (in >= 0) close(in);
+				return {};
+			}
+		}
 		if (in < 0 || out < 0)
 		{
 			Log("%s: open failed (drive %d, file %d, errno %d)", serial.c_str(), in, out, errno);
@@ -451,7 +641,10 @@ namespace
 			snprintf(msg, sizeof(msg), "Copying PS2 disc: %s (%llu MB)", title.c_str(), static_cast<unsigned long long>(node.bytes >> 20));
 			OrbisNotifyPlain(msg);
 		}
-		PublishDumpProgress(serial, title, 0); // live-22: the shelf's spinning-disc entry starts here
+		if (resume_at)
+			Log("%s: carrying on at %llu of %llu MB (a copy the app's restart cut short)", serial.c_str(), static_cast<unsigned long long>(resume_at >> 20),
+				static_cast<unsigned long long>(node.bytes >> 20));
+		PublishDumpProgress(serial, title, static_cast<int>(resume_at * 100 / node.bytes)); // live-22: the shelf's spinning-disc entry starts here
 		// vk-285-150: the drive asked for its fastest read through its pass device (SET STREAMING; ProsperoDiscSpeed.cpp).
 		// vk-285-147/148's CDRIOCREADSPEED came back EINVAL on the console: it sends SET CD SPEED, a CD command.
 		// vk-285-151: and the fastest way to read it (pread on cd0, or READ commands through pass0; ProsperoDiscSpeed.cpp)
@@ -465,18 +658,20 @@ namespace
 		const auto t0 = std::chrono::steady_clock::now();
 		auto rate = [&](uint64_t done) {
 			const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-			return secs > 0 ? done / secs : 0.0;
+			return secs > 0 ? (done - resume_at) / secs : 0.0;
 		};
 		// the speed over the last 5% (a CAV drive speeds up toward the disc's edge)
-		uint64_t mark_done = 0;
+		uint64_t mark_done = resume_at;
 		auto mark_time = t0;
 		// vk-285-148: how long the drive takes per read, and how much of the time a read was running ("drive busy"):
 		// busy near 100% at a steady speed is the drive's own limit; well under it, the copy loop is waiting on something.
 		std::atomic<uint64_t> read_us{0}, read_n{0};
+		std::mutex bad_mutex; // the unreadable sectors found in this run (the reader thread adds them, the progress callback counts them)
+		std::vector<uint64_t> bad_list;
 		uint64_t mark_read_us = 0, mark_read_n = 0;
 		Log("reading %zu MiB at a time, %d ahead", chunk >> 20, depth);
-		const orbis_disc::CopyResult res = orbis_disc::Copy(
-			node.bytes, chunk, depth, 3, 4096,
+		const orbis_disc::CopyResult res = orbis_disc::CopyFrom(
+		resume_at, resume_bad, node.bytes, chunk, depth, 3, 4096,
 			[&](uint64_t off, void* buf, size_t len) {
 				const auto a = std::chrono::steady_clock::now();
 				const ssize_t r = OrbisDiscRead(rm, off, buf, len);
@@ -494,6 +689,28 @@ namespace
 				{
 					last_file_pct = pct;
 					PublishDumpProgress(serial, title, pct);
+					// 2.11: how far the writing has come, for a restart to carry on from (OrbisDiscResume.h)
+					{
+						orbis_disc::ResumeState st;
+						st.serial = serial;
+						st.total = node.bytes;
+						st.done = done;
+						{
+							const uint64_t resume_point = done > orbis_disc::kResumeRewind ? (done - orbis_disc::kResumeRewind) / 2048 : 0;
+							std::lock_guard<std::mutex> lock(bad_mutex);
+							st.bad = resume_bad;
+							for (const uint64_t sector : bad_list)
+								st.bad += sector < resume_point ? 1 : 0;
+						}
+						const std::string tmp = state_file + ".tmp";
+						if (FILE* sf = fopen(tmp.c_str(), "w"))
+						{
+							const std::string text = orbis_disc::FormatResumeState(st);
+							fwrite(text.data(), 1, text.size(), sf);
+							fclose(sf);
+							rename(tmp.c_str(), state_file.c_str());
+						}
+					}
 				}
 				if (pct / 5 == last_pct / 5)
 					return;
@@ -524,6 +741,10 @@ namespace
 				}
 			},
 			[&](uint64_t sector) {
+				{
+					std::lock_guard<std::mutex> lock(bad_mutex);
+					bad_list.push_back(sector);
+				}
 				static int s_said = 0;
 				if (++s_said <= 20)
 					Log("sector %llu unreadable (errno %d): zeros", static_cast<unsigned long long>(sector), errno);
@@ -535,6 +756,8 @@ namespace
 		OrbisDiscSpeedRestore(node.path.c_str(), rm);
 		OrbisDiscReadMethodClose(rm);
 		close(in);
+		if (!failed && resume_at && ftruncate(out, static_cast<off_t>(node.bytes)) != 0) // a resumed .part may have been longer than what was written over it
+			Log("%s: could not set the copy's length (errno %d)", serial.c_str(), errno);
 		fsync(out);
 		close(out);
 		if (failed)
@@ -542,11 +765,14 @@ namespace
 			ClearDumpProgress(); // live-22: drop the shelf's spinning-disc entry
 			OrbisNotifyPlain("PS2 disc copy failed: see the log (Download logs)");
 			unlink(part.c_str());
+			unlink(state_file.c_str());
 			sleep(30);
 			return {};
 		}
 		ClearDumpProgress(); // live-22: the copy is done; the shelf drops the spinning-disc entry (the game launches next)
 		rename(part.c_str(), iso.c_str());
+		s_copy_end_ms.store(NowMs()); // 2.11 (dumpxmb): t = 0 of the "endcopy" lines and of the exec decision's "the copy ended N ms ago"
+		unlink(state_file.c_str());
 		const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 		Log("done: %s, %llu MB in %.0f s (%.1f MB/s, %.1fx average), %llu unreadable sectors", iso.c_str(),
 			static_cast<unsigned long long>(done >> 20), secs, secs > 0 ? done / secs / 1e6 : 0.0,
@@ -710,8 +936,22 @@ namespace
 		std::string handled;
 		std::string failed;  // vk-285-155: a disc that didn't copy; not tried again until it leaves (no 3 s retry loop)
 		std::string pending; // a copy whose game waits for the shelf
+		std::string pending_said; // 2.11 (dumpxmb): the copy whose "waits: no shelf is up" was logged (once)
+		std::string asked;    // 2.04: the disc the shelf was asked about (play from the disc, or copy it)
+		std::string unasked;  // 2.04: the disc that waits for a shelf (logged once)
+		std::string at_start; // 2.04: the disc that was already in when this run looked first (it started PS5SX2, or PS5SX2 was opened with it in): not asked about, copied as before
+		std::string declined; // 2.04: a disc the person said "not now" to (or whose question went away): left alone until it leaves
 		bool refg_done = false; // vk-285-159: one re-foreground attempt per boot, whatever the outcome (flag disc_refg)
+		long long last_media_change_ms = 0; // 2.11 (dumpxmb): when a media size other than 0 was last seen to change (the log's "N ms after the disc was seen")
 		const bool relaunch = TakeRelaunchMark();
+		// 2.11: a start that is a re-exec into the shelf (back to the menu) with the same disc still in carries on from what was chosen before; any other
+		// start asks afresh.
+		std::string kept_serial, kept_word;
+		if (relaunch)
+			ReadKeptChoice(kept_serial, kept_word);
+		else
+			ClearKeptChoice();
+		std::string drive_shown; // 2.11: the disc the shelf was told is in the drive
 		const std::string recent = RecentAutoStart(kAutoStartGuardSeconds); // vk-285-155: a disc auto-started recently (a likely failed launch)
 		sleep(5); // vk-285-145: well after the app's start
 		if (relaunch)
@@ -724,33 +964,55 @@ namespace
 			// come to the foreground.  A self-exec from within our own process is what the PS5 shell needs to
 			// bring the app to the front; an exec from an external ELF loader does not.  disc-launch.txt
 			// (the ISO path) was already written by the ELF and will be picked up at the next boot.
+			// 2.11 (dumpxmb): honoured only when no game is being started or runs in this process and this is not a disc tile (OrbisDiscExec.h); an
+			// ignored signal takes disc-launch.txt with it. Flags: discexec (the old behaviour), nodiscexec (never).
 			{
 				const std::string exec_mark = OrbisLogPath("disc-launch-exec.txt");
 				struct stat est{};
 				if (stat(exec_mark.c_str(), &est) == 0)
 				{
 					unlink(exec_mark.c_str());
-					Log("disc-launch-exec.txt: self-exec to come to the foreground");
-					// vk-285-160e: a re-foreground mark too, so a disc_refg flag left on from 159 testing doesn't
-					// bounce the fresh boot a second time for the same disc.
-					if (FILE* rf = fopen(ReForegroundMarkPath().c_str(), "w"))
+					orbis_disc::ExecIn ein = {};
+					ein.is_tile = s_tile_process.load();
+					ein.game_starting = s_game_starting.load();
+					ein.flag_discexec = OrbisFlag("discexec");
+					ein.flag_nodiscexec = OrbisFlag("nodiscexec");
+					const orbis_disc::ExecVerdict verdict = orbis_disc::DecideExec(ein);
+					const long long now_ms = NowMs(), copy_end = s_copy_end_ms.load(), starting = s_game_starting_ms.load();
+					Log("disc-launch-exec.txt: seen (the copy ended %lld ms ago, a game is starting since %lld ms, tile %d, flags discexec %d nodiscexec %d): %s",
+						copy_end ? now_ms - copy_end : -1LL, starting ? now_ms - starting : -1LL, ein.is_tile ? 1 : 0, ein.flag_discexec ? 1 : 0,
+						ein.flag_nodiscexec ? 1 : 0, orbis_disc::ExecVerdictText(verdict));
+					if (verdict != orbis_disc::ExecVerdict::Honor)
+						orbis_disc::RemoveSignalFiles(OrbisLogPath("disc-launch.txt"), exec_mark);
+					else
 					{
-						fprintf(rf, "disc-auto %lld\n", static_cast<long long>(time(nullptr)));
-						fclose(rf);
+						Log("disc-launch-exec.txt: self-exec to come to the foreground"); // (the old line, kept: the old logs are read for it)
+						// vk-285-160e: a re-foreground mark too, so a disc_refg flag left on from 159 testing doesn't
+						// bounce the fresh boot a second time for the same disc.
+						if (FILE* rf = fopen(ReForegroundMarkPath().c_str(), "w"))
+						{
+							fprintf(rf, "disc-auto %lld\n", static_cast<long long>(time(nullptr)));
+							fclose(rf);
+						}
+						const char* path = "/data/homebrew/PPSA99203/eboot.bin";
+						struct stat st{};
+						if (stat(path, &st) != 0)
+							path = "/app0/eboot.bin";
+						fflush(stdout);
+						const int rc = sceSystemServiceLoadExec(path, nullptr);
+						Log("disc-launch-exec.txt: LoadExec(%s) returned 0x%08x%s", path, static_cast<unsigned>(rc),
+							rc == 0 ? " (accepted: the system is closing this process)" : " (refused; carrying on)");
+						if (rc == 0)
+							for (int i = 0; i < 100; i++)
+								usleep(100000); // as TryReForeground: the kill is under way; start nothing in a dying process
 					}
-					const char* path = "/data/homebrew/PPSA99203/eboot.bin";
-					struct stat st{};
-					if (stat(path, &st) != 0)
-						path = "/app0/eboot.bin";
-					fflush(stdout);
-					sceSystemServiceLoadExec(path, nullptr);
-					// LoadExec does not return on success; if it fails, carry on
-					Log("disc-launch-exec.txt: LoadExec returned (failed); carrying on");
 				}
 			}
 
 			const std::vector<std::string> nodes = Candidates(first);
 			bool any_ps2 = false;
+			bool waiting = false;
+			std::string present_serial, present_title; // 2.11: the PS2 disc in the drive that is not copied (the shelf lists it)
 			for (const std::string& path : nodes)
 			{
 				// PR #34 port: a game plays from this drive (OrbisDiscDumpClaim): not looked at, not copied. A PS2 disc
@@ -767,6 +1029,14 @@ namespace
 				ProbeCache& pc = probes[path];
 				if (media == 0 || media != pc.media || log)
 				{
+					// 2.11 (dumpxmb): the media size changing is the only sign the app gets that the disc went out or in (the drive is not asked anything more)
+					if (media != pc.media)
+					{
+						if (!log)
+							Log("%s: media size %llu -> %llu", path.c_str(), static_cast<unsigned long long>(pc.media), static_cast<unsigned long long>(media));
+						if (media != 0)
+							last_media_change_ms = NowMs();
+					}
 					pc = ProbeCache{};
 					pc.iso = ProbeNode(path, pc.node, log);
 					pc.media = media; // a non-PS2 disc is remembered too, so it isn't re-read every 3 s either
@@ -790,6 +1060,11 @@ namespace
 					continue;
 				}
 				any_ps2 = true;
+				if (present_serial.empty() && !AlreadyCopied(node, serial))
+				{
+					present_serial = serial;
+					present_title = DiscTitle(serial);
+				}
 				// vk-285-155: at the first look, a re-exec or a just-auto-started disc counts as handled (don't auto-start).
 				if (first && (relaunch || serial == recent))
 					handled = serial;
@@ -802,17 +1077,107 @@ namespace
 					refg_done = true;
 					TryReForeground(serial); // under flag disc_refg this re-execs and doesn't return
 				}
+				// 2.04: a disc not copied yet: the shelf asks whether to play it from the disc or copy it first (flag nodiscask: copied
+				// at once, as before). With no shelf up it is copied as before too.
+				if (first && at_start.empty())
+					at_start = serial;
+				// 2.11: what was chosen before the app restarted (see ReadKeptChoice): a copy goes on without a question; "play" and "not now" are left alone.
+				bool resumed_copy = false;
+				if (serial == kept_serial)
+				{
+					const bool copy = kept_word == "copy";
+					kept_serial.clear();
+					if (copy)
+					{
+						resumed_copy = true;
+						Log("%s: copy it first (chosen before the app restarted): carrying on without asking", serial.c_str());
+					}
+					else
+					{
+						declined = serial;
+						Log("%s: %s before the app restarted: not asked again (pick the disc on the shelf to choose)", serial.c_str(),
+							kept_word == "play" ? "played from the disc" : "\"not now\"");
+					}
+				}
+				if (serial == declined)
+				continue;
+				// A disc is copied only when the person chooses it on the shelf. With no shelf up (the PS5 home screen with PS5SX2 in the
+				// background, a game running, the app still starting) nothing is copied: the disc waits, and the question comes with the shelf.
+				if (!resumed_copy && !OrbisFlag("nodiscask") && !AlreadyCopied(node, serial))
+				{
+					if (asked != serial)
+					{
+						if (orbis_frontend_ask_disc(DiscTitle(serial), serial))
+						{
+							asked = serial;
+							waiting = true;
+							Log("%s: asked on the shelf: play from the disc, or copy it first", serial.c_str());
+							continue;
+						}
+						if (unasked != serial)
+						{
+							unasked = serial;
+							Log("%s: no shelf is up: not copied; the question comes when the shelf is up", serial.c_str());
+						}
+						continue;
+					}
+					else
+					{
+						const int answer = orbis_frontend_disc_answer();
+						if (answer == 0)
+						{
+							waiting = true;
+							continue;
+						}
+						if (answer == 2)
+						{
+							if (OrbisDiscDumpClaim(path) && orbis_frontend_request_launch(path))
+							{
+								NoteGameStarting("play from the drive: the launch request was taken"); // 2.11 (dumpxmb)
+								WriteAskChoice(serial, "play");
+								Log("%s: playing straight from the drive %s", serial.c_str(), path.c_str());
+								OrbisNotifyPlain("PS2 disc: starting the game from the disc");
+								handled = serial;
+							}
+							else
+							{
+								WriteAskChoice(serial, "later");
+								Log("%s: could not start from the drive %s; left alone", serial.c_str(), path.c_str());
+								OrbisDiscDumpRelease(path);
+								declined = serial;
+							}
+							continue;
+						}
+						if (answer == 3 || answer < 0)
+						{
+							WriteAskChoice(serial, "later");
+							Log("%s: %s", serial.c_str(), answer == 3 ? "not now: the disc is left alone until it is taken out" : "the question went away: the disc is left alone");
+							declined = serial;
+							continue;
+						}
+						WriteAskChoice(serial, "copy");
+						Log("%s: copy it first (chosen on the shelf)", serial.c_str());
+					}
+				}
 				bool clean = true;
 				if (!BeginCopy(path))
-					continue; // PR #34 port: claimed for a game just now
+				continue; // PR #34 port: claimed for a game just now
+				// 2.11 (review): the disc is being copied (or has been, or failed): the shelf's "disc in the drive" entry goes; the next look says again
+				present_serial.clear();
+				if (!drive_shown.empty())
+				{
+					drive_shown.clear();
+					orbis_frontend_set_drive_disc(std::string(), std::string());
+				}
 				s_busy.store(true);
 				const std::string copy = Dump(node, serial, clean);
 				s_busy.store(false);
 				EndCopy();
 				if (copy.empty())
 				{
-					// vk-285-155: don't re-read the disc and rewrite gigabytes every 3 s; wait for it to leave.
-					failed = serial;
+				// vk-285-155: don't re-read the disc and rewrite gigabytes every 3 s; wait for it to leave.
+				failed = serial;
+				WriteAskChoice(serial, "later"); // 2.11 (review): a restart must not retry a copy that failed, without asking
 					Log("%s: not copied; left until the disc is taken out and put back", serial.c_str());
 					continue;
 				}
@@ -828,12 +1193,49 @@ namespace
 				pending = copy; // started when the shelf takes it (it may not be up yet)
 				Log("%s: its game starts when the shelf is up (%s)", serial.c_str(), copy.c_str());
 			}
+			// 2.11 (swordpdf: "since the emulator knows what game is inside the drive, it would be cool to have the disc in the shelf as well"): the shelf lists
+			// the PS2 disc in the drive that is not copied, first, and asks about it again when it is picked there.
+			{
+				const std::string shown = (OrbisFlag("nodiscask") || present_serial.empty()) ? std::string() : present_serial;
+				if (shown != drive_shown)
+				{
+					drive_shown = shown;
+					orbis_frontend_set_drive_disc(shown.empty() ? std::string() : present_title, shown);
+				}
+			}
 			if (!pending.empty() && orbis_frontend_request_launch(pending))
 			{
-				Log("starting %s", pending.c_str());
+				NoteGameStarting("the launch request for the copy was taken"); // 2.11 (dumpxmb): from now on the disc helper's exec signal is ignored
+				{
+					const long long now_ms = NowMs(), end = s_copy_end_ms.load();
+					Log("starting %s (%lld ms after the copy ended, %lld ms after the disc was seen)", pending.c_str(), end ? now_ms - end : -1LL,
+						last_media_change_ms ? now_ms - last_media_change_ms : -1LL);
+				}
 				OrbisNotifyPlain("PS2 disc: starting the game");
 				WriteAutoStartMark(handled); // vk-285-155: so a force-off then reopen doesn't loop this game
 				pending.clear();
+				pending_said.clear();
+			}
+			else if (!pending.empty() && pending_said != pending)
+			{
+				// 2.11 (dumpxmb): the copy is done and its game waits: no shelf is up to take the request (a game runs, or the shelf is not up yet)
+				pending_said = pending;
+				Log("%s waits: no shelf is up to take the launch request (a game runs, or the shelf is not up yet)", pending.c_str());
+			}
+			if (!any_ps2 && !asked.empty())
+			{
+				orbis_frontend_cancel_disc_ask(); // 2.04: the disc was taken out with the question open
+				asked.clear();
+				unlink(OrbisLogPath("disc-ask-choice.txt").c_str());
+				ClearKeptChoice();
+			}
+			if (!any_ps2)
+			{
+			unasked.clear();
+			declined.clear();
+			at_start.clear();
+			kept_serial.clear();
+			ClearKeptChoice();
 			}
 			if (!any_ps2 && (!handled.empty() || !failed.empty()))
 			{
@@ -842,6 +1244,7 @@ namespace
 				handled.clear();
 				failed.clear(); // vk-285-155: a disc that failed is tried again once it's reinserted
 				pending.clear();
+				pending_said.clear();
 				ClearReForegroundMark(); // vk-285-159: a re-inserted disc bounces us to the front again (flag disc_refg)
 				refg_done = false;
 				// vk-285-160d (AI-assisted): remove the autostart guard so a reinserted disc
@@ -852,7 +1255,31 @@ namespace
 			if (logged.size() > 32)
 				logged.clear();
 			first = false;
-			sleep(3);
+			EndCopyTimeline(probes); // 2.11 (dumpxmb): one line per pass for a minute after a copy ended
+			// 2.04: a question waits on the shelf: look for the answer every second. 2.11: in tenths of a second, so the shelf's "ask about the disc again" is
+			// heard at once.
+			bool reask = false;
+			for (int tenth = 0; tenth < (waiting ? 10 : 30) && !reask; tenth++)
+			{
+				reask = orbis_frontend_take_reask();
+				if (!reask)
+					usleep(100000);
+			}
+			if (reask)
+			{
+				Log("the shelf asks about the disc again");
+				declined.clear();
+				asked.clear();
+				failed.clear();
+				unasked.clear();
+				handled.clear(); // 2.11 (review): a fresh choice: a copy then starts its game, as on a fresh insert
+				pending.clear();
+				pending_said.clear();
+				kept_serial.clear();
+				unlink(OrbisLogPath("disc-ask-choice.txt").c_str());
+				ClearKeptChoice();
+				orbis_frontend_cancel_disc_ask();
+			}
 		}
 		return nullptr;
 	}
@@ -871,6 +1298,12 @@ static void* AliveThread(void*)
 			fprintf(f, "%lld\n", static_cast<long long>(time(nullptr)));
 			fclose(f);
 		}
+		{
+			// 2.11: a game plays from a drive: the stamp for the disc helper stays fresh (StampPlayingLocked)
+			std::lock_guard<std::mutex> lock(s_drive_mutex);
+			if (!s_claimed.empty())
+				StampPlayingLocked();
+		}
 		sleep(2);
 	}
 	return nullptr;
@@ -880,6 +1313,12 @@ void OrbisDiscDumpStart()
 {
 	if (s_started.exchange(true))
 		return;
+	{
+		// 2.11: a stamp "a game plays from a drive" left by the run before this one (it ended by re-executing or being killed) is not true now
+		std::lock_guard<std::mutex> lock(s_drive_mutex);
+		if (s_claimed.empty())
+			StampPlayingLocked();
+	}
 	{
 		pthread_t at;
 		pthread_attr_t aattr;
@@ -911,6 +1350,47 @@ bool OrbisDiscDumpBusy()
 	return s_busy.load();
 }
 
+// 2.11 (dumpxmb): see ProsperoDiscDump.h and OrbisDiscExec.h
+void OrbisDiscNoteTile(bool tile)
+{
+	s_tile_process.store(tile);
+	if (tile)
+		Log("this process is a disc tile: the disc helper's disc-launch-exec.txt is never honoured here");
+}
+
+void OrbisDiscNoteGameStarting(const char* how)
+{
+	NoteGameStarting(how);
+}
+
+void OrbisDiscLogSignalFiles(const char* when)
+{
+	LogSignalFiles(when);
+}
+
+std::string OrbisFindDiscCopy(const std::string& serial, const std::string& device)
+{
+	const uint64_t bytes = QuietMediaSize(device);
+	const std::string games = OrbisGamesDestDir(); // 2026-10-16: the games folder set, else games/; "" with none that can be written to
+	auto whole = [](const std::string& image) {
+		struct stat s;
+		return !image.empty() && stat((image + ".incomplete").c_str(), &s) != 0;
+	};
+	const std::string iso = games + "/" + Clean(DiscTitle(serial) + " (" + serial + ")") + ".iso";
+	struct stat st;
+	if (!games.empty() && stat(iso.c_str(), &st) == 0 && (bytes == 0 || static_cast<uint64_t>(st.st_size) == bytes) && whole(iso))
+		return iso;
+	if (bytes == 0)
+		return {};
+	const std::string other = FindExistingAnywhere(serial, bytes);
+	return whole(other) ? other : std::string();
+}
+
+std::string OrbisDiscSettingsStem(const std::string& serial)
+{
+	return Clean(DiscTitle(serial) + " (" + serial + ")");
+}
+
 bool OrbisDiscDumpClaim(const std::string& device)
 {
 	std::lock_guard<std::mutex> lock(s_drive_mutex);
@@ -922,6 +1402,7 @@ bool OrbisDiscDumpClaim(const std::string& device)
 	if (s_claimed != device)
 		Log("%s: a game plays from this drive: the disc watcher leaves it alone", device.c_str());
 	s_claimed = device;
+	StampPlayingLocked(); // 2.11: for the disc helper
 	return true;
 }
 
@@ -931,5 +1412,6 @@ void OrbisDiscDumpRelease(const std::string& device)
 	if (s_claimed != device)
 		return;
 	s_claimed.clear();
+	StampPlayingLocked(); // 2.11: removes the disc helper's stamp
 	Log("%s: no game plays from this drive now: the disc watcher may copy its disc", device.c_str());
 }

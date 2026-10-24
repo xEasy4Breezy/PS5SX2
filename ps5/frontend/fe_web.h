@@ -13,6 +13,7 @@
 #pragma once
 
 #include "fe_covers.h"
+#include "fe_gametile.h"
 #include "fe_games.h"
 #include "fe_game_achievements.h"
 
@@ -39,7 +40,8 @@ struct WebAsset
 
 struct WebConfig
 {
-	std::vector<std::string> game_dirs; // the images: games/, then the top folder
+	std::vector<std::string> game_dirs; // the images: games/, then the top folder (2026-10-16: or only the folders the player set)
+	bool scan_subfolders = true;        // 2026-10-16: PS5SX2/ScanSubfolders: also the folders in each of game_dirs (ScanGames)
 	std::string settings_dir;           // settings/<image stem>.ini
 	std::string gs_ini;                 // the settings every game shares
 	std::string patches_dir;            // <serial>_<crc>.pnach
@@ -67,6 +69,10 @@ struct WebConfig
 	std::function<std::string()> current_disc;
 	std::function<std::vector<std::string>()> disc_set;
 	std::function<bool(const std::string& path)> change_disc;
+	// 2.12: a game's tile on the PS5 home screen (/api/tile; fe_gametile.h): the folder the page and the PS5SX2 Disc Helper talk through (/data/PCSX2/tiles; empty: no
+	// tile row on the page) and the game this process was started from a tile for ("" outside a tile): its own tile is not taken off from inside it.
+	std::string tiles_dir;
+	std::string own_tile_game;
 };
 
 // vk-285-51: appends "<date time>  <line>" to the settings log (logs/settings.log), which keeps
@@ -89,8 +95,17 @@ public:
 	uint16_t Port() const { return m_port; }
 	const std::string& Token() const { return m_token; } // "" since vk-285-118 (the host harness sends it to the 1.50 page)
 
-	// The disc image PCSX2 runs ("" while the shelf is up).
+	// The disc image PCSX2 runs ("" while the shelf is up). 2.11: a game played straight from a drive ("/dev/cd0") is no file of
+	// the shelf's list, so the page found none and showed the first game of the list instead (its settings, patches and cheats).
+	// `settings_stem` (the game's settings/<stem>.ini, as main-boot.cpp chose it) and `serial` let the page list it as a game of its
+	// own for as long as it runs; with an empty stem nothing is added (an image of the list needs neither).
 	void SetNowPlaying(const std::string& image_path);
+	void SetNowPlaying(const std::string& image_path, const std::string& settings_stem, const std::string& serial);
+
+	// 2.11: the shelf's search (fe_app.h AppConfig::search_remote and search_report): the shelf says what it is searching for; a page's search
+	// box (POST /api/search) asks for another, and TakeSearchFromPage hands that to the shelf once.
+	void SetSearchReported(const std::string& text);
+	bool TakeSearchFromPage(std::string& text);
 
 	// The QR code's address, "http://<ip>:<port>/" (vk-285-118: no key), and the short "<ip>:<port>" shown under it.
 	// False (both empty) without a network.
@@ -136,6 +151,7 @@ private:
 	CoverFinder& Covers();
 
 	void ApiState(Response& res);
+	void ApiSearch(const Request& req, Response& res); // 2.11
 	void ApiGames(Response& res);
 	void ApiAchievements(Response& res);
 	void ApiAchievementBadge(const Request& req, Response& res);
@@ -149,6 +165,7 @@ private:
 	void ApiDisc(const Request& req, Response& res);   // vk-285-139: put one in (the body: its path)
 	void ApiMemcards(Response& res);                   // vk-285-113: the cards in memcards/
 	void ApiMemcardCreate(const Request& req, Response& res); // vk-285-113: "create <8|16|32|64> <name>"
+	void ApiTile(const Request& req, Response& res);   // 2.12: GET ?id=<image file>, POST "add|remove\n<image file>": the game's home screen tile
 	void Log(const Request& req, const std::string& what);
 
 	WebConfig m_cfg;
@@ -165,8 +182,22 @@ private:
 	std::unique_ptr<CoverFinder> m_covers; // the server thread only (vk-285-110)
 	double m_covers_time = -1e9;
 
+	// review 2026-10-16 (lens 3): the search fields have a mutex of their own. The shelf asks TakeSearchFromPage in every frame, and m_mutex is held
+	// through a whole rescan of the game list (Games(): the folders, every serial, every game's badges: seconds for a big library), which would
+	// have frozen the shelf's frames for as long whenever the page was opened or a game picked on it.
+	mutable std::mutex m_search_mutex;
+	std::string m_search_text;      // 2.11: what the shelf searches for (SetSearchReported, or the page's last box)
+	std::string m_search_from_page; // 2.11: what the page asked for and the shelf has not taken yet
+	bool m_search_pending = false;
+
+	// 2.12: the page's asks for game tiles (the server thread only, but a mutex of its own: the shelf's tracker is another object, the files are shared)
+	std::mutex m_tiles_mutex;
+	gametile::Tracker m_tiles;
+	gametile::StateReader m_tile_state;
+
 	mutable std::mutex m_mutex; // the fields below
 	std::string m_now_playing;
+	GameInfo m_now_extra; // 2.11: the running game as the page lists it when it is no file of the list (file empty: none)
 	std::vector<GameInfo> m_games;
 	double m_games_time = -1e9;
 	std::map<std::string, std::pair<uint64_t, std::string>> m_serials; // path -> (size, serial): USB drives are slow

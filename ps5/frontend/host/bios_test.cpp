@@ -136,6 +136,9 @@ int main(int argc, char** argv)
 	Dir("b/PCSX2/games");
 	CHECK(Has(Describe("b/PCSX2", "b/PCSX2"), "There is no bios folder: make "));
 	CHECK(Has(Describe("b/PCSX2", "b/PCSX2"), "b/PCSX2/bios and copy your BIOS file into it."));
+	// 2026-10-16: a BIOS folder the player set (PS5SX2/BiosFolder, now the only place looked in) that isn't there: that folder is the one to make.
+	CHECK(Has(Describe("b/custom-missing", "b/PCSX2"), "There is no bios folder: make "));
+	CHECK(Has(Describe("b/custom-missing", "b/PCSX2"), "b/custom-missing and copy your BIOS file into it."));
 
 	// A PS1 BIOS (scph5501.bin, 512 KB) and a ROM1 without its main file.
 	File(Dir("c/PCSX2/bios") + "/scph5501.bin", KB512);

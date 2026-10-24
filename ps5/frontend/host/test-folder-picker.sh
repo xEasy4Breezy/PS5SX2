@@ -20,6 +20,7 @@ mkdir -p "$data/usb0/PS2/Sub" "$data/usb0/Other" "$data/usb0/.hidden"
 : > "$data/usb0/PS2/Game A (USA).iso"
 : > "$data/usb0/PS2/Sub/Game B (Europe).chd"
 : > "$data/usb0/PS2/notes.txt"
+mkdir -p "$data/usb0/ZZ #bad" # review 2026-10-16: a name the settings file can't hold ('#' starts a comment there); last in the list, so no row above it moves
 failed=0
 check() { # check <what> <command...>
   local what=$1
@@ -39,13 +40,13 @@ run() {
 }
 ini() { grep -s "^$1=" "$data/gs.ini" | head -1 | cut -d= -f2-; }
 # The sheet for all games (Square, then R1), its first rows (vk-285-135b: Folders at the top): Recommended for all games, then
-# Game folders, BIOS folder, NFS shares. Each step below goes down from the top.
+# Game folders, BIOS folder, NFS shares, Textures folder (2026-10-16), Scan USB drives, Scan subfolders. Each step below goes down from the top.
 open_all="game 0;wait 1;press square;wait 0.4;press r1;wait 0.3;press up 80;wait 0.1"
 steps() { tr ';' '\n' <<<"$1" | sed '/^$/d'; }
 script="$work/script.txt"
 
 # A game folder: USB drive 1 > PS2 (2 games, one in its folder Sub) > Use this folder.
-steps "$open_all;press down 1;wait 0.2;press cross;wait 0.3;expect picker=1;shot picker-places;press down;press cross;wait 0.2;shot picker-usb;press down 2;press cross;wait 0.2;shot picker-ps2;press cross;wait 0.3;expect picker=0;expect sheet=1;shot picker-added" > "$script"
+steps "$open_all;press down 1;wait 0.2;press cross;wait 0.3;expect picker=1;shot picker-places;press down 2;press cross;wait 0.2;shot picker-usb;press down 2;press cross;wait 0.2;shot picker-ps2;press cross;wait 0.3;expect picker=0;expect sheet=1;shot picker-added" > "$script"
 run game-folder --script "$script"
 check "the folder is in PS5SX2/GameFolders" test "$(ini PS5SX2/GameFolders)" = "$data/usb0/PS2"
 
@@ -54,13 +55,63 @@ steps "$open_all;press down 1;wait 0.2;press cross;wait 0.3;expect picker=1;pres
 run game-folder-removed --script "$script"
 check "the game folder is gone from gs.ini" test -z "$(ini PS5SX2/GameFolders)"
 
+# 2.11 (swordpdf: "for picking paths you cant really browse to your folder"): "Type a folder path" (the first place) takes a path on
+# the (stand-in) PS5 keyboard and goes there; a path that is no folder stays on the places. /data and the root are places too.
+steps "$open_all;press down 1;wait 0.2;press cross;wait 0.3;expect picker=1;press cross;wait 0.4;expect picker=1;shot picker-typed;press cross;wait 0.3;expect picker=0;expect sheet=1" > "$script"
+run type-path --ime-text "$data/usb0/PS2" --script "$script"
+check "the typed folder is in PS5SX2/GameFolders" test "$(ini PS5SX2/GameFolders)" = "$data/usb0/PS2"
+steps "$open_all;press down 1;wait 0.2;press cross;wait 0.3;press triangle;wait 0.3;expect picker=1;press circle;wait 0.3;expect picker=0" > "$script"
+run type-path-undo --script "$script"
+check "the typed folder is removed again" test -z "$(ini PS5SX2/GameFolders)"
+steps "$open_all;press down 1;wait 0.2;press cross;wait 0.3;press cross;wait 0.4;expect picker=1;shot picker-typed-refused;press circle;wait 0.3;expect picker=0" > "$script"
+run type-path-refused --ime-text "$data/nowhere/at/all" --script "$script"
+check "a path that is no folder adds nothing" test -z "$(ini PS5SX2/GameFolders)"
+
+# 2026-10-16: the root itself ("Everything (the root)", the last place) is no folder to list from: "Use this folder" there says so and
+# nothing is added; the picker stays open.
+steps "$open_all;press down 1;wait 0.2;press cross;wait 0.3;expect picker=1;press down 40;press cross;wait 0.3;press cross;wait 0.3;expect picker=1;shot picker-root-refused;press circle;wait 0.3;press circle;wait 0.3;expect picker=0" > "$script"
+run game-folder-root-refused --script "$script"
+check "the root adds nothing" test -z "$(ini PS5SX2/GameFolders)"
+
 # The BIOS folder: USB drive 1 > Use this folder; then Triangle on the row sets it back.
-steps "$open_all;press down 2;wait 0.2;press cross;wait 0.3;press down;press cross;wait 0.2;press cross;wait 0.3;expect picker=0" > "$script"
+steps "$open_all;press down 2;wait 0.2;press cross;wait 0.3;press down 2;press cross;wait 0.2;press cross;wait 0.3;expect picker=0" > "$script"
 run bios-folder --script "$script"
 check "PS5SX2/BiosFolder is the drive" test "$(ini PS5SX2/BiosFolder)" = "$data/usb0"
 steps "$open_all;press down 2;wait 0.2;press triangle;wait 0.3;expect picker=0" > "$script"
 run bios-folder-reset --script "$script"
 check "PS5SX2/BiosFolder is unset again" test -z "$(ini PS5SX2/BiosFolder)"
+
+# 2026-10-16: the Textures folder (the row after NFS shares): USB drive 1 > Use this folder; then Triangle on the row sets it back.
+steps "$open_all;press down 4;wait 0.2;press cross;wait 0.3;expect picker=1;press down 2;press cross;wait 0.2;press cross;wait 0.3;expect picker=0" > "$script"
+run textures-folder --script "$script"
+check "PS5SX2/TexturesDir is the drive" test "$(ini PS5SX2/TexturesDir)" = "$data/usb0"
+steps "$open_all;press down 4;wait 0.2;press triangle;wait 0.3;expect picker=0" > "$script"
+run textures-folder-reset --script "$script"
+check "PS5SX2/TexturesDir is unset again" test -z "$(ini PS5SX2/TexturesDir)"
+# Review 2026-10-16: a folder whose name has a '#' is refused by the settings writer: nothing is saved for the textures folder, the BIOS folder
+# or the game folders, and the picker still closes (its status line then says "Couldn't save", not that the folder is in use).
+steps "$open_all;press down 4;wait 0.2;press cross;wait 0.3;expect picker=1;press down 2;press cross;wait 0.2;press down 3;press cross;wait 0.2;press cross;wait 0.3;expect picker=0" > "$script"
+run textures-folder-refused --script "$script"
+check "a folder with a # in its name isn't saved as the textures folder" test -z "$(ini PS5SX2/TexturesDir)"
+steps "$open_all;press down 2;wait 0.2;press cross;wait 0.3;press down 2;press cross;wait 0.2;press down 3;press cross;wait 0.2;press cross;wait 0.3;expect picker=0" > "$script"
+run bios-folder-refused --script "$script"
+check "a folder with a # in its name isn't saved as the BIOS folder" test -z "$(ini PS5SX2/BiosFolder)"
+steps "$open_all;press down 1;wait 0.2;press cross;wait 0.3;press down 2;press cross;wait 0.2;press down 3;press cross;wait 0.2;press cross;wait 0.3;expect picker=0" > "$script"
+run game-folder-refused --script "$script"
+check "a folder with a # in its name isn't saved as a game folder" test -z "$(ini PS5SX2/GameFolders)"
+
+# 2026-10-16: the two switches under the folder rows (Scan USB drives, Scan subfolders; both on by default): Cross turns one off, Triangle
+# puts it back to the default (the key is removed).
+steps "$open_all;press down 5;wait 0.2;press cross;wait 0.3;expect picker=0" > "$script"
+run scan-usb-off --script "$script"
+check "PS5SX2/ScanUsb is false" test "$(ini PS5SX2/ScanUsb)" = "false"
+steps "$open_all;press down 6;wait 0.2;press cross;wait 0.3;expect picker=0" > "$script"
+run scan-subfolders-off --script "$script"
+check "PS5SX2/ScanSubfolders is false" test "$(ini PS5SX2/ScanSubfolders)" = "false"
+steps "$open_all;press down 5;wait 0.2;press triangle;wait 0.3;press down;press triangle;wait 0.3" > "$script"
+run scan-switches-reset --script "$script"
+check "PS5SX2/ScanUsb is back to the default" test -z "$(ini PS5SX2/ScanUsb)"
+check "PS5SX2/ScanSubfolders is back to the default" test -z "$(ini PS5SX2/ScanSubfolders)"
 
 # An NFS share typed on the keyboard, listed, then removed.
 steps "$open_all;press down 3;wait 0.2;press cross;wait 0.3;expect picker=1;press cross;wait 0.4;shot picker-nfs;expect picker=1" > "$script"

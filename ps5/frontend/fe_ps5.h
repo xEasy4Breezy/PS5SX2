@@ -25,7 +25,15 @@ struct OrbisFrontendPaths
 	bool sound = true;        // the shelf's key sounds (vk-285-47; off with the nomenusound flag)
 	std::string settings_log; // vk-285-51: logs/settings.log, what the settings page changed
 	// Test build 1 (vk-285-55):
-	std::vector<std::string> usb_dirs; // folders on USB drives to list games from (orbis_usb_game_dirs)
+	std::vector<std::string> usb_dirs; // folders on USB drives to list games from (orbis_usb_game_dirs); read only while game_dirs is empty (a host without roots)
+	// 2026-10-16 (AI-assisted; swordpdf: the game folders setting must list only that folder): the folders games are listed from, all of
+	// them (fe_roots.h ResolveGameRoots: the usual places and the drives, or only the folders the player set, and the NFS shares). When
+	// only_set_folders is on, an empty game_dirs is the answer too (no fallback to games/ and the top folder).
+	std::vector<std::string> game_dirs;
+	bool only_set_folders = false;
+	bool scan_subfolders = true;       // PS5SX2/ScanSubfolders: also the folders in each of game_dirs (ScanGames)
+	std::string roots_signature;       // what usb_list was written for (fe_roots.h): a list for other roots is not used
+	std::string games_folder_note;     // only_set_folders: the folder the empty shelf names (the first set folder)
 	std::string usb_list;              // cache/usb-games.txt: the USB games seen, for the next start's cover prefetch
 	std::vector<std::string> share_roots; // vk-285-156: the NFS shares' folders (OrbisNfs mount points), for covers
 	int test_build = 0;                // > 0: a testing build; the shelf shows TESTING and this label
@@ -82,12 +90,17 @@ int orbis_frontend_prefetch_covers(const OrbisFrontendPaths& paths, double budge
 // once, after the jailbreak; it runs until the app ends, through the shelf and the game. The shelf
 // shows its address as a QR code. The access token is kept in /data/PCSX2/webui_token.txt.
 bool orbis_web_start(const OrbisFrontendPaths& paths, const char* build_tag);
-// The disc image PCSX2 runs, for the page's "now playing".
-void orbis_web_now_playing(const std::string& image_path);
+// The disc image PCSX2 runs, for the page's "now playing". 2.11: the game's settings file stem and serial too, so the page can list a game
+// played from a drive (no file of its list) as the running game (see WebServer::SetNowPlaying).
+void orbis_web_now_playing(const std::string& image_path, const std::string& settings_stem = std::string(),
+	const std::string& serial = std::string());
 // vk-285-139 (main-boot.cpp): the running game's disc, its discs, and a disc the settings page asks for (false: no game).
 std::string orbis_current_disc();
 std::vector<std::string> orbis_disc_set();
 bool orbis_request_disc(const std::string& path);
+// 2.12 (main-boot.cpp): the game this process was started from a home screen game tile for ("" when it was not started from one): the sheet and the page do not
+// take that tile off from inside it (fe_gametile.h).
+std::string orbis_own_tile_game();
 // vk-285-113: the page's address as the QR code the shelf shows: `modules` (one byte a module, row by row), its
 // side length in `size`, and the short "<ip>:<port>" in `shown`. GSRenderer.cpp draws it over the game when the
 // PS5's browser can't be opened (L2 + D-pad down held for 2 s). False without a web server or a network.
@@ -113,6 +126,9 @@ void orbis_event_log_init(const std::string& path);
 int orbis_hide_splash();
 extern "C" void orbis_event_log(const char* line);
 
+// 176 (main-boot.cpp): ms since "back to the menu" (L1 + R1 + Touch) was pressed, in the process that press started; -1 for any other start.
+long long orbis_leave_press_age_ms();
+
 // vk-285-110: the PS5's system language (system parameter 1: 0 Japanese, 1 English, 2 French, 3 Spanish,
 // ...; English when the call fails), read once.
 int orbis_ps5_language();
@@ -130,6 +146,18 @@ std::string orbis_frontend_run(const OrbisFrontendPaths& paths, const char* buil
 // vk-285-144 (AI-assisted): starts a game from outside the shelf (a PS2 disc put in the drive, orbis-shims/ProsperoDiscDump.cpp):
 // the running shelf closes as if the image at `path` had been picked. False when no shelf is up to take it.
 bool orbis_frontend_request_launch(const std::string& path);
+
+// 2.04 (AI-assisted): a PS2 disc was put in the drive and is not copied: the disc watcher asks the shelf what to do with it. False when
+// no shelf is up (the watcher then copies it as before). The answer comes through orbis_frontend_disc_answer: 0 not yet, 1 copy it,
+// 2 play it from the disc, 3 not now, -1 the question went away (the shelf closed). The shelf's panel shows the title and serial.
+bool orbis_frontend_ask_disc(const std::string& title, const std::string& serial);
+int orbis_frontend_disc_answer();
+void orbis_frontend_cancel_disc_ask(); // the disc was taken out
+// 2.11 (swordpdf: "since the emulator knows what game is inside the drive, it would be cool to have the disc in the shelf as well"): the PS2 disc in
+// the drive that is not copied, for the shelf to list first (title and serial; both empty: none). The shelf's pick of that entry asks the watcher
+// about the disc again: orbis_frontend_take_reask is true once per request.
+void orbis_frontend_set_drive_disc(const std::string& title, const std::string& serial);
+bool orbis_frontend_take_reask();
 
 // vk-285-145 (AI-assisted): free bytes in `dir` through libkernel's _fstatfs (libc's statfs makes the system call from the
 // app's code, which the PS5 kills the app for). UINT64_MAX when it can't tell.

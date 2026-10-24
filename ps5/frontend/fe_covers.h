@@ -10,7 +10,9 @@
 
 #pragma once
 
+#include "fe_coverfit.h"
 #include "fe_games.h"
+#include "fe_launchbox.h"
 #include "fe_text.h"
 
 #include <atomic>
@@ -18,6 +20,7 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <pthread.h>
@@ -32,15 +35,22 @@ struct CoverImage
 	{
 		Spine,
 		Placeholder,
-		Cover
+		Cover,
+		Back,     // 2.11: the case's back, painted (title and serial) until RealBack replaces it
+		RealBack, // 2.11: a back cover the user (or a download) supplied
+		Disc      // 2.11: the disc art of a disc being copied (game -1): a round label with a transparent surround, alpha kept
 	};
 	int game = -1;
 	Kind kind = Spine;
 	int width = 0, height = 0;
 	std::vector<uint8_t> rgba;
 	float glow[3] = {0, 0, 0};
+	std::string serial; // 2.11: Disc: the serial it is for
 	bool has_glow = false;
 	const char* source = ""; // "manual", "cache", "download"
+	// 2.11: Back: painted with the note "No back cover for this game" (true: none can come) or without it (false: one may still arrive, the placeholder
+	// says nothing about it).
+	bool none = false;
 };
 
 struct CoverConfig
@@ -48,11 +58,28 @@ struct CoverConfig
 	std::string manual_dir; // covers the user supplies: <serial>.jpg/.png or <file name>.jpg/.png
 	std::string cache_dir;  // downloads: <serial>.jpg, and <serial>.missing after a 404
 	std::string url_template; // "${serial}" is replaced
+	// 2.11: where back covers come from, when the player has a source ("" for none: only files the player puts in covers/ are used);
+	// the same "${serial}"; a download is kept as cache/<serial>_back.jpg.
+	std::string back_url_template;
 	bool allow_download = true;
 	// vk-285-110: the shelf downloads only for games on USB drives (the prefetch before the jailbreak
 	// can't see those); every other cover comes from the prefetch, as before. vk-285-156: and for games on
 	// NFS shares, which are mounted only after the jailbreak too (OnNetworkShare).
 	bool download_usb_only = false;
+	// 2.11: LaunchBox's art by serial (fe_launchbox.h), null for none. Its region-exact scans come before url_template, the other regions' after it.
+	std::shared_ptr<const LaunchboxIndex> launchbox;
+	// 2.11: a cached cover the index has a sure match for (LaunchboxIndex::CanUpgrade) is replaced by LaunchBox's once, when its game comes near
+	// the selection; the old file is kept as <serial>.jpg.old. Off with the flag file flags/nolbupgrade (fe_ps5.cpp).
+	bool launchbox_upgrade = true;
+	// 2.11: a front, back or spine picture is made the shape of its face of the case (fe_coverfit.h) as it is decoded. Off with the flag file
+	// flags/nocoverfit (fe_ps5.cpp): every picture then fills its face as it did before, whatever its proportions.
+	bool fit_covers = true;
+	// 2.11 (swordpdf: "back covers are not loading instantly"): the back covers of the cases beside the picked one are fetched into the cache ahead of
+	// the flip (PrefetchBacks, a few files at a time, one request at a time). Off with the flag file flags/nobackprefetch (fe_ps5.cpp).
+	bool back_prefetch = true;
+	// 2.11: after a network failure downloads wait before they are tried again (30 s, doubling to 5 min; LaunchBox: 2 min to 10 min, a rate limit 15 min).
+	// 0: those times; the tests set a few hundred milliseconds.
+	int net_retry_ms = 0;
 };
 
 // Fetches `url` into `out`; returns the HTTP status (200 on success), or a negative value when the
@@ -87,6 +114,10 @@ public:
 
 	// The first of them, or an empty path (stops looking at the first one found).
 	CoverFile Best(const GameInfo& g);
+
+	// 2.11: the back covers a game has, best first: the front's places and names with "_back", "-back", " back" or "_b" after them
+	// ("SLUS-21351_back.jpg" in covers/, "Game_back.jpg" beside "Game.iso", the drive's covers/, a download in the cache).
+	std::vector<CoverFile> FindBack(const GameInfo& g);
 
 private:
 	using Names = std::unordered_map<std::string, std::string>; // lower-case name -> the name on disk
@@ -141,6 +172,32 @@ public:
 	// dropped, and a download for it only goes to the cache. Needs proper testing on the console with a large library.
 	void Want(int index);
 	void Forget(int index);
+	// 2.11: main thread. The shelf looks at this game's back (it has been the picked one a moment): its back cover is looked for
+	// (files, then a download) and comes as a RealBack image; nothing when there is none. `download` is the permission to use the network: false asks
+	// for the files on disk (the cache included) only; a game still waiting for that permission is fetched when the call comes again with true (the
+	// shelf gives it after the case has been picked 0.35 s, or when the player starts to turn it over, so scrolling past games costs no request).
+	// Asking again for what was asked already does nothing. When the game has no back and none can come (no source, downloads off, a 404 in the last two
+	// weeks) the painted back is sent again with its note ("No back cover for this game"; CoverImage::none). ForgetBack takes the request back (the
+	// textures are the shelf's to free).
+	void WantBack(int index, bool download = false);
+	void ForgetBack(int index);
+	// 2.11: main thread. The backs of these games (nearest the picked one first, at most 8) are fetched into the cache, for the flip to find them there:
+	// the download thread takes them after the picked game's back and before the spines, one request at a time, skipping what is on disk, a 404 in
+	// the last two weeks and a source that is paused. No image is made. Replaces the earlier list. Nothing with CoverConfig::back_prefetch off.
+	void PrefetchBacks(const std::vector<int>& nearest_first);
+	// 2.11: main thread. A disc is being copied: its disc art (a round label, transparent around it) is looked for (covers/<serial>_disc.png, the
+	// cache, then LaunchBox) and comes as a Disc image (game -1, alpha kept); nothing when there is none.
+	void RequestDisc(const std::string& serial);
+
+	// 2.11: the addresses to try for a game's front cover, back cover and disc art, best first: LaunchBox's art from the serial's own region, the
+	// configured source (url_template / back_url_template), then LaunchBox's art from other regions. Empty when there is no source.
+	static std::vector<std::string> FrontUrls(const CoverConfig& cfg, const std::string& serial);
+	static std::vector<std::string> BackUrls(const CoverConfig& cfg, const std::string& serial);
+	static std::vector<std::string> DiscUrls(const CoverConfig& cfg, const std::string& serial);
+	// 2.11 (swordpdf: "what about the side cover? that also exists on the site"): LaunchBox's spine for the case's side, when it has one.
+	static std::vector<std::string> SpineUrls(const CoverConfig& cfg, const std::string& serial);
+	// Like Decode, but the alpha channel is kept and no glow colour is worked out: the disc art.
+	static bool DecodeWithAlpha(const std::vector<uint8_t>& bytes, int max_h, CoverImage& out, int max_dimension = 0);
 
 	// A line for the UI: "" when idle, else e.g. "Downloading covers  3 / 11".
 	std::string Status() const;
@@ -148,9 +205,13 @@ public:
 	// Paints a placeholder front / a spine (also used before the worker runs).
 	static void PaintSpine(const Fonts& fonts, const GameInfo& g, CoverImage& out);
 	static void PaintPlaceholder(const Fonts& fonts, const GameInfo& g, CoverImage& out);
+	// 2.11: `none`: the note "No back cover for this game / Put <serial>_back.jpg in covers/" is painted (no back can come); else the card says only the
+	// title and serial, for the moment before a back that may exist arrives.
+	static void PaintBackPlaceholder(const Fonts& fonts, const GameInfo& g, CoverImage& out, bool none = true);
 
-	// Decodes an image file's bytes to RGBA8, at most `max_h` rows tall; false if it isn't one.
-	static bool Decode(const std::vector<uint8_t>& bytes, int max_h, CoverImage& out, int max_dimension = 0);
+	// Decodes an image file's bytes to RGBA8, at most `max_h` rows tall; false if it isn't one. 2.11: `fit` makes the result the shape of the case face it goes
+	// on (fe_coverfit.h: left alone when nearly right, else cropped or padded, never stretched).
+	static bool Decode(const std::vector<uint8_t>& bytes, int max_h, CoverImage& out, int max_dimension = 0, CoverFit fit = CoverFit::None);
 
 	// The games whose cover is none of: the user's own file (CoverFinder's manual, beside or drive), a
 	// cached download, a 404 in the last two weeks. For fetching them before the HEN jailbreak
@@ -168,7 +229,40 @@ private:
 	void Run();
 	void RunDownloads(); // 2026-10-10: the downloads, on a thread of their own so a slow one never holds up the painting
 	int NextWanted() const; // m_mutex held: the wanted game nearest the selection still to paint, or -1
+	int NextBack() const;   // m_mutex held: the game whose back cover the shelf asked for (WantBack) and is still to look for, or -1
+	bool FindLocalBack(CoverFinder& finder, int index, CoverImage& out); // 2.11
+	// 2.11 (painting thread): the answer to a back cover asked for: the file on disk as a RealBack image, else the painted back with its note when no back
+	// can come, else (a download may fetch it) the request goes on to the download thread, at once when the shelf gave the permission (WantBack's
+	// `download`), else when it does. The painting pass calls AnswerNextBack between its stages, so a back waits for a decode, not for a whole game.
+	void AnswerBack(CoverFinder& finder, int back);
+	bool AnswerNextBack(CoverFinder& finder); // the nearest back waiting for its answer; false when there is none
+	bool BackKnownNone(int index) const;      // no back cover can come for this game: no source, downloads off, or a 404 for it in the last two weeks
+	// 2.11: `keep` gets the bytes to write to the cache (after the image is handed over: the flash write stays out of the way to the screen); `none`: the
+	// game was marked as having no back (the painting thread then paints the note). `no_answer`: a request got no answer (the connection failed), so the
+	// picked game's back is worth asking for again (each such failure counts towards a pause, NoteResult, so this cannot go on for ever).
+	bool DownloadBack(int index, CoverImage& out, std::vector<uint8_t>& keep, bool& none, bool& no_answer);
+	bool PrefetchBack(int index); // 2.11: the back into the cache, no image
 	bool Push(CoverImage& img); // to the results once there's room; false (dropped) when the game is forgotten or stopping
+	bool PushDisc(CoverImage& img); // 2.11: the disc art (no game): false when stopping
+	void NoteResult(const std::string& url, int status, bool good); // 2.11: what a download's outcome means for the sources (see m_offline_until_ms)
+	// 2.11 (swordpdf: "back covers are not loading instantly"): downloads are paused for a while, not for the session, after a failure. Offline: the
+	// network or the configured source; LbPaused: LaunchBox.
+	static int64_t NowMs();
+	bool Offline() const { return m_offline_until_ms.load() > NowMs(); }
+	bool LbPaused() const { return m_lb_until_ms.load() > NowMs(); }
+	// 2.11: the download thread's other jobs, one per call, between the bulk covers: the disc art of a disc being copied, then the back cover of
+	// the picked game, then the backs of its neighbours (PrefetchBacks), the spine, then a cached cover LaunchBox can improve. False when there was
+	// nothing to do (or the downloads are paused).
+	bool ServeRequest();
+	bool DownloadDisc(const std::string& serial, CoverImage& out);
+	bool FindLocalSpine(int index, CoverImage& out); // 2.11: covers/<serial>_spine.jpg|png, or one downloaded before
+	bool DownloadSpine(int index, CoverImage& out);   // 2.11
+	int NextSpineDownload() const;                    // m_mutex held
+	bool FindLocalDisc(const std::string& serial, CoverImage& out);
+	bool WantsUpgrade(int index, const char* source) const;
+	bool UpgradeCover(int index, CoverImage& out);
+	int NextBackDownload() const; // m_mutex held: the game nearest the selection whose back cover is to be downloaded, or -1
+	int NextUpgrade() const;      // m_mutex held: the same for a cached cover to improve
 	// vk-285-110: the covers on disk for every game first, then the downloads, so a slow or failing
 	// download never holds back a cover that is already there. `upgrade`: a download is still worth
 	// trying (no cover, or only an OPL ART one).
@@ -187,11 +281,28 @@ private:
 	std::atomic<int> m_running{0}; // threads not finished yet
 	std::condition_variable m_wake; // Want, Stop
 	std::vector<uint8_t> m_live, m_todo; // m_mutex: per game, wanted by the shelf / still to paint
+	std::vector<uint8_t> m_back_todo;    // m_mutex: per game, its back cover asked for (WantBack) and not yet looked for
+	// 2.11, m_mutex: per game, what the shelf asked of its back (0 nothing, 1 the files on disk, 2 and the network too), and whether the lookup missed and
+	// waits for the permission to download.
+	std::vector<uint8_t> m_back_ask, m_back_miss;
+	std::vector<uint8_t> m_back_note; // 2.11, m_mutex: per game, the painted back with its note ("No back cover") is out (a picked game is not given it again)
+	std::vector<int> m_back_ring; // 2.11, m_mutex: PrefetchBacks' list, nearest first
+	std::unique_ptr<CoverFinder> m_dl_finder; // 2.11: the download thread's own finder (RunDownloads): PrefetchBack asks it for the backs on disk
+	std::vector<uint8_t> m_spine_dl; // 2.11, m_mutex: per game, a real spine to download (none on disk)
+	std::vector<uint8_t> m_back_dl, m_upgrade_todo; // 2.11, m_mutex: per game, a back cover to download / a cached cover LaunchBox can improve
+	std::string m_disc_serial;                      // 2.11, m_mutex: RequestDisc
+	bool m_disc_todo = false, m_disc_dl = false;    // 2.11, m_mutex: to look for on disk (paint thread) / to download (download thread)
 	std::atomic<int> m_selected{0};
 	mutable std::mutex m_mutex;
 	std::deque<CoverImage> m_results;
 	int m_download_total = 0, m_download_done = 0;
-	bool m_offline = false;
+	// 2.11 (review): which source failed decides what stops. LaunchBox failing three times running (or answering 429) pauses LaunchBox only; any other
+	// source failing is the old "network down" and pauses every download. 2.11 (swordpdf: "back covers are not loading instantly"): a pause ends by
+	// itself (until the steady clock reads these milliseconds) and doubles with each failure in a row, instead of lasting the session; a download that
+	// delivers a picture ends the run of failures.
+	std::atomic<int64_t> m_offline_until_ms{0}, m_lb_until_ms{0};
+	std::atomic<int> m_offline_strikes{0}, m_lb_strikes{0};
+	std::atomic<int> m_lb_failures{0};
 	bool m_busy = false;
 };
 } // namespace fe

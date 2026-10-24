@@ -5,6 +5,7 @@
 
 #include "fe_app.h"
 #include "fe_i18n.h"
+#include "fe_roots.h" // 2026-10-16: kScanSubfoldersKey (the picker's game count)
 
 #include <algorithm>
 #include <cctype>
@@ -28,6 +29,9 @@ const Vec3 kEye(0.0f, 0.30f, 7.8f);
 const Vec3 kTarget(0.0f, -0.16f, 0.0f);
 constexpr float kFovY = 30.0f;
 constexpr float kFloorY = -kBoxHalfH;
+// fe_coverfit.h makes a cover the shape of the case face it goes on: the faces of the box mesh (fe_renderer.cpp CreateBoxMesh) must be the shape it assumes.
+static_assert(kFaceAspectFront - kBoxHalfW / kBoxHalfH < 0.001f && kBoxHalfW / kBoxHalfH - kFaceAspectFront < 0.001f, "front/back face shape");
+static_assert(kFaceAspectSpine - kBoxHalfD / kBoxHalfH < 0.001f && kBoxHalfD / kBoxHalfH - kFaceAspectSpine < 0.001f, "spine face shape");
 constexpr float kCenterZ = 1.05f;   // the selected case, pulled forward
 constexpr float kSideX = 1.86f;     // the first neighbour's centre
 constexpr float kStepX = 0.56f;     // each further one
@@ -40,6 +44,30 @@ constexpr int kVisible = 7;         // cases drawn on each side
 // games the renderer's descriptor pool (1,024 sets) ran out, so boxes weren't drawn. Needs proper testing on the console.
 constexpr int kCoverKeep = 24; // games within this many places of the selection are asked for
 constexpr int kCoverDrop = 32; // and dropped beyond this many (from the selection and the scroll), so going back and forth doesn't repaint
+
+// 2.11 (swordpdf: "back covers are not loading instantly"): when the picked case's back cover is asked for. The files on disk after 0.20 s of being picked,
+// which is above the 0.11 s a held D-pad steps at (Step runs before PollCovers in a frame), so scrolling never starts a lookup; the network after 0.35 s, or
+// at once when the player starts to turn the case over; the backs of the cases beside it are fetched ahead after 0.45 s, above the 0.36 s a held button
+// waits before it repeats.
+constexpr double kBackLocalDwell = 0.20, kBackNetDwell = 0.35, kBackRingDwell = 0.45;
+constexpr int kBackRing = 3; // cases on each side of the picked one whose backs are fetched ahead
+// 2.11 (swordpdf, build 175: "viewing the back cover and moving to the next game: the cover gets deloaded before it turns to the front, a black spot for a
+// second"): a case the selection has left keeps its back cover for as long as the flip still turns it over on screen (more than kBackShownDeg of its pose,
+// well past the 90 degrees at which the back is in view), and kBackGrace longer: the next case's back is only the picked one's, but what is drawn is not.
+constexpr float kBackShownDeg = 10.0f;
+constexpr double kBackGrace = 0.20;
+
+// 2.11 (swordpdf: "the rotating of the disc cover with the stick is very sensitive and small stick movements make the rotation go fast. make it harder"):
+// the right stick turns the picked case over. Nothing happens below kFlipDead; the whole way is reached only near a full push (kFlipFull); between, the
+// push (0..1 after those two) is bent by a power curve, so a small push turns it a little. A soft spring follows it, with hardly any overshoot, and the
+// turning speed is capped (flips a second: one flip is the whole way over), so a flick of the stick cannot spin the case.
+constexpr float kFlipDead = 0.35f, kFlipFull = 0.95f, kFlipCurve = 2.2f;
+constexpr float kFlipSpring = 60.0f, kFlipDamping = 0.85f, kFlipMaxSpeed = 2.6f;
+
+// 2.11 (swordpdf: "proportionate to the case"): the disc drawn on a case front, to the case scale: the front is 135 mm wide and a PS2 disc is 120 mm
+// across, so its circle is most of the front's width (the loading arc goes round it, the percentage and the captions under it).
+constexpr float kDiscRadius = 0.54f, kDiscCy = 0.17f;
+constexpr float kDiscTextY = kDiscCy - kDiscRadius - 0.17f; // the text's centre: clear of the disc's lower edge, above the serial at the foot
 
 // The author's handles, under the wordmark (vk-285-50, the user's request).
 constexpr const char* kDiscordHandle = "sword.pdf";
@@ -60,18 +88,22 @@ std::string SizeText(uint64_t bytes)
 // live-22 (AI-assisted): a disc being copied is a shelf entry whose Init-list index is this (below every real index, 0..N-1),
 // so it sorts to the front and the cover service, which keys on real indices, never touches it.
 constexpr int kDumpIndex = -1;
+// 2.11: the disc in the drive, not copied: a shelf entry too, in front of everything (an index below kDumpIndex: both are never up at once).
+constexpr int kDriveIndex = -2;
 
 // live-22 (AI-assisted, graphics approach from the dropped frontend of PR #34): a spinning disc drawn on the front of a box
 // (model `model`), as UI triangles whose corners are the box's front points projected, so it lies on the box at any angle.
 // `alpha` fades it on the boxes beside the selected one. Here it marks the game currently being dumped; the percentage is
 // drawn over it by Build.
-void AddDiscSpinner(std::vector<UiVertex>& ui, const Mat4& view_proj, const Mat4& model, float t, float alpha, float W, float H)
+void AddDiscSpinner(std::vector<UiVertex>& ui, const Mat4& view_proj, const Mat4& model, float t, float alpha, float W, float H, bool with_disc = true,
+	bool with_arc = true)
 {
 	if (alpha <= 0.01f)
 		return;
 	constexpr int kSegments = 72;
 	constexpr float kPi = 3.14159265f;
-	const float cx = 0.0f, cy = 0.18f, z = kBoxHalfD + 0.004f; // a little above centre; the percentage sits below it
+	const float cx = 0.0f, cy = kDiscCy, z = kBoxHalfD + 0.004f; // a little above centre; the percentage sits below it
+	const float s = kDiscRadius / 0.40f; // the radii below were drawn for a disc of 0.40
 	auto put = [&](float r, float a, uint32_t color) {
 		const Vec4 w = model * Vec4(cx + r * std::cos(a), cy + r * std::sin(a), z, 1.0f);
 		const Vec4 c = view_proj * w;
@@ -90,8 +122,9 @@ void AddDiscSpinner(std::vector<UiVertex>& ui, const Mat4& view_proj, const Mat4
 	};
 	const float spin = t * 5.0f;
 	const auto a8 = [&](float a) { return static_cast<uint32_t>(Clamp(a, 0.0f, 1.0f) * 255.0f + 0.5f) << 24; };
-	// The disc: silver with two glints that turn with it and a faint rainbow, the clear hub, and the hole.
-	ring(0.13f, 0.40f, 0.0f, 2 * kPi, [&](float a, float outer) {
+	// The disc: silver with two glints that turn with it and a faint rainbow, the clear hub, and the hole. (2.11: not when the disc's own art is drawn.)
+	if (with_disc)
+	ring(0.13f * s, 0.40f * s, 0.0f, 2 * kPi, [&](float a, float outer) {
 		const float g1 = std::pow(std::max(0.0f, std::cos(a - spin)), 10.0f), g2 = std::pow(std::max(0.0f, std::cos(a - spin - kPi)), 10.0f);
 		const float glint = 0.55f * (g1 + g2) * (0.6f + 0.4f * outer);
 		const float hue = a * 2.0f - spin;
@@ -99,13 +132,47 @@ void AddDiscSpinner(std::vector<UiVertex>& ui, const Mat4& view_proj, const Mat4
 					bl = 0.72f + 0.10f * std::sin(hue + 4.2f) + glint;
 		return a8(alpha * 0.92f) | Rgba(Clamp(r, 0.0f, 1.0f), Clamp(g, 0.0f, 1.0f), Clamp(bl, 0.0f, 1.0f), 0);
 	});
-	ring(0.055f, 0.13f, 0.0f, 2 * kPi, [&](float, float) { return a8(alpha * 0.55f) | Rgba(0.85f, 0.88f, 0.95f, 0); });
+	if (with_disc)
+	ring(0.055f * s, 0.13f * s, 0.0f, 2 * kPi, [&](float, float) { return a8(alpha * 0.55f) | Rgba(0.85f, 0.88f, 0.95f, 0); });
 	// The loading arc around it, a quarter turn long, going round faster than the disc.
 	const float head = t * 3.2f;
-	ring(0.44f, 0.465f, head, head + kPi * 0.6f, [&](float a, float) {
+	if (with_arc)
+	ring(0.44f * s, 0.465f * s, head, head + kPi * 0.6f, [&](float a, float) {
 		const float tail = (a - head) / (kPi * 0.6f);
 		return a8(alpha * (0.15f + 0.85f * tail)) | Rgba(1.0f, 1.0f, 1.0f, 0);
 	});
+}
+
+// 2.11 (AI-assisted; swordpdf: "we can also use the circular disc cover for when a game is dumping"): the disc's own art, a picture with a round label and a
+// transparent surround, turned by `angle` about the disc's centre on the box front. A grid of small quads whose corners are the box's front points
+// projected (the UI shader has no perspective correction, so a few cells keep the picture from swimming when the box is at an angle). `images` gets
+// the texture change for them (the renderer binds `set` for those vertices).
+void AddDiscArt(std::vector<UiVertex>& ui, std::vector<UiImageRange>& images, VkDescriptorSet set, float aspect, const Mat4& view_proj, const Mat4& model,
+	float angle, float alpha, float W, float H)
+{
+	if (alpha <= 0.01f || !set)
+		return;
+	constexpr int kGrid = 8;
+	const float cx = 0.0f, cy = kDiscCy, z = kBoxHalfD + 0.0035f, radius = kDiscRadius; // as the spinner's disc
+	const float hw = aspect >= 1.0f ? radius : radius * aspect, hh = aspect >= 1.0f ? radius / aspect : radius;
+	const float ca = std::cos(angle), sa = std::sin(angle);
+	const uint32_t colour = Rgba(1.0f, 1.0f, 1.0f, Clamp(alpha, 0.0f, 1.0f));
+	auto vert = [&](float s, float tt) {
+		const float lx = (s - 0.5f) * 2.0f * hw, ly = (0.5f - tt) * 2.0f * hh; // the picture's top is up on the box
+		const Vec4 w = model * Vec4(cx + lx * ca - ly * sa, cy + lx * sa + ly * ca, z, 1.0f);
+		const Vec4 c = view_proj * w;
+		return UiVertex{((c.x / c.w) * 0.5f + 0.5f) * W, ((c.y / c.w) * 0.5f + 0.5f) * H, s, tt, colour, 0, 0, 0, 2};
+	};
+	const uint32_t first = static_cast<uint32_t>(ui.size());
+	for (int gy = 0; gy < kGrid; gy++)
+		for (int gx = 0; gx < kGrid; gx++)
+		{
+			const float s0 = static_cast<float>(gx) / kGrid, s1 = static_cast<float>(gx + 1) / kGrid;
+			const float t0 = static_cast<float>(gy) / kGrid, t1 = static_cast<float>(gy + 1) / kGrid;
+			const UiVertex a = vert(s0, t0), b = vert(s1, t0), c = vert(s1, t1), d = vert(s0, t1);
+			ui.insert(ui.end(), {a, b, c, a, c, d});
+		}
+	images.push_back({first, static_cast<uint32_t>(ui.size()) - first, set});
 }
 
 // vk-285-114: multiplies the alpha of UI vertices [begin, end) by `f` (what the options sheet covers fades out).
@@ -222,12 +289,16 @@ void App::SetWebUrl(const std::string& url, const std::string& shown)
 
 void App::Shutdown()
 {
+	// 2.12: a request for a tile that the helper has not taken within moments is not left for a helper that is loaded later (the page's too: one registry).
+	if (!m_cfg.tiles_dir.empty())
+		gametile::WithdrawOwn(m_cfg.tiles_dir, gametile::kShutdownWithdrawS, gametile::WallSeconds());
 	if (m_cfg.game_achievements.cancel)
 		m_cfg.game_achievements.cancel();
 	ClearAchievementBadges();
 	m_account.Close();
+	FreeDiscArt(); // 2.11 (review)
 	for (Shelved& h : m_shelved) // vk-285-137
-		m_slots.push_back(h.slot);
+	m_slots.push_back(h.slot);
 	m_shelved.clear();
 	for (Slot& s : m_slots)
 	{
@@ -235,6 +306,8 @@ void App::Shutdown()
 		m_renderer->DestroyTexture(s.cover);
 		m_renderer->DestroyTexture(s.placeholder);
 		m_renderer->DestroyTexture(s.spine);
+		m_renderer->DestroyTexture(s.back_ph); // 2.11
+		m_renderer->DestroyTexture(s.back_real);
 		s = Slot();
 	}
 	m_renderer->SetAtlas(nullptr);
@@ -250,7 +323,9 @@ bool App::Step(int dir)
 	const int next = std::max(0, std::min(n - 1, m_selected + dir));
 	if (next == m_selected)
 		return false;
+	m_last_dir = dir > 0 ? 1 : -1; // 2.11: the backs ahead are fetched on this side first
 	m_selected = next;
+	m_flip_latched = false; // 2.11: a case turned over goes back when the shelf moves
 	m_select_time = m_time;
 	if (m_covers && m_index[static_cast<size_t>(m_selected)] >= 0) // live-22: the dump entry (kDumpIndex) isn't the service's
 		m_covers->SetSelected(m_index[static_cast<size_t>(m_selected)]);
@@ -286,7 +361,7 @@ bool App::ApplyHidden(int keep)
 	int at = -1, after = -1, before = -1;
 	for (Entry& e : all)
 	{
-		if (e.game.hidden && !m_show_hidden)
+		if ((e.game.hidden && !m_show_hidden) || (!m_search.applied.empty() && e.index >= 0 && !SearchMatches(e.game))) // 2.11: and the search's
 		{
 			m_shelved.push_back({std::move(e.game), e.slot, e.index});
 			continue;
@@ -325,7 +400,10 @@ void App::DropCovers(Slot& s, int index)
 	m_renderer->DestroyTexture(s.cover);
 	m_renderer->DestroyTexture(s.placeholder);
 	m_renderer->DestroyTexture(s.spine);
+	m_renderer->DestroyTexture(s.back_ph); // 2.11
+	m_renderer->DestroyTexture(s.back_real);
 	s = Slot();
+	m_covers->ForgetBack(index); // 2.11
 	m_covers->Forget(index);
 }
 
@@ -352,16 +430,182 @@ void App::KeepCoversNear()
 			}
 }
 
+// R3 (build 175). What the flip adds to the pose of the case d places from the scroll position (Pose): all of the flip for the picked case, less for the
+// ones beside it, none from a place away. The same number draws the case and decides whether its back may go, so the two cannot differ.
+float App::FlipTurn(float d) const
+{
+	const float e = Smoothstep(0.0f, 1.0f, std::min(std::fabs(d), 1.0f));
+	return (1.0f - e) * m_flip * m_flip_dir * Radians(180.0f);
+}
+
+// The case at this position is drawn turned over by the flip (so its back may be in view): not the picked one only, everything on the shelf.
+bool App::BackOnShow(int pos) const
+{
+	return std::fabs(FlipTurn(static_cast<float>(pos) - m_scroll)) > Radians(kBackShownDeg);
+}
+
+void App::ReleaseBack(Slot& s, int index)
+{
+	m_covers->ForgetBack(index);
+	m_renderer->DestroyTexture(s.back_real);
+	s.back_real = nullptr;
+	s.back_wanted = false;
+	s.back_net = false;
+	s.back_asked = -1;
+	s.back_shown = s.back_left = -1;
+	s.dirty = true; // its set takes the painted back
+}
+
+// The backs the selection has left but the flip still shows: let go once their case is no longer turned over on screen (and kBackGrace more), or at once
+// when the case is gone from the shelf, or picked again (its back is then the picked case's).
+void App::PollBackHolds(int sel_index)
+{
+	for (size_t h = 0; h < m_back_held.size();)
+	{
+		const int index = m_back_held[h];
+		const int pos = PositionOf(index);
+		bool gone = pos < 0 || index == sel_index;
+		if (!gone)
+		{
+			Slot& s = m_slots[static_cast<size_t>(pos)];
+			if (!s.back_real) // let go already (DropCovers, or the next selection change)
+				gone = true;
+			else if (BackOnShow(pos))
+				s.back_shown = m_time;
+			else if (m_time - s.back_shown > kBackGrace)
+			{
+				std::printf("[frontend] back cover of %s let go %d ms after the selection left it: its case is turned back to the front\n",
+					m_games[static_cast<size_t>(pos)].title.c_str(), static_cast<int>((m_time - s.back_left) * 1000.0)); // 2.11: for the console log
+				std::fflush(stdout);
+				ReleaseBack(s, index);
+				gone = true;
+			}
+		}
+		if (gone)
+			m_back_held.erase(m_back_held.begin() + static_cast<long>(h));
+		else
+			h++;
+	}
+}
+
+int App::BackRealOf(int game) const
+{
+	const int pos = PositionOf(game);
+	return pos < 0 ? -1 : m_slots[static_cast<size_t>(pos)].back_real ? 1 : 0;
+}
+
+int App::SetOf(int game) const
+{
+	const int pos = PositionOf(game);
+	return pos < 0 ? -1 : m_slots[static_cast<size_t>(pos)].set != VK_NULL_HANDLE ? 1 : 0;
+}
+
+int App::TurnOf(int game) const
+{
+	const int pos = PositionOf(game);
+	return pos < 0 ? 0 : static_cast<int>(std::lround(std::fabs(FlipTurn(static_cast<float>(pos) - m_scroll)) / Radians(1.0f)));
+}
+
+int App::BackRealCount() const
+{
+	int n = 0;
+	for (const Slot& s : m_slots)
+		n += s.back_real ? 1 : 0;
+	for (const Shelved& h : m_shelved)
+		n += h.slot.back_real ? 1 : 0;
+	return n;
+}
+
 void App::PollCovers()
 {
 	if (!m_covers)
 		return;
 	KeepCoversNear();
+	// 2.11: the picked game's back cover is looked for once it has been picked for a moment (the flip is then instant); the others' are let go.
+	// Asked for in two steps (see kBackLocalDwell): the files after 0.20 s, the network after 0.35 s or at once when the player starts to turn the case, so
+	// a game passed over costs nothing and one landed on has its back before the flip is over. The cases beside it get theirs fetched ahead.
+	if (!m_games.empty() && m_index[static_cast<size_t>(m_selected)] >= 0)
+	{
+		const int sel_index = m_index[static_cast<size_t>(m_selected)];
+		if (m_back_for != sel_index)
+		{
+			for (size_t pos = 0; pos < m_slots.size(); pos++)
+			{
+				Slot& other = m_slots[pos];
+				if ((other.back_wanted || other.back_real) && m_index[pos] != sel_index)
+				{
+					// R3 (build 175): a case still turned over on screen keeps its back until the flip has brought it round (PollBackHolds); a back
+					// only asked for (no texture to keep) and one not turned over are let go at once, as before.
+					if (other.back_real && BackOnShow(static_cast<int>(pos)))
+					{
+						other.back_shown = m_time;
+						if (std::find(m_back_held.begin(), m_back_held.end(), m_index[pos]) == m_back_held.end())
+						{
+							other.back_left = m_time;
+							m_back_held.push_back(m_index[pos]);
+						}
+					}
+					else
+						ReleaseBack(other, m_index[pos]);
+				}
+			}
+			m_back_for = sel_index;
+		}
+		PollBackHolds(sel_index);
+		Slot& sel = m_slots[static_cast<size_t>(m_selected)];
+		const double dwell = m_time - m_select_time;
+		if (sel.wanted && !sel.back_real)
+		{
+			const bool net = m_flip_wanted || dwell > kBackNetDwell;
+			if (!sel.back_wanted && (net || dwell > kBackLocalDwell))
+			{
+				sel.back_wanted = true;
+				sel.back_net = net;
+				sel.back_asked = m_time;
+				m_covers->WantBack(sel_index, net);
+				std::printf("[frontend] back cover asked for %s (%s) %d ms after it was picked\n", m_games[static_cast<size_t>(m_selected)].title.c_str(),
+					net ? "files and download" : "files only", static_cast<int>(dwell * 1000.0)); // 2.11: for the console log (and the host tests)
+				std::fflush(stdout);
+			}
+			else if (sel.back_wanted && net && !sel.back_net)
+			{
+				sel.back_net = true;
+				m_covers->WantBack(sel_index, true);
+				std::printf("[frontend] back cover asked for %s (download too) %d ms after it was picked\n",
+					m_games[static_cast<size_t>(m_selected)].title.c_str(), static_cast<int>(dwell * 1000.0));
+				std::fflush(stdout);
+			}
+		}
+		if (dwell > kBackRingDwell && m_prefetch_for != sel_index)
+		{
+			// Nearest first, the side the selection is moving towards first: those are the backs the player flips to next.
+			m_prefetch_for = sel_index;
+			std::vector<int> ring;
+			const int n = static_cast<int>(m_games.size());
+			for (int d = 1; d <= kBackRing; d++)
+				for (const int side : {m_last_dir, -m_last_dir})
+				{
+					const int pos = m_selected + side * d;
+					if (pos >= 0 && pos < n && m_index[static_cast<size_t>(pos)] >= 0) // (not the disc entries)
+						ring.push_back(m_index[static_cast<size_t>(pos)]);
+				}
+			m_covers->PrefetchBacks(ring);
+			m_ring_count = static_cast<int>(ring.size());
+			m_ring_first = ring.empty() ? -1 : ring.front();
+		}
+	}
+	else
+		PollBackHolds(-3); // a disc entry is picked: nothing is the picked game, the flip still brings the held cases round
 	CoverImage img;
 	int budget = 4; // textures a frame
 	while (budget-- > 0 && m_covers->Poll(img))
 	{
-		// vk-285-137: img.game is an index in Init's list; the game may be off the shelf (its slot keeps the covers).
+	if (img.kind == CoverImage::Disc) // 2.11: belongs to the dump entry, not to a game of the list
+	{
+	TakeDiscArt(img);
+	continue;
+	}
+	// vk-285-137: img.game is an index in Init's list; the game may be off the shelf (its slot keeps the covers).
 		Slot* slot = nullptr;
 		const GameInfo* game = nullptr;
 		if (const int pos = PositionOf(img.game); pos >= 0)
@@ -379,12 +623,15 @@ void App::PollCovers()
 				}
 		if (!slot || !slot->wanted) // 2026-10-10: dropped since (KeepCoversNear)
 			continue;
+		if (img.kind == CoverImage::RealBack && img.game != m_back_for) // 2.11: arrived after the selection moved on: not kept (the file is in the cache)
+			continue;
 		Slot& s = *slot;
 		Texture* t = m_renderer->CreateTexture(static_cast<uint32_t>(img.width), static_cast<uint32_t>(img.height),
 			VK_FORMAT_R8G8B8A8_UNORM, img.rgba.data());
 		if (!t)
 			continue;
-		Texture** dst = img.kind == CoverImage::Spine ? &s.spine : img.kind == CoverImage::Placeholder ? &s.placeholder : &s.cover;
+		Texture** dst = img.kind == CoverImage::Spine ? &s.spine : img.kind == CoverImage::Placeholder ? &s.placeholder :
+		                img.kind == CoverImage::Back ? &s.back_ph : img.kind == CoverImage::RealBack ? &s.back_real : &s.cover; // 2.11: the back
 		m_renderer->DestroyTexture(*dst);
 		*dst = t;
 		if (img.kind == CoverImage::Cover)
@@ -398,17 +645,68 @@ void App::PollCovers()
 				s.has_glow = true;
 			}
 			std::printf("[frontend] cover for %s (%s, %dx%d)\n", game->title.c_str(), img.source, img.width, img.height);
-		}
+			}
+			if (img.kind == CoverImage::RealBack)
+			{
+				std::printf("[frontend] back cover for %s (%s, %dx%d) %d ms after it was asked for\n", game->title.c_str(), img.source, img.width, img.height,
+					s.back_asked >= 0 ? static_cast<int>((m_time - s.back_asked) * 1000.0) : -1); // 2.11: for the console log
+				std::fflush(stdout);
+			}
 		s.dirty = true;
 	}
 	for (Slot& s : m_slots)
 		if (s.dirty && s.spine && s.placeholder)
 		{
 			m_renderer->FreeTextureSet(s.set);
-			s.set = m_renderer->AllocTextureSet(s.cover ? s.cover : s.placeholder, s.placeholder, s.spine);
+			s.set = m_renderer->AllocTextureSet(s.cover ? s.cover : s.placeholder, s.placeholder, s.spine,
+				s.back_real ? s.back_real : s.back_ph ? s.back_ph : s.placeholder); // 2.11: and the back
 			s.dirty = !s.set; // 2026-10-10: the pool full for now (sets freed are given back a frame later): try again
 		}
 }
+
+// 2.11: the disc art arrived (CoverService::RequestDisc): a texture of its own, drawn over the dump entry's box (Build) in place of the painted disc.
+void App::TakeDiscArt(const CoverImage& img)
+{
+	if ((!m_dump_on && !m_drive_on) || img.width < 16 || img.height < 16 || img.serial != m_disc_art_serial)
+	return;
+	Texture* t = m_renderer->CreateTexture(static_cast<uint32_t>(img.width), static_cast<uint32_t>(img.height), VK_FORMAT_R8G8B8A8_UNORM, img.rgba.data());
+	if (!t)
+		return;
+	const VkDescriptorSet set = m_renderer->AllocTextureSet(t, t, t);
+	if (!set) // the descriptor pool is full for now: the painted disc stays
+	{
+		m_renderer->DestroyTexture(t);
+		return;
+	}
+	const std::string keep = m_disc_art_serial; // FreeDiscArt forgets which disc the art is for
+	FreeDiscArt();
+	m_disc_art_serial = keep;
+	m_dump_disc = t;
+	m_dump_disc_set = set;
+	m_dump_disc_aspect = static_cast<float>(img.width) / static_cast<float>(img.height);
+	std::printf("[frontend] disc dump: the disc's own art (%s, %dx%d)\n", img.source, img.width, img.height);
+	std::fflush(stdout);
+}
+
+void App::FreeDiscArt()
+{
+	if (m_dump_disc_set)
+		m_renderer->FreeTextureSet(m_dump_disc_set);
+	m_renderer->DestroyTexture(m_dump_disc);
+	m_dump_disc_set = VK_NULL_HANDLE;
+	m_dump_disc = nullptr;
+	m_disc_art_serial.clear();
+	}
+
+	void App::EnsureDiscArt(const std::string& serial)
+	{
+	if (serial.empty() || serial == m_disc_art_serial)
+	return;
+	FreeDiscArt();
+	m_disc_art_serial = serial;
+	if (m_covers)
+	m_covers->RequestDisc(serial); // the disc's own art (LaunchBox or covers/<serial>_disc.png)
+	}
 
 // live-22 (AI-assisted): the dump entry's position on the shelf (its index is kDumpIndex), or -1.
 int App::DumpPos() const
@@ -424,6 +722,8 @@ int App::DumpPos() const
 // leaves it alone. The percentage is drawn over the box by Build.
 void App::InsertDumpEntry(const std::string& serial, const std::string& title, int pct)
 {
+	if (m_drive_on)
+	RemoveDriveEntry(); // the disc is being copied: the copy's entry stands for it
 	const std::string disp = title.empty() ? std::string("PS2 disc") : title;
 	GameInfo g;
 	g.path = "@disc-dump"; // a sentinel path: this entry is never launched
@@ -441,7 +741,7 @@ void App::InsertDumpEntry(const std::string& serial, const std::string& title, i
 		VK_FORMAT_R8G8B8A8_UNORM, sp.rgba.data());
 	if (s.placeholder && s.spine)
 	{
-		s.set = m_renderer->AllocTextureSet(s.placeholder, s.placeholder, s.spine);
+		s.set = m_renderer->AllocTextureSet(s.placeholder, s.placeholder, s.spine, s.placeholder);
 		s.dirty = !s.set; // the descriptor pool may be full for a frame; PollCovers retries
 	}
 	else
@@ -458,6 +758,7 @@ void App::InsertDumpEntry(const std::string& serial, const std::string& title, i
 	m_dump_serial = serial;
 	m_dump_title = disp;
 	m_dump_pct = pct;
+	EnsureDiscArt(serial); // 2.11: the disc's own art (LaunchBox or covers/<serial>_disc.png) replaces the painted disc when it arrives
 	Sound(Sfx::Move, 0.0f);
 	std::printf("[frontend] disc dump: %s (%s) %d%% on the shelf\n", disp.c_str(), serial.c_str(), pct);
 	std::fflush(stdout);
@@ -468,9 +769,9 @@ void App::InsertDumpEntry(const std::string& serial, const std::string& title, i
 void App::RemoveDumpEntry()
 {
 	const int pos = DumpPos();
-	m_dump_on = false;
+	m_dump_on = false; // (the disc art is let go by PollDriveDisc once no entry wants it)
 	if (pos < 0)
-		return;
+	return;
 	Slot& s = m_slots[static_cast<size_t>(pos)];
 	m_renderer->FreeTextureSet(s.set);
 	m_renderer->DestroyTexture(s.cover);
@@ -529,12 +830,118 @@ void App::PollDiscDump()
 		if (m_dump_on && serial != m_dump_serial)
 			RemoveDumpEntry(); // a different disc is being copied now: start fresh
 		if (!m_dump_on)
-			InsertDumpEntry(serial, title, pct);
+		{
+		if (!ShelfBusy()) // 2.11 (review): the entry selects itself; not under a launch, a sheet, the account panel, a picker or the search
+		InsertDumpEntry(serial, title, pct);
+		}
 		else
-			m_dump_pct = pct;
+		m_dump_pct = pct;
 	}
 	else if (m_dump_on)
 		RemoveDumpEntry();
+}
+
+int App::DrivePos() const
+{
+for (size_t i = 0; i < m_index.size(); i++)
+if (m_index[i] == kDriveIndex)
+return static_cast<int>(i);
+return -1;
+}
+
+void App::InsertDriveEntry(const std::string& serial, const std::string& title)
+{
+GameInfo g;
+g.path = "@disc-drive"; // a sentinel path: this entry is never launched
+g.serial = serial;
+g.title = title.empty() ? std::string("PS2 disc") : title;
+Slot s;
+CoverImage ph, sp;
+GameInfo front = g;
+front.title.clear(); // the box front holds the disc, not the title (as the copy's entry)
+CoverService::PaintPlaceholder(*m_fonts, front, ph);
+CoverService::PaintSpine(*m_fonts, g, sp);
+s.placeholder = m_renderer->CreateTexture(static_cast<uint32_t>(ph.width), static_cast<uint32_t>(ph.height), VK_FORMAT_R8G8B8A8_UNORM, ph.rgba.data());
+s.spine = m_renderer->CreateTexture(static_cast<uint32_t>(sp.width), static_cast<uint32_t>(sp.height), VK_FORMAT_R8G8B8A8_UNORM, sp.rgba.data());
+if (s.placeholder && s.spine)
+{
+s.set = m_renderer->AllocTextureSet(s.placeholder, s.placeholder, s.spine, s.placeholder);
+s.dirty = !s.set;
+}
+else
+s.dirty = true;
+const bool had_games = !m_games.empty();
+m_games.insert(m_games.begin(), std::move(g));
+m_slots.insert(m_slots.begin(), std::move(s));
+m_index.insert(m_index.begin(), kDriveIndex);
+// The shelf stays where it was: what was picked stays picked (the new entry is one to the left of it).
+if (had_games)
+{
+m_selected++;
+m_scroll += 1.0f;
+}
+m_drive_on = true;
+m_drive_serial = serial;
+m_drive_title = m_games[0].title;
+EnsureDiscArt(serial);
+std::printf("[frontend] disc in the drive: %s (%s) is the first entry on the shelf\n", m_drive_title.c_str(), serial.c_str());
+std::fflush(stdout);
+}
+
+void App::RemoveDriveEntry()
+{
+const int pos = DrivePos();
+m_drive_on = false; // (the disc art stays for a moment: the copy's entry takes it over)
+if (pos < 0)
+return;
+Slot& s = m_slots[static_cast<size_t>(pos)];
+m_renderer->FreeTextureSet(s.set);
+m_renderer->DestroyTexture(s.cover);
+m_renderer->DestroyTexture(s.placeholder);
+m_renderer->DestroyTexture(s.spine);
+m_games.erase(m_games.begin() + pos);
+m_slots.erase(m_slots.begin() + pos);
+m_index.erase(m_index.begin() + pos);
+if (m_selected > pos)
+m_selected--;
+const int n = static_cast<int>(m_games.size());
+m_selected = n == 0 ? 0 : std::max(0, std::min(m_selected, n - 1));
+m_scroll = static_cast<float>(m_selected);
+m_scroll_vel = 0;
+m_select_time = m_time;
+if (m_covers && n > 0 && m_index[static_cast<size_t>(m_selected)] >= 0)
+m_covers->SetSelected(m_index[static_cast<size_t>(m_selected)]);
+std::printf("[frontend] disc in the drive: entry removed\n");
+std::fflush(stdout);
+}
+
+// The watcher tells the shelf which PS2 disc is in the drive and not copied (AppConfig::drive_disc_poll): it is listed first. Not while the disc
+// is being copied (that entry stands for it) or the shelf is closing for a game.
+void App::PollDriveDisc()
+{
+// The disc art is let go two seconds after the last entry that wanted it (the drive's entry becomes the copy's and back without asking again).
+if (!m_dump_on && !m_drive_on && !m_disc_art_serial.empty())
+{
+if (m_art_idle < 0)
+m_art_idle = m_time;
+else if (m_time - m_art_idle > 2.0)
+{
+FreeDiscArt();
+m_art_idle = -1;
+}
+}
+else
+m_art_idle = -1;
+if (!m_cfg.drive_disc_poll)
+return;
+std::string title, serial;
+const bool present = m_cfg.drive_disc_poll(title, serial) && !m_dump_on && !m_launching;
+if (present && m_drive_on && serial != m_drive_serial)
+RemoveDriveEntry(); // another disc
+if (present && !m_drive_on && !ShelfBusy())
+InsertDriveEntry(serial, title);
+else if (!present && m_drive_on)
+RemoveDriveEntry();
 }
 
 void App::Update(double dt, const Input& in)
@@ -544,6 +951,34 @@ void App::Update(double dt, const Input& in)
 	PollGameAchievements();
 	const float fdt = static_cast<float>(std::min(dt, 0.1));
 	m_dump_spin += fdt; // live-22: the dump disc's rotation, advanced whether or not a dump is on
+	PollDiscAsk();
+	m_ask_anim += ((m_ask_on ? 1.0f : 0.0f) - m_ask_anim) * (1.0f - std::exp(-fdt * 16.0f));
+
+	// 2.11: the search: what the settings page's box says, the PS5's keyboard while it is up, and the fades.
+	if (m_cfg.search_remote)
+	{
+		std::string from_page;
+		if (m_cfg.search_remote(from_page) && from_page != m_search.text)
+		{
+			if (m_search.typing && !m_search.system)
+				CloseSearch(); // the page typed: its text wins over a half-typed one on the panel
+			SetSearch(from_page);
+		}
+	}
+	if (m_search.system)
+	{
+		std::string typed;
+		const int r = m_cfg.text_entry.poll ? m_cfg.text_entry.poll(typed) : -1;
+		if (r != 0)
+		{
+			m_search.system = false;
+			m_search.typing = false;
+			if (r > 0)
+				SetSearch(typed);
+		}
+	}
+	m_search.kb_anim += ((m_search.typing && !m_search.system ? 1.0f : 0.0f) - m_search.kb_anim) * (1.0f - std::exp(-fdt * 16.0f));
+	m_search.pill_anim += ((m_search.typing || !m_search.applied.empty() ? 1.0f : 0.0f) - m_search.pill_anim) * (1.0f - std::exp(-fdt * 12.0f));
 
 	// 2026-10-05: the account panel fades in and out, and its keyboard slides up under it (AI-assisted).
 	{
@@ -567,6 +1002,16 @@ void App::Update(double dt, const Input& in)
 			m_launch_time = m_time;
 		if (m_time - m_launch_time > 0.6 && !m_game_achievements.busy)
 			m_done = true;
+	}
+	else if (m_ask_on)
+	{
+		UpdateDiscAsk(in);
+		m_prev = in;
+	}
+	else if (m_search.typing)
+	{
+		UpdateSearch(in, dt); // 2.11: the search keyboard has the pad
+		m_prev = in;
 	}
 	else if (m_account.open)
 	{
@@ -652,6 +1097,16 @@ void App::Update(double dt, const Input& in)
 					m_refused_time = m_time;
 					Sound(Sfx::Edge, 0.0f);
 				}
+				else if (m_index[static_cast<size_t>(m_selected)] == kDriveIndex) // 2.11: the disc in the drive: the question about it again
+				{
+				if (m_cfg.drive_disc_reask)
+				m_cfg.drive_disc_reask();
+				m_refused_text = "Asking about the disc...";
+				m_refused_time = m_time;
+				Sound(Sfx::Move, 0.0f);
+				std::printf("[frontend] the disc in the drive was picked: asking about it again\n");
+				std::fflush(stdout);
+				}
 				else if (!picked.damaged.empty()) // vk-285-134: an image that can't be read stays on the shelf
 				{
 					m_refused_text = "This image can't be read (" + picked.damaged +
@@ -670,6 +1125,17 @@ void App::Update(double dt, const Input& in)
 					Sound(Sfx::Launch, 0.0f);
 				}
 			}
+			// 2.11: R2 searches; Circle puts the whole shelf back while a search narrows it (and the QR view isn't up).
+			else if (!m_qr_big && in.r2 && !m_prev.r2 && m_sheet_anim < 0.05f && !m_launching)
+			{
+				OpenSearch();
+				Sound(Sfx::Move, 0.3f);
+			}
+			else if (!m_qr_big && in.circle && !m_prev.circle && !m_search.applied.empty())
+			{
+				SetSearch(std::string());
+				Sound(Sfx::Move, -0.3f);
+			}
 			// Triangle keeps the upstream QR view; Circle opens the RA account (AI-assisted).
 			else if (m_qr_big && ((in.triangle && !m_prev.triangle) || (in.circle && !m_prev.circle)))
 			{
@@ -684,7 +1150,7 @@ void App::Update(double dt, const Input& in)
 			// vk-285-114: Square opens the selected game's options sheet (the settings for all games when there is no game).
 			else if (!m_qr_big && in.square && !m_prev.square && m_sheet_anim < 0.05f)
 			{
-				OpenSheet(m_games.empty());
+			OpenSheet(m_games.empty() || m_index[static_cast<size_t>(m_selected)] < 0); // 2.11: a disc entry has no sheet of its own: the all-games one
 				m_chord_square_time = m_time; // pr9n: L1 right after makes it the account chord
 				Sound(Sfx::Move, 0.3f);
 			}
@@ -707,7 +1173,67 @@ void App::Update(double dt, const Input& in)
 		m_scroll += m_scroll_vel * h;
 	}
 
+	// 2.11: the picked case turns over with the right stick (more of it the further it is pushed, either way), and stays over with its
+	// click (R3) until the stick, the click or a move says otherwise. A soft spring with hardly any overshoot, and a cap on how fast it turns, so it is a thing
+	// with weight that a flick of the thumb cannot spin (swordpdf: "small stick movements make the rotation go fast. make it harder to rotate").
+	{
+		const bool free_shelf = !m_games.empty() && m_index[static_cast<size_t>(m_selected)] >= 0 && !m_launching && !m_sheet_open && m_sheet_anim < 0.05f && !m_account.open &&
+		                        !m_search.typing && !m_ask_on && !m_picker.open && !m_qr_big;
+		float target = 0.0f;
+		m_flip_wanted = false;
+		if (free_shelf)
+		{
+			if (in.r3 && !m_r3_prev)
+				m_flip_latched = !m_flip_latched;
+			const float ax = std::fabs(in.rx);
+			const bool pushed = ax > kFlipDead; // past the dead zone: the player means to turn it
+			const float stick = pushed ? std::pow(std::min(1.0f, (ax - kFlipDead) / (kFlipFull - kFlipDead)), kFlipCurve) : 0.0f;
+			if (pushed)
+			{
+				m_flip_latched = false; // the stick takes over from the click
+				const float side = in.rx < 0.0f ? -1.0f : 1.0f;
+				if (side != m_flip_dir)
+				{
+					// Pushed the other way while it is turned: the angle (m_flip * m_flip_dir) and its speed stay as they are, only the side they are counted
+					// from changes -- the case never jumps across.
+					m_flip = -m_flip;
+					m_flip_vel = -m_flip_vel;
+					m_flip_dir = side;
+				}
+			}
+			target = m_flip_latched ? 1.0f : stick;
+			m_flip_wanted = pushed || m_flip_latched; // (PollCovers: the back is wanted now, network included)
+		}
+		else
+			m_flip_latched = false;
+		m_r3_prev = in.r3;
+		// The pose repeats every two flips (a case turned right round is where it began). After a swing to the other side the target may be much nearer the
+		// other way round: from the back, a push to the other side leaves it where it is, and from well over it goes on to the back instead of all the way round
+		// through the front. A way of more than a flip and a half is not taken (so the usual ways -- to the front, and to the back from the front -- never change).
+		float want = target;
+		if (want - m_flip > 1.5f)
+			want -= 2.0f;
+		else if (want - m_flip < -1.5f)
+			want += 2.0f;
+		const float fk = kFlipSpring, fc = 2.0f * std::sqrt(fk) * kFlipDamping;
+		for (int i = 0; i < 4; i++)
+		{
+			const float h = fdt / 4;
+			m_flip_vel += (fk * (want - m_flip) - fc * m_flip_vel) * h;
+			m_flip_vel = std::max(-kFlipMaxSpeed, std::min(kFlipMaxSpeed, m_flip_vel));
+			m_flip += m_flip_vel * h;
+		}
+		if (m_flip > 1.04f) // (the same pose, counted from the other side of the turn; below zero only while it swings through the front)
+			m_flip -= 2.0f;
+		else if (m_flip < -1.04f)
+			m_flip += 2.0f;
+		if (target == 0.0f && std::fabs(m_flip) < 0.002f && std::fabs(m_flip_vel) < 0.01f)
+			m_flip = m_flip_vel = 0.0f;
+	}
+
 	PollDiscDump(); // live-22: the disc being copied shows as a spinning-disc entry at the front
+	PollDriveDisc(); // 2.11: the disc in the drive that is not copied is the first entry
+	PollTiles(false); // 2.12: the Home screen tile row's state (nothing is looked at unless the row is shown or an ask is pending)
 	PollCovers();
 	for (Slot& s : m_slots)
 		if (s.has_cover && s.cover_mix < 1.0f)
@@ -744,7 +1270,7 @@ void App::Pose(float d, float t, Mat4& model, float& brightness) const
 		const float l = Smoothstep(0.0f, 0.6f, static_cast<float>(m_time - m_launch_time));
 		z += l * 2.2f;
 	}
-	model = Mat4::Translate(x, bob, z) * Mat4::RotateY(turn);
+	model = Mat4::Translate(x, bob, z) * Mat4::RotateY(turn + FlipTurn(d)); // 2.11: turned over with the right stick
 	brightness = Mix(1.0f, 0.74f, e) - 0.05f * std::min(far_, 5.0f);
 }
 
@@ -834,15 +1360,36 @@ void App::Build(FrameDesc& f, const std::string& clock)
 		if (m_index[static_cast<size_t>(i)] == kDumpIndex)
 		{
 			const float a = std::max(0.0f, 1.0f - std::fabs(d) * 1.6f) * b.brightness;
+			if (m_dump_disc_set)
+			{
+			AddDiscArt(f.ui, m_achievement_images, m_dump_disc_set, m_dump_disc_aspect, f.view_proj, b.model, m_dump_spin * 2.2f, a, W, H); // 2.11
+			AddDiscSpinner(f.ui, f.view_proj, b.model, m_dump_spin, a, W, H, false); // the loading arc round it
+			}
+			else
 			AddDiscSpinner(f.ui, f.view_proj, b.model, m_dump_spin, a, W, H);
-			const Vec4 wp = b.model * Vec4(0.0f, -0.30f, kBoxHalfD + 0.01f, 1.0f);
+			const Vec4 wp = b.model * Vec4(0.0f, kDiscTextY, kBoxHalfD + 0.01f, 1.0f);
 			const Vec4 cp = f.view_proj * wp;
 			const float sx = ((cp.x / cp.w) * 0.5f + 0.5f) * W, sy = ((cp.y / cp.w) * 0.5f + 0.5f) * H;
 			char pctbuf[8];
 			std::snprintf(pctbuf, sizeof(pctbuf), "%d%%", m_dump_pct);
 			const float ppx = (54.0f + 60.0f * b.selected) * k;
 			m_fonts->AddText(f.ui, pctbuf, sx, sy, ppx, Rgba(1.0f, 1.0f, 1.0f, std::min(1.0f, a * 1.4f)), 0.6f, Fonts::Center);
-		}
+			}
+			else if (m_index[static_cast<size_t>(i)] == kDriveIndex)
+			{
+			// 2.11: the disc in the drive, not copied: its own art on the box, turning slowly, and what picking it does.
+			const float a = std::max(0.0f, 1.0f - std::fabs(d) * 1.6f) * b.brightness;
+			if (m_dump_disc_set)
+			AddDiscArt(f.ui, m_achievement_images, m_dump_disc_set, m_dump_disc_aspect, f.view_proj, b.model, m_dump_spin * 0.45f, a, W, H);
+			else
+			AddDiscSpinner(f.ui, f.view_proj, b.model, m_dump_spin * 0.18f, a, W, H, true, false);
+			const Vec4 cp = f.view_proj * (b.model * Vec4(0.0f, kDiscTextY, kBoxHalfD + 0.01f, 1.0f));
+			const float sx = ((cp.x / cp.w) * 0.5f + 0.5f) * W, sy = ((cp.y / cp.w) * 0.5f + 0.5f) * H;
+			const float ppx = (30.0f + 26.0f * b.selected) * k;
+			m_fonts->AddText(f.ui, "Disc in the drive", sx, sy, ppx, Rgba(1.0f, 1.0f, 1.0f, std::min(1.0f, a * 1.4f)), 0.6f, Fonts::Center);
+			if (b.selected > 0.5f)
+			m_fonts->AddText(f.ui, "Play it or copy it", sx, sy + 46.0f * k, 26.0f * k, Rgba(0.82f, 0.80f, 0.92f, std::min(1.0f, a * 1.2f)), 0.3f, Fonts::Center);
+			}
 	}
 
 	// The outline glow on the selected case once the shelf settles on it.
@@ -862,7 +1409,7 @@ void App::Build(FrameDesc& f, const std::string& clock)
 		f.halo.color[0] = Mix(m_glow[0], 1.0f, 0.8f);
 		f.halo.color[1] = Mix(m_glow[1], 1.0f, 0.8f);
 		f.halo.color[2] = Mix(m_glow[2], 1.0f, 0.8f);
-		f.halo.color[3] = settle * (0.50f + 0.08f * std::sin(t * 2.2f));
+		f.halo.color[3] = settle * (0.50f + 0.08f * std::sin(t * 2.2f)) * (1.0f - std::min(1.0f, std::fabs(m_flip) * 2.0f)); // 2.11: gone as it turns over
 	}
 
 	// Fade in at start, out when launching.
@@ -966,7 +1513,9 @@ void App::Build(FrameDesc& f, const std::string& clock)
 		add(Region(g.region)); // vk-285-110: the region names in the PS5's language
 		if (m_index[static_cast<size_t>(m_selected)] == kDumpIndex) // live-22: the disc being copied, not a sized image
 			add("Copying " + std::to_string(m_dump_pct) + "%");
-		else
+			else if (m_index[static_cast<size_t>(m_selected)] == kDriveIndex) // 2.11 (review): no size
+			add("In the drive");
+			else
 			add(SizeText(g.bytes));
 		if (!g.damaged.empty())
 			add("can't be read"); // vk-285-134
@@ -990,7 +1539,29 @@ void App::Build(FrameDesc& f, const std::string& clock)
 		}
 	}
 	else
-		m_fonts->AddText(ui, Tr(Str::NoGames), W * 0.5f, H * 0.5f, 64.0f * k, white, 0.4f, Fonts::Center);
+		{
+			if (m_search.applied.empty())
+			{
+				// 2026-10-16: with games folders set, the empty shelf names the first of them, not /data/PCSX2/games (a language file
+				// without that path in its line is shown as it is)
+				std::string none = Tr(Str::NoGames);
+				static const char kDefaultPath[] = "/data/PCSX2/games";
+				const size_t at = m_cfg.games_folder_note.empty() ? std::string::npos : none.find(kDefaultPath);
+				if (at != std::string::npos)
+				{
+					none.replace(at, sizeof(kDefaultPath) - 1, m_cfg.games_folder_note);
+					none = Fit(*m_fonts, none, 64.0f * k, W * 0.9f); // a long path is cut, not drawn off the screen
+				}
+				m_fonts->AddText(ui, none.c_str(), W * 0.5f, H * 0.5f, 64.0f * k, white, 0.4f, Fonts::Center);
+			}
+			else
+			{
+				// 2.11: a search with no match
+				m_fonts->AddText(ui, "No game matches", W * 0.5f, H * 0.47f, 64.0f * k, white, 0.4f, Fonts::Center);
+				m_fonts->AddText(ui, Fit(*m_fonts, "\xE2\x80\x9C" + m_search.text + "\xE2\x80\x9D", 48.0f * k, W * 0.7f).c_str(), W * 0.5f,
+					H * 0.53f, 48.0f * k, dim, 0.2f, Fonts::Center);
+			}
+		}
 	// vk-285-137: a note (a game hidden, hidden games shown or not), in the same place, unless a refusal came after it.
 	if (!m_note_text.empty() && m_time - m_note_time < 7.0 && m_note_time >= m_refused_time)
 	{
@@ -1097,6 +1668,16 @@ void App::Build(FrameDesc& f, const std::string& clock)
 			hint(icon::Triangle, nullptr, Tr(Str::HintDelete));
 		hint(icon::Circle, nullptr, Tr(Str::HintBack));
 	}
+	else if (m_search.typing && !m_search.system)
+	{
+		// 2.11: the search keyboard's buttons
+		hint(icon::DpadLeftRight, nullptr, "Move");
+		hint(icon::Cross, nullptr, "Type");
+		hint(icon::Square, nullptr, "Delete");
+		hint(icon::Triangle, nullptr, "Clear");
+		hint("#L1", "#R1", "Keys");
+		hint(icon::Circle, nullptr, "Done");
+	}
 	else if (m_sheet_open || m_sheet_anim > 0.5f)
 	{
 		// vk-285-114: the options sheet's buttons.
@@ -1114,7 +1695,7 @@ void App::Build(FrameDesc& f, const std::string& clock)
 	}
 	else
 	{
-		hint(icon::Cross, nullptr, Tr(Str::HintPlay)); // vk-285-110: hints in the PS5's language
+		hint(icon::Cross, nullptr, n > 0 && m_index[static_cast<size_t>(m_selected)] == kDriveIndex ? "Play or copy the disc" : Tr(Str::HintPlay)); // vk-285-110: hints in the PS5's language
 		// vk-285-69: the shelf opens with one game too (its QR code leads to the settings page and the
 		// logs); browsing needs two.
 		if (n > 1)
@@ -1123,6 +1704,12 @@ void App::Build(FrameDesc& f, const std::string& clock)
 			hint("#L1", "#R1", Tr(Str::HintJump));
 		}
 		hint(icon::Square, nullptr, Tr(Str::HintSettings)); // vk-285-114
+		if (!m_qr_big)
+		{
+			hint("#R2", nullptr, "Search"); // 2.11
+			if (!m_search.applied.empty())
+				hint(icon::Circle, nullptr, "Show all");
+		}
 		if (m_cfg.achievements.state && !m_qr_big)
 			hint("#L1", icon::Square, "RetroAchievements");
 		if (m_qr_size > 0)
@@ -1198,6 +1785,10 @@ void App::Build(FrameDesc& f, const std::string& clock)
 	}
 	if (m_account_anim > 0.001f)
 		BuildAccount(ui, W, H, k, accent);
+	if (m_ask_anim > 0.001f)
+		BuildDiscAsk(ui, W, H, k, accent);
+	BuildSearch(ui, W, H, k, accent); // 2.11: the search line and its keyboard, over everything but the disc question
+	f.ui_images = m_achievement_images; // 2.11: the texture changes among the UI vertices (badges, the disc being copied)
 }
 
 // ---- vk-285-114: the options sheet ---------------------------------------------------------------------------------
@@ -1303,13 +1894,15 @@ void App::OpenSheet(bool global)
 	m_sheet.SetOnlinePatchRow(static_cast<bool>(m_cfg.online_patches)); // 2026-10-08
 	m_sheet.SetSystemMenuRow(m_cfg.system_menu);                        // 2026-10-08
 	m_sheet.SetFolderRows(!m_cfg.folder_places.empty());                // vk-285-135
+	m_tile_row = HomeTileEligible(g);                                   // 2.12: the Home screen tile row (a game with a plain image file; the flag turns it on)
+	m_sheet.SetHomeTileRow(m_tile_row);
 	m_picker.open = false;
 	OptionsPaths paths = m_cfg.options;
 	if (!g || IsElfName(g->file.c_str())) // 2026-10-08: an ELF's Disc image row lists the shelf's disc images; vk-285-139: the Cheat disc row
 	{
-		for (const GameInfo& other : m_games)
-			if (!IsElfName(other.file.c_str()))
-				paths.disc_images.emplace_back(other.file, other.title);
+		for (size_t pos = 0; pos < m_games.size(); pos++) // 2.11 (review): not the disc entries (no file)
+		if (m_index[pos] >= 0 && !IsElfName(m_games[pos].file.c_str()))
+		paths.disc_images.emplace_back(m_games[pos].file, m_games[pos].title);
 		for (const Shelved& h : m_shelved) // vk-285-137: hidden ones too
 			if (!IsElfName(h.game.file.c_str()))
 				paths.disc_images.emplace_back(h.game.file, h.game.title);
@@ -1321,6 +1914,18 @@ void App::OpenSheet(bool global)
 		m_sheet_open = true;
 		m_sheet_scroll = m_sheet_scroll_target = 0;
 	}
+	// 2.12: the Home screen tile row is for this game from now on; the helper's state is looked at once, now, so the row shows the truth from its first frame.
+	m_tile_view = gametile::View();
+	m_tile_view_known = false;
+	if (m_tile_row)
+	{
+		m_tile_path = gametile::NormalizePath(g->path);
+		m_tile_title = g->title;
+		m_tile_serial = g->serial;
+		PollTiles(true);
+	}
+	else
+		m_tile_path.clear();
 	// The first row that can be picked.
 	m_sheet_row = 0;
 	const auto& rows = m_sheet.rows();
@@ -1588,7 +2193,7 @@ void App::UpdateSheet(double dt, const Input& in)
 	// vk-285-135: the Folders rows: Cross opens the picker (game folders, the BIOS folder) or the share list; Triangle sets the
 	// BIOS folder back to its default.
 	if (row.kind == OptionsSheet::Kind::GameFolders || row.kind == OptionsSheet::Kind::BiosFolder ||
-		row.kind == OptionsSheet::Kind::NfsShares)
+		row.kind == OptionsSheet::Kind::TexturesFolder || row.kind == OptionsSheet::Kind::NfsShares) // 2026-10-16: and the textures folder
 	{
 		if (pressed(in.cross, m_prev.cross))
 		{
@@ -1624,6 +2229,19 @@ void App::UpdateSheet(double dt, const Input& in)
 				}
 			}
 		}
+		return;
+	}
+
+	// 2.12: "Home screen tile": Cross, Left and Right put the game on the PS5 home screen (the helper makes the tile), Cross or Triangle take it off again.
+	if (row.kind == OptionsSheet::Kind::HomeTile)
+	{
+		const bool horizontal = (in.left && !m_prev.left) || (in.right && !m_prev.right);
+		if (pressed(in.cross, m_prev.cross))
+			HomeTileToggle(0);
+		else if (horizontal)
+			HomeTileToggle(1);
+		else if (pressed(in.triangle, m_prev.triangle))
+			HomeTileToggle(2);
 		return;
 	}
 
@@ -1673,6 +2291,172 @@ std::string App::OnlinePatchValue() const
 			return "Failed: " + s.message;
 	}
 	return {};
+}
+
+// ---- 2.12: the sheet's "Home screen tile" row (AI-assisted; see fe_gametile.h) ---------------------------------------
+// swordpdf: "add an option to add a game from the shelf to the xmb (square - and then option on) it should utilize the existing mounting scheme we have, we
+// should also be able to delete it, again, from the shelf". The row asks the PS5SX2 Disc Helper (one small file per press, in tiles_dir) to make a copy of this
+// app under a title ID of its own that starts this game from the home screen, and shows what the helper says about it. English like the rest of the sheet.
+// Nothing is read or written unless AppConfig::tiles_dir is set (the flag file flags/gametiles), and then only with the row shown or an ask pending.
+
+int App::TileFocused() const
+{
+	if (!m_sheet_open || !m_tile_row)
+		return 0;
+	const auto& rows = m_sheet.rows();
+	return m_sheet_row >= 0 && m_sheet_row < static_cast<int>(rows.size()) && rows[static_cast<size_t>(m_sheet_row)].kind == OptionsSheet::Kind::HomeTile ? 1 : 0;
+}
+
+// A game of the shelf's own list (not the copy in progress or the disc in the drive: no file of the list), a plain image the helper can use.
+bool App::HomeTileEligible(const GameInfo* g) const
+{
+	return !m_cfg.tiles_dir.empty() && g && !m_games.empty() && g == &m_games[static_cast<size_t>(m_selected)] &&
+	       m_index[static_cast<size_t>(m_selected)] >= 0 && gametile::RowEligible(g->path, g->file, g->damaged);
+}
+
+// The menu thread's file access stalls while a texture pack is unpacked (the project measured frames of 0.95 s): nothing is looked at then.
+bool App::DiskBusy() const
+{
+	if (!m_cfg.texture_packs || !m_cfg.texture_packs.activity)
+		return false;
+	using TS = TexturePackStatus::State;
+	const TexturePackActivity a = m_cfg.texture_packs.activity();
+	return a.active && (a.state == TS::Unpacking || a.state == TS::Installing || a.state == TS::Removing);
+}
+
+void App::HomeTileSay(const std::string& text)
+{
+	m_sheet_status = text;
+	m_sheet_status_time = m_time;
+}
+
+// alive.txt and state.txt, looked at every game with an ask in the books (the sheet may have moved on to another game, or closed) and the sheet's game.
+void App::PollTiles(bool force)
+{
+	if (m_cfg.tiles_dir.empty())
+		return;
+	const bool shown = m_sheet_open && m_tile_row;
+	const bool pending = m_tile.AnyPending();
+	if (!gametile::PollDue(shown || pending, pending, m_tile_view.busy, false, force, m_time, m_tile_poll))
+		return;
+	if (!force && DiskBusy())
+		return; // due, but a texture pack is being unpacked: the menu thread's file access stalls then; looked at again as soon as that is over
+	m_tile_poll = m_time;
+	m_tile_polls++;
+	const std::string& dir = m_cfg.tiles_dir;
+	const bool alive = gametile::AliveFresh(dir, static_cast<long long>(std::time(nullptr)));
+	m_tile_state.Refresh(dir, force, pending);
+	std::vector<std::string> paths = m_tile.Paths();
+	if (shown && std::find(paths.begin(), paths.end(), m_tile_path) == paths.end())
+		paths.push_back(m_tile_path);
+	for (const std::string& path : paths)
+	{
+		const std::string file = m_tile.FileOf(path);
+		const bool present = !file.empty() && gametile::RequestPresent(dir, file);
+		gametile::View v = m_tile.Evaluate(path, m_tile_state.entries, alive, present, m_time);
+		if (v.withdraw)
+		{
+			// Not taken within 15 s: taken back, so a helper loaded later does not act on it. ENOENT: the helper took it just now.
+			const gametile::WithdrawResult r = gametile::WithdrawFile(dir, file);
+			m_tile.WithdrawDone(path, r, m_time);
+			std::printf("[tiles] the request %s was not taken within %.0f s: %s\n", file.c_str(), gametile::kTakeS,
+				r == gametile::WithdrawResult::Withdrawn ? "taken back" : r == gametile::WithdrawResult::AlreadyTaken ? "taken by the helper just now" : "could not be taken back");
+			std::fflush(stdout);
+			if (r == gametile::WithdrawResult::AlreadyTaken)
+				v = m_tile.Evaluate(path, m_tile_state.entries, alive, false, m_time);
+		}
+		if (!shown || path != m_tile_path)
+			continue;
+		const gametile::Phase before = m_tile_view.phase;
+		if (!m_tile_view_known || v.phase != before)
+		{
+			const std::string id = v.tile.empty() ? std::string("no tile id") : v.tile;
+			std::printf("[tiles] %s: %s (%s%s%s)\n", m_tile_title.c_str(), gametile::PhaseName(v.phase), id.c_str(), v.reason.empty() ? "" : ", failed: ",
+				v.reason.c_str());
+			std::fflush(stdout);
+			if (m_cfg.options.log)
+				m_cfg.options.log("shelf: home screen tile: " + m_tile_title + ": " + gametile::PhaseName(v.phase) + " (" + id +
+				                  (v.reason.empty() ? std::string() : ", failed: " + v.reason) + ")");
+			if (m_tile_view_known && v.phase == gametile::Phase::On && before != gametile::Phase::On)
+			{
+				HomeTileSay("Tile ready: " + m_tile_title + " is on the home screen"); // never a system popup: no popups for tile mechanics
+				Sound(Sfx::Move, 0.3f);
+			}
+		}
+		m_tile_view = v;
+		m_tile_view_known = true;
+	}
+}
+
+// how: 0 Cross, 1 Left or Right, 2 Triangle. Cross adds or removes (what the row can do now); Left and Right only add (from Off); Triangle only removes.
+void App::HomeTileToggle(int how)
+{
+	if (m_cfg.tiles_dir.empty() || !m_tile_row || m_tile_path.empty() || m_games.empty())
+		return;
+	const gametile::View& v = m_tile_view;
+	if (v.phase == gametile::Phase::NoHelper)
+	{
+		// No file is written for a helper that is not there: nobody would take it, and a helper loaded later would act on a request of long ago.
+		HomeTileSay("Load the PS5SX2 Disc Helper 171g first");
+		Sound(Sfx::Edge, 0.3f);
+		return;
+	}
+	if (v.busy)
+	{
+		HomeTileSay("Still working: wait for the helper");
+		Sound(Sfx::Edge, 0.3f);
+		return;
+	}
+	const bool add = how == 0 ? v.can == gametile::Can::Add : how == 1 && v.can == gametile::Can::Add && v.phase == gametile::Phase::Off;
+	const bool remove = (how == 0 || how == 2) && v.can == gametile::Can::Remove;
+	if (!add && !remove)
+	{
+		Sound(Sfx::Edge, 0.3f);
+		return;
+	}
+	if (remove && !m_cfg.own_tile_game.empty() && gametile::NormalizePath(m_cfg.own_tile_game) == m_tile_path)
+	{
+		// Taking off the tile this very process runs from would have the helper close it under the player.
+		HomeTileSay("This is the tile this game was started from: take it off from the main app");
+		Sound(Sfx::Edge, 0.3f);
+		return;
+	}
+	const GameInfo& g = m_games[static_cast<size_t>(m_selected)];
+	const std::string cover = add && m_cfg.tile_cover ? m_cfg.tile_cover(g) : std::string();
+	const std::string text = add ? gametile::FormatAdd(m_tile_path, m_tile_serial, m_tile_title, cover) : gametile::FormatRemove(m_tile_path);
+	std::string file, err;
+	if (text.empty() || !gametile::QueueRequest(m_cfg.tiles_dir, text, &file, &err))
+	{
+		if (text.empty())
+			err = "not a path it can use";
+		HomeTileSay("Couldn't ask the helper: " + err);
+		std::printf("[tiles] %s: couldn't ask the helper: %s\n", m_tile_title.c_str(), err.c_str());
+		std::fflush(stdout);
+		Sound(Sfx::Edge, 0.3f);
+		return;
+	}
+	m_tile.Ask(m_tile_path, add, file, m_time, gametile::FindByPath(m_tile_state.entries, m_tile_path));
+	m_tile_view = m_tile.Evaluate(m_tile_path, m_tile_state.entries, true, true, m_time);
+	m_tile_view_known = true;
+	m_tile_poll = m_time; // the next look in a second
+	HomeTileSay(std::string(add ? "Asked the helper to add " : "Asked the helper to take off ") + m_tile_title);
+	std::printf("[tiles] %s: asked the helper to %s (%s)%s%s\n", m_tile_title.c_str(), add ? "add it" : "take it off", file.c_str(), cover.empty() ? "" : ", cover ",
+		cover.c_str());
+	std::fflush(stdout);
+	if (m_cfg.options.log)
+		m_cfg.options.log("shelf: home screen tile: " + m_tile_title + ": asked the helper to " + (add ? "add it" : "take it off") + " (" + m_tile_path + ")");
+	Sound(Sfx::Move, 0.3f);
+}
+
+std::string App::HomeTileValue() const
+{
+	return m_cfg.tiles_dir.empty() ? std::string() : gametile::ValueText(m_tile_view);
+}
+
+std::string App::HomeTileHelp() const
+{
+	const bool own = !m_cfg.own_tile_game.empty() && gametile::NormalizePath(m_cfg.own_tile_game) == m_tile_path;
+	return gametile::HelpText(m_tile_view, m_tile_title, own);
 }
 
 // ---- 2026-10-05: the sheet's HD texture pack row (AI-assisted; see fe_texpacks.h) -----------------------------------
@@ -1726,7 +2510,7 @@ void App::UpdateTexturePackRow(const Input& in, double now)
 			const std::string header = "# " + g.title + (g.serial.empty() ? std::string() : " (" + g.serial + ")");
 			ok = m_cfg.texture_packs.begin(g.serial, pick, path, header, g.title);
 			const TexturePack& p = s.packs[static_cast<size_t>(pick)];
-			status(ok ? "Asked for " + p.label + " (" + FormatBytes(p.bytes) + ")" : "Couldn't start the download");
+			status(ok ? "Asked for " + p.label + " (" + (p.OnDrive() ? std::string("Google Drive") : FormatBytes(p.bytes)) + ")" : "Couldn't start the download");
 		}
 		Sound(ok ? Sfx::Move : Sfx::Edge, 0.3f);
 		return;
@@ -1773,7 +2557,7 @@ std::string App::TexturePackValue(const TexturePackStatus& s, int pick) const
 		case State::Available:
 		{
 			const TexturePack& p = s.packs[static_cast<size_t>(std::clamp(pick, 0, n - 1))];
-			return (n > 1 ? p.label : std::string("Download")) + "  \xC2\xB7  " + FormatBytes(p.bytes);
+			return (n > 1 ? p.label : std::string("Download")) + "  \xC2\xB7  " + (p.OnDrive() ? std::string("Google Drive") : FormatBytes(p.bytes));
 		}
 		case State::Queued: return "Waiting";
 		case State::Checking: return "Checking " + percent();
@@ -1814,18 +2598,28 @@ std::string App::TexturePackHelp(const TexturePackStatus& s, int pick, const std
 		case State::Available:
 		{
 			const TexturePack& p = s.packs[static_cast<size_t>(std::clamp(pick, 0, n - 1))];
-			std::string h = "Cross downloads " + p.label + " (" + FormatBytes(p.bytes) +
-			                (p.files > 0 ? ", " + std::to_string(p.files) + " files" : std::string()) +
-			                ") from archive.org's PCSX2 HD Texture Packs, puts it in " + folder +
-			                " and turns Texture replacements on for this game." + carry_on;
+			std::string h = p.OnDrive()
+			                    ? "Cross downloads " + p.maker + "'s pack (" + p.name +
+			                      (p.hint_bytes > 0 ? ", about " + FormatBytes(p.hint_bytes) + "; the exact size shows when it starts" : std::string("; its size shows when it starts")) +
+			                      ") from the community's Google Drive "
+			                      "folder, puts it in " + folder + " and turns Texture replacements on for this game." + carry_on
+			                    : "Cross downloads " + p.label + " (" + FormatBytes(p.bytes) +
+			                      (p.files > 0 ? ", " + std::to_string(p.files) + " files" : std::string()) +
+			                      ") from archive.org's PCSX2 HD Texture Packs, puts it in " + folder +
+			                      " and turns Texture replacements on for this game." + carry_on;
 			if (n > 1)
 				h += " Left and right pick another version.";
 			return h;
 		}
 		case State::Queued: return "Waiting for the pack before it." + carry_on + " Triangle twice cancels it.";
 		case State::Checking: return "Checking what was downloaded before." + carry_on + " Triangle twice cancels it.";
-		case State::Downloading: return "Downloading from archive.org." + carry_on + " Triangle twice cancels it.";
-		case State::Verifying: return "Checking the download against archive.org's checksum.";
+		case State::Downloading:
+			return std::string(s.job_pack >= 0 && s.job_pack < n && s.packs[static_cast<size_t>(s.job_pack)].OnDrive() ? "Downloading from Google Drive." :
+			                                                                                                            "Downloading from archive.org.") +
+			       carry_on + " Triangle twice cancels it.";
+		case State::Verifying:
+			return s.job_pack >= 0 && s.job_pack < n && s.packs[static_cast<size_t>(s.job_pack)].OnDrive() ? std::string("Checking the download.") :
+			                                                                                              std::string("Checking the download against archive.org's checksum.");
 		case State::Unpacking: return "Unpacking into " + folder + ". Triangle twice cancels it.";
 		case State::Installing: return "Moving the pack into " + folder + ".";
 		case State::Installed:
@@ -1834,6 +2628,8 @@ std::string App::TexturePackHelp(const TexturePackStatus& s, int pick, const std
 				std::string name = s.installed.empty() ? std::string("The pack") : s.installed;
 				if (name.size() > 4 && (name.compare(name.size() - 4, 4, ".rar") == 0 || name.compare(name.size() - 4, 4, ".zip") == 0))
 					name.resize(name.size() - 4);
+				else if (name.size() > 3 && name.compare(name.size() - 3, 3, ".7z") == 0) // b176
+					name.resize(name.size() - 3);
 				return name + " is in " + folder + ". It shows in the game while Texture replacements is on (installing turned it on). "
 				                                   "Triangle twice deletes it.";
 			}
@@ -2204,6 +3000,9 @@ void App::BuildSheet(std::vector<UiVertex>& ui, float W, float H, float k, uint3
 			value += "  \xC2\xB7  Create";
 		if (r.kind == OptionsSheet::Kind::OnlinePatches) // 2026-10-08
 			value = OnlinePatchValue();
+		const bool tile_row = r.kind == OptionsSheet::Kind::HomeTile; // 2.12: the helper's word for the game's tile (Off, Adding..., On, ...)
+		if (tile_row)
+			value = HomeTileValue();
 		// 2026-10-05: the HD texture pack row shows the pack, the download's progress or the installed pack.
 		const bool pack_row = r.kind == OptionsSheet::Kind::TexturePack && m_cfg.texture_packs && !m_games.empty();
 		TexturePackStatus pack;
@@ -2222,10 +3021,10 @@ void App::BuildSheet(std::vector<UiVertex>& ui, float W, float H, float k, uint3
 		}
 		// vk-285-135: the Folders rows open a list (Cross); left and right don't change them.
 		const bool folder_row = r.kind == OptionsSheet::Kind::GameFolders || r.kind == OptionsSheet::Kind::BiosFolder ||
-		                        r.kind == OptionsSheet::Kind::NfsShares;
+		                        r.kind == OptionsSheet::Kind::TexturesFolder || r.kind == OptionsSheet::Kind::NfsShares;
 		if (folder_row && focused)
 			value += "  \xE2\x80\xBA";
-		const bool arrows = focused && !action && pick_arrows && !folder_row;
+		const bool arrows = focused && !action && pick_arrows && !folder_row && !tile_row;
 
 		const float value_room = bw * (pack_row ? 0.68f : 0.46f); // 2026-10-05: the pack row's label is short, its value long
 		// vk-285-116: a label or a value that starts with a button's symbol ("<glyph>  Cross", the Controls tab): the symbol
@@ -2252,6 +3051,12 @@ void App::BuildSheet(std::vector<UiVertex>& ui, float W, float H, float k, uint3
 			{
 				using TS = TexturePackStatus::State;
 				vc = pack.state == TS::Installed ? own : (pack.state == TS::Failed || pack.state == TS::NeedSpace) ? Rgba(1.0f, 0.62f, 0.60f) : mid;
+			}
+			if (tile_row) // 2.12: On in the shelf's own colour; a failure, a request nobody answered or a helper that is not there in the warning colour
+			{
+				using TP = gametile::Phase;
+				const TP p = m_tile_view.phase;
+				vc = p == TP::On ? own : (p == TP::Failed || p == TP::NoAnswer || p == TP::Stuck || p == TP::NoHelper) ? Rgba(1.0f, 0.62f, 0.60f) : mid;
 			}
 			const float vx = bx + bw - 44 * k - (arrows ? 30 * k : 0.0f);
 			float vw = m_fonts->AddText(ui, shown.c_str(), vx, mid_y, vpx, vc, 0.5f, Fonts::Right);
@@ -2301,6 +3106,8 @@ void App::BuildSheet(std::vector<UiVertex>& ui, float W, float H, float k, uint3
 			const auto it = m_texpack_pick.find(serial);
 			help = TexturePackHelp(pack, it != m_texpack_pick.end() ? it->second : std::max(0, pack.job_pack), serial);
 		}
+		if (focus_row.kind == OptionsSheet::Kind::HomeTile) // 2.12
+			help = HomeTileHelp();
 		float hy = list_bottom + 110 * k;
 		for (const std::string& line : Wrap(*m_fonts, help, 32 * k, inner, 4))
 		{
@@ -2380,6 +3187,17 @@ bool StartsWithNoCase(const std::string& s, const char* prefix)
 			return false;
 	return true;
 }
+
+// Review 2026-10-16: what the picker says when the settings writer refused the value (the file can't hold a '#', it starts a comment
+// there, nor more than 200 characters): the plain reason, else the sheet's own "Couldn't save: ...".
+std::string NotSavedBecause(const std::string& value, const std::string& sheet_status)
+{
+	if (value.find('#') != std::string::npos)
+		return "Not saved: a '#' in a folder's name can't be kept in the settings";
+	if (value.size() > 200)
+		return "Not saved: the settings keep at most 200 characters here";
+	return sheet_status;
+}
 } // namespace
 
 void App::OpenPicker(OptionsSheet::Kind kind)
@@ -2389,7 +3207,8 @@ void App::OpenPicker(OptionsSheet::Kind kind)
 	m_picker.kind = kind;
 	PickerList("");
 	std::printf("[options] %s\n", kind == OptionsSheet::Kind::NfsShares ? "NFS share list" :
-	                              kind == OptionsSheet::Kind::BiosFolder ? "folder picker for the BIOS folder" : "folder picker for game folders");
+	                              kind == OptionsSheet::Kind::BiosFolder ? "folder picker for the BIOS folder" :
+	                              kind == OptionsSheet::Kind::TexturesFolder ? "folder picker for the textures folder" : "folder picker for game folders");
 	std::fflush(stdout);
 }
 
@@ -2410,9 +3229,20 @@ void App::PickerList(const std::string& dir, const std::string& focus)
 		if (p.kind == OptionsSheet::Kind::GameFolders)
 			for (const std::string& f : SplitFolderList(m_sheet.OwnValue(kGameFoldersKey)))
 				p.items.push_back({T::Listed, f, f, "Added"});
+		// 2.11 (swordpdf: "for picking paths you cant really browse to your folder"): a folder that is none of the places below (under
+		// /data, say) is typed instead; the places also reach /data and the root now.
+		p.items.push_back({T::TypePath, "Type a folder path", "", "/data/..."});
 		for (const auto& [label, path] : m_cfg.folder_places)
 			if (IsFolder(path))
 				p.items.push_back({T::Place, label, path, path});
+		for (const char* const extra : {"/data", "/mnt", "/"})
+		{
+			bool listed = false;
+			for (const PickerItem& it : p.items)
+				listed = listed || (it.type == T::Place && it.path == extra);
+			if (!listed && IsFolder(extra))
+				p.items.push_back({T::Place, std::string(extra) == "/" ? "Everything (the root)" : std::string("All of ") + extra, extra, extra});
+		}
 	}
 	else
 	{
@@ -2422,9 +3252,11 @@ void App::PickerList(const std::string& dir, const std::string& focus)
 		std::string value;
 		if (p.kind == OptionsSheet::Kind::GameFolders)
 		{
-			// The games the shelf would list from it: its own, and those one folder down (as main-boot.cpp lists folders).
+			// The games the shelf would list from it: its own, and those one folder down (as main-boot.cpp lists folders);
+			// 2026-10-16: not those, with Scan subfolders off.
 			int below = 0;
-			for (size_t i = 0; i < folders.size() && i < 64; i++)
+			const bool one_down = m_sheet.OwnValue(kScanSubfoldersKey) != "false";
+			for (size_t i = 0; one_down && i < folders.size() && i < 64; i++)
 			{
 				std::vector<std::string> sub;
 				int n = 0;
@@ -2457,6 +3289,24 @@ void App::FinishShareText(int r, std::string text)
 		text.pop_back();
 	while (!text.empty() && text.front() == ' ')
 		text.erase(0, 1);
+	// 2.11: a folder's path typed: go there when it is a folder (the listing then offers "Use this folder").
+	if (p.path_entry)
+	{
+		p.path_entry = false;
+		while (text.size() > 1 && text.back() == '/')
+			text.pop_back();
+		if (r > 0 && !text.empty() && text[0] == '/' && IsFolder(text))
+		{
+			PickerList(text);
+			Sound(Sfx::Move, 0.3f);
+		}
+		else
+		{
+			status(r > 0 && !text.empty() ? "Not a folder on this console: " + text : std::string("Nothing typed"));
+			Sound(Sfx::Edge, 0.3f);
+		}
+		return;
+	}
 	// vk-285-138 (AI-assisted; swordpdf: "i cant edit my nfs path"): Cross on a listed share opens the keyboard with it, and
 	// what comes back takes its place.
 	const std::string editing = p.editing;
@@ -2586,7 +3436,7 @@ void App::UpdatePicker(double dt, const Input& in)
 			p.open = false;
 		else
 		{
-			bool place = false;
+			bool place = p.dir == "/"; // 2026-10-16: the root is the top: Circle there goes back to the places (it stayed on the root)
 			for (const auto& pl : m_cfg.folder_places)
 				place = place || pl.second == p.dir;
 			const std::string from = p.dir;
@@ -2640,10 +3490,27 @@ void App::UpdatePicker(double dt, const Input& in)
 				Sound(Sfx::Move, 0.3f);
 				break;
 			case T::Use:
+				// 2026-10-16: the root itself is no folder to read from (the app skips a '/' entry): "Everything" opens it, a folder in it is used
+				if (item.path.size() <= 1)
+				{
+					status("Pick a folder inside it");
+					Sound(Sfx::Edge, 0.3f);
+					break;
+				}
+				// Review 2026-10-16: the status says it was saved only when it was (a path with a '#' in it, or over 200 characters, is refused by
+				// the settings writer: then the reason is what the player reads). Picking the same folder again is no failure.
 				if (p.kind == K::BiosFolder)
 				{
-					m_sheet.SetOwn(kBiosFolderKey, item.path, "BIOS folder picked");
-					status("BIOS folder: " + item.path + " (restart PS5SX2)");
+					const bool saved = m_sheet.SetOwn(kBiosFolderKey, item.path, "BIOS folder picked") || m_sheet.OwnValue(kBiosFolderKey) == item.path;
+					// review 2026-10-16 (lens 3): the path last: the status is one line (30 px, about 93 characters) and a long path cut the
+					// "(restart PS5SX2)" off the end
+					status(saved ? "BIOS folder, the only place the BIOS is looked for (restart PS5SX2): " + item.path
+					             : NotSavedBecause(item.path, m_sheet.status()));
+				}
+				else if (p.kind == K::TexturesFolder)
+				{
+					const bool saved = m_sheet.SetOwn(kTexturesDirKey, item.path, "Textures folder picked") || m_sheet.OwnValue(kTexturesDirKey) == item.path;
+					status(saved ? "Textures folder: " + item.path + " (restart PS5SX2)" : NotSavedBecause(item.path, m_sheet.status()));
 				}
 				else
 				{
@@ -2652,15 +3519,37 @@ void App::UpdatePicker(double dt, const Input& in)
 						status(item.path + " is listed already");
 					else
 					{
+						const bool first = list.empty();
 						list.push_back(item.path);
-						if (m_sheet.SetOwn(kGameFoldersKey, JoinFolderList(list), "game folder added"))
-							status("Added " + item.path + ": restart PS5SX2 to list its games");
+						// 2026-10-16: the folders added are the only ones games are listed from
+						const std::string joined = JoinFolderList(list);
+						if (m_sheet.SetOwn(kGameFoldersKey, joined, "game folder added"))
+							status(first ? "Games now come from the folders you added only (restart PS5SX2): " + item.path
+							             : "Added " + item.path + ": restart PS5SX2 to list its games"); // (the path last when it is the long text: one line)
+						else
+							status(NotSavedBecause(joined, m_sheet.status())); // review 2026-10-16: the list is over 200 characters, or a name has a '#'
 					}
 				}
-				std::printf("[options] %s picked: %s\n", p.kind == K::BiosFolder ? "BIOS folder" : "game folder", item.path.c_str());
+				std::printf("[options] %s picked: %s\n", p.kind == K::BiosFolder ? "BIOS folder" : p.kind == K::TexturesFolder ? "textures folder" : "game folder",
+					item.path.c_str());
 				std::fflush(stdout);
 				p.open = false;
 				Sound(Sfx::Move, 0.3f);
+				break;
+			case T::TypePath: // 2.11: a folder's path on the keyboard
+				p.path_entry = true;
+				p.editing.clear();
+				if (m_cfg.text_entry.open && m_cfg.text_entry.open("Folder path, for example /data/roms", "/data/", false, 255))
+					p.typing = true;
+				else
+				{
+					p.osk = true;
+					p.osk_text = "/data/";
+					p.osk_page = 0;
+					p.osk_row = 1;
+					p.osk_col = 0;
+					Sound(Sfx::Move, 0.3f);
+				}
 				break;
 			case T::Share: // vk-285-138: change it on the keyboard
 			case T::Add:
@@ -2692,7 +3581,7 @@ void App::UpdatePicker(double dt, const Input& in)
 		std::vector<std::string> list = SplitFolderList(m_sheet.OwnValue(key));
 		list.erase(std::remove(list.begin(), list.end(), item.path), list.end());
 		if (m_sheet.SetOwn(key, JoinFolderList(list), std::string(item.type == T::Share ? "NFS share" : "game folder") + " removed: " + item.path))
-			status("Removed " + item.path + " (restart PS5SX2)");
+			status("Removed " + item.path + (item.type == T::Listed && list.empty() ? ": back to the usual places (restart PS5SX2)" : " (restart PS5SX2)"));
 		const int keep = p.row;
 		PickerList(p.dir);
 		p.row = std::min(keep, std::max(0, static_cast<int>(p.items.size()) - 1));
@@ -2711,7 +3600,8 @@ void App::BuildPicker(std::vector<UiVertex>& ui, float x, float sw, float y, flo
 	const float list_top = y + kSheetListTop * k, list_bottom = y + sh - kSheetHelpH * k;
 
 	// Where it is: what for, and the folder shown.
-	const char* what = p.kind == K::NfsShares ? "NFS SHARES" : p.kind == K::BiosFolder ? "THE BIOS FOLDER" : "A GAME FOLDER";
+	const char* what = p.kind == K::NfsShares ? "NFS SHARES" : p.kind == K::BiosFolder ? "THE BIOS FOLDER" :
+	                   p.kind == K::TexturesFolder ? "THE TEXTURES FOLDER" : "A GAME FOLDER";
 	const std::string head = p.kind == K::NfsShares ? std::string(what) : std::string("PICK ") + what;
 	m_fonts->AddText(ui, head.c_str(), cx, list_top + 40 * k, 26 * k, lo, 0.45f);
 	if (!p.dir.empty())
@@ -2747,7 +3637,7 @@ void App::BuildPicker(std::vector<UiVertex>& ui, float x, float sw, float y, flo
 			Fonts::AddRoundedRect(ui, bx + 14 * k, ry + 24 * k, 6 * k, bh - 48 * k, 3 * k, accent);
 		}
 		const float mid_y = ry + bh * 0.5f + 13 * k;
-		const bool action = it.type == T::Use || it.type == T::Add;
+		const bool action = it.type == T::Use || it.type == T::Add || it.type == T::TypePath;
 		const char* const mark = it.type == T::Folder || it.type == T::Place ? "\xE2\x80\xBA" : ""; // a folder to go into
 		const float vpx = 34 * k, lpx = 40 * k;
 		const float value_w = it.value.empty() ? 0.0f : std::min(bw * 0.42f, m_fonts->Measure(it.value.c_str(), vpx));
@@ -2768,15 +3658,23 @@ void App::BuildPicker(std::vector<UiVertex>& ui, float x, float sw, float y, flo
 	Fonts::AddRoundedRect(ui, cx, list_bottom + 44 * k, inner, 2 * k, 0, Rgba(1, 1, 1, 0.12f));
 	std::string help;
 	const PickerItem* it = p.items.empty() ? nullptr : &p.items[static_cast<size_t>(p.row)];
-	if (p.osk)
+	if (p.osk && p.path_entry)
+		help = "Type the folder's path, like /data/roms: Cross types the key, Square deletes, Options is done, Circle cancels.";
+	else if (p.typing && p.path_entry)
+		help = "Type the folder's path on the PS5's keyboard, like /data/roms. The picker goes to that folder.";
+	else if (p.osk)
 		help = "Type the share's address, nfs://<server>/<shared folder>: Cross types the key, Square deletes, Options is done, Circle "
 		       "cancels. Add ?version=4 for an NFS v4 server.";
 	else if (p.typing)
 		help = "Type the share's address on the PS5's keyboard: nfs://<server>/<shared folder>, as the server shares it (a folder "
 		       "inside it works too). Add ?version=4 for an NFS v4 server.";
+	else if (it && it->type == T::TypePath)
+		help = "Cross: type a folder's path (like /data/roms) when it is not under the places below. Circle: back to the sheet.";
 	else if (it && it->type == T::Use)
-		help = p.kind == K::BiosFolder ? "Cross: look for the BIOS here first. Circle: back."
-		                               : "Cross: list the games in this folder (and in the folders in it). Circle: back.";
+		// 2026-10-16: the folder picked is the only one (the games, the BIOS), not one more place
+		help = p.kind == K::BiosFolder ? "Cross: look for the BIOS only here (and in the folders in it). Circle: back."
+		     : p.kind == K::TexturesFolder ? "Cross: read texture packs from here and install HD packs here. Circle: back."
+		                                   : "Cross: list the games in this folder (and in the folders in it) only. Circle: back.";
 	else if (it && (it->type == T::Listed || it->type == T::Share))
 		help = it->type == T::Share ? std::string("Cross: change it on the PS5's keyboard. Triangle: remove it from the shares. Circle: back to the sheet.")
 		                            : std::string("Triangle: remove it from the game folders. Circle: back to the sheet.");
@@ -2852,6 +3750,123 @@ void App::UpdateAccount(const Input& in)
 		else
 			m_account.StartKeyboard();
 	}
+}
+
+// 2.04: a PS2 disc was put in the drive and is not copied: the disc watcher (orbis-shims/ProsperoDiscDump.cpp) asks here whether to
+// play it straight from the disc or copy it first. Left/Right choose, Cross confirms, Circle leaves the disc alone for now.
+void App::PollDiscAsk()
+{
+	if (!m_cfg.disc_ask_poll)
+		return;
+	std::string title, serial;
+	const bool pending = m_cfg.disc_ask_poll(title, serial);
+	if (pending && !m_ask_on && !m_launching)
+	{
+		m_ask_on = true;
+		m_ask_title = title;
+		m_ask_serial = serial;
+		m_ask_sel = 0;
+		m_held = 0;
+		Sound(Sfx::Move, 0.0f);
+		std::printf("[frontend] disc ask: %s (%s)\n", title.c_str(), serial.c_str());
+		std::fflush(stdout);
+	}
+	else if (!pending && m_ask_on)
+		m_ask_on = false; // the disc was taken out, or the question was answered elsewhere
+}
+
+void App::UpdateDiscAsk(const Input& in)
+{
+	const bool left = in.left && !m_prev.left, right = in.right && !m_prev.right;
+	int answer = 0;
+	if (left || right)
+	{
+		m_ask_sel = 1 - m_ask_sel;
+		Sound(Sfx::Move, left ? -0.2f : 0.2f);
+	}
+	else if (in.cross && !m_prev.cross)
+		answer = m_ask_sel == 0 ? 2 : 1;
+	else if (in.circle && !m_prev.circle)
+		answer = 3;
+	if (answer != 0)
+	{
+		std::printf("[frontend] disc ask: answered %s\n", answer == 2 ? "play from the disc" : answer == 1 ? "copy it" : "not now");
+		std::fflush(stdout);
+		if (m_cfg.disc_ask_answer)
+			m_cfg.disc_ask_answer(answer);
+		m_ask_on = false;
+		Sound(answer == 3 ? Sfx::Edge : Sfx::Launch, 0.0f);
+	}
+}
+
+void App::BuildDiscAsk(std::vector<UiVertex>& ui, float W, float H, float k, uint32_t accent)
+{
+	const float e = Smoothstep(0.0f, 1.0f, m_ask_anim);
+	const size_t begin = ui.size();
+	const uint32_t hi = Rgba(1, 1, 1), mid = Rgba(0.76f, 0.74f, 0.86f), lo = Rgba(0.56f, 0.54f, 0.68f);
+	const uint32_t ink = Rgba(0.07f, 0.06f, 0.16f), inkmid = Rgba(0.30f, 0.28f, 0.44f);
+	// The shelf behind, dimmed so that the panel is what the eye goes to.
+	Fonts::AddRoundedRect(ui, 0, 0, W, H, 0.0f, Rgba(0.01f, 0.01f, 0.03f, 0.76f));
+
+	const float pw = 1560 * k, ph = 740 * k, px = (W - pw) * 0.5f, py = (H - ph) * 0.5f - 20 * k;
+	const float pad = 84 * k, cx = px + pad, inner = pw - 2 * pad;
+	// The panel: a soft shadow, a faint rim, the dark body, and a thin accent line along its top.
+	Fonts::AddRoundedRect(ui, px - 8 * k, py + 14 * k, pw + 16 * k, ph + 16 * k, 52 * k, Rgba(0, 0, 0, 0.38f));
+	Fonts::AddRoundedRect(ui, px - 2 * k, py - 2 * k, pw + 4 * k, ph + 4 * k, 46 * k, Rgba(1, 1, 1, 0.14f));
+	Fonts::AddRoundedRect(ui, px, py, pw, ph, 44 * k, Rgba(0.045f, 0.050f, 0.105f, 0.985f));
+	Fonts::AddRoundedRect(ui, px + 120 * k, py, pw - 240 * k, 6 * k, 3 * k, accent);
+
+	// The disc: a bright rim, a darker face with a ring in the accent colour, and the hole.
+	const float dr = 62 * k, dcx = cx + dr, dcy = py + 148 * k;
+	Fonts::AddRoundedRect(ui, dcx - dr - 6 * k, dcy - dr - 6 * k, 2 * (dr + 6 * k), 2 * (dr + 6 * k), dr + 6 * k, Rgba(1, 1, 1, 0.10f));
+	Fonts::AddRoundedRect(ui, dcx - dr, dcy - dr, 2 * dr, 2 * dr, dr, Rgba(0.80f, 0.80f, 0.92f, 0.95f));
+	Fonts::AddRoundedRect(ui, dcx - dr * 0.80f, dcy - dr * 0.80f, 2 * dr * 0.80f, 2 * dr * 0.80f, dr * 0.80f, Rgba(0.10f, 0.10f, 0.22f, 1.0f));
+	Fonts::AddRoundedRect(ui, dcx - dr * 0.50f, dcy - dr * 0.50f, 2 * dr * 0.50f, 2 * dr * 0.50f, dr * 0.50f, accent);
+	Fonts::AddRoundedRect(ui, dcx - dr * 0.44f, dcy - dr * 0.44f, 2 * dr * 0.44f, 2 * dr * 0.44f, dr * 0.44f, Rgba(0.10f, 0.10f, 0.22f, 1.0f));
+	Fonts::AddRoundedRect(ui, dcx - dr * 0.17f, dcy - dr * 0.17f, 2 * dr * 0.17f, 2 * dr * 0.17f, dr * 0.17f, Rgba(0.80f, 0.80f, 0.92f, 0.95f));
+
+	// What is in the drive: a small label, the game's name, its serial.
+	const float tx = cx + 2 * dr + 56 * k, tw = inner - 2 * dr - 56 * k;
+	m_fonts->AddText(ui, "PS2 DISC IN THE DRIVE", tx, py + 96 * k, 26 * k, mid, 0.40f);
+	m_fonts->AddText(ui, Fit(*m_fonts, m_ask_title, 64 * k, tw).c_str(), tx, py + 168 * k, 64 * k, hi, 0.55f);
+	if (!m_ask_serial.empty())
+		m_fonts->AddText(ui, m_ask_serial.c_str(), tx, py + 214 * k, 28 * k, lo, 0.20f);
+
+	Fonts::AddRoundedRect(ui, cx, py + 262 * k, inner, 2 * k, 0, Rgba(1, 1, 1, 0.10f));
+	m_fonts->AddText(ui, "How do you want to play it?", cx, py + 322 * k, 34 * k, mid, 0.25f);
+
+	// Two cards, side by side: the focused one is white with dark text and a glow in the accent colour.
+	const float gap = 36 * k, cw = (inner - gap) * 0.5f, ch = 220 * k, cy = py + 360 * k;
+	auto card = [&](float x0, const char* title, const char* line1, const char* line2, bool focused) {
+		if (focused)
+		{
+			Fonts::AddRoundedRect(ui, x0 - 8 * k, cy - 8 * k, cw + 16 * k, ch + 16 * k, 46 * k, Rgba(1, 1, 1, 0.16f));
+			Fonts::AddRoundedRect(ui, x0 - 4 * k, cy - 4 * k, cw + 8 * k, ch + 8 * k, 42 * k, accent);
+			Fonts::AddRoundedRect(ui, x0, cy, cw, ch, 38 * k, Rgba(1, 1, 1, 0.96f));
+		}
+		else
+			Fonts::AddRoundedRect(ui, x0, cy, cw, ch, 38 * k, Rgba(1, 1, 1, 0.07f));
+		const uint32_t t = focused ? ink : hi, c = focused ? inkmid : mid;
+		m_fonts->AddText(ui, title, x0 + cw * 0.5f, cy + 84 * k, 46 * k, t, 0.55f, Fonts::Center);
+		m_fonts->AddText(ui, line1, x0 + cw * 0.5f, cy + 140 * k, 29 * k, c, 0.15f, Fonts::Center);
+		m_fonts->AddText(ui, line2, x0 + cw * 0.5f, cy + 182 * k, 29 * k, c, 0.15f, Fonts::Center);
+	};
+	card(cx, "Play from disc", "Starts right now.", "The disc stays in the drive.", m_ask_sel == 0);
+	card(cx + cw + gap, "Copy to storage", "A few minutes, then it plays.", "After that the disc can come out.", m_ask_sel == 1);
+
+	// The buttons, in small chips along the bottom.
+	float hx = cx;
+	auto hint = [&](const char* key, const char* what) {
+		const float kpx = 24 * k, kw = m_fonts->Measure(key, kpx) + 36 * k, kh = 46 * k, hy = py + ph - 100 * k;
+		Fonts::AddRoundedRect(ui, hx, hy, kw, kh, kh * 0.5f, Rgba(1, 1, 1, 0.14f));
+		m_fonts->AddText(ui, key, hx + kw * 0.5f, hy + kh * 0.5f + 9 * k, kpx, hi, 0.45f, Fonts::Center);
+		hx += kw + 14 * k;
+		hx += m_fonts->AddText(ui, what, hx, hy + kh * 0.5f + 9 * k, kpx, lo, 0.20f) + 40 * k;
+	};
+	hint("Left / Right", "choose");
+	hint("Cross", "confirm");
+	hint("Circle", "not now");
+	FadeRange(ui, begin, ui.size(), e);
 }
 
 void App::BuildAccount(std::vector<UiVertex>& ui, float W, float H, float k, uint32_t accent)
@@ -3115,6 +4130,318 @@ void App::BuildPanelKeyboard(std::vector<UiVertex>& ui, float x, float y, float 
 		const float fw = Panel::FnWidth[c] * (key_w + gap) - gap;
 		key(fx, fy, fw, fn_labels[c], key_row == Panel::FnRow && key_col == c, true);
 		fx += fw + gap;
+	}
+}
+
+// ---- 2.11: the shelf's search (AI-assisted; swordpdf: "add a search section to the shelf (make it sleek)") --------------------------
+// R2 on the shelf opens a keyboard and the shelf narrows to the games that match as each key goes in (ApplyHidden leaves the others
+// waiting in m_shelved, covers and all, so clearing the search is instant). The PS5's own keyboard is used when the app can open it
+// (AppConfig::text_entry: it returns the whole text when it closes); otherwise the panel's, in a compact form at the bottom of the screen
+// with the shelf live above it. The settings page's search box does the same from a phone (AppConfig::search_remote).
+
+namespace
+{
+std::string SearchLower(const std::string& s)
+{
+	std::string out;
+	out.reserve(s.size());
+	for (const char c : s)
+		out += static_cast<char>(c >= 'A' && c <= 'Z' ? c - 'A' + 'a' : c);
+	return out;
+}
+
+// Spaces collapsed, none at either end, at most 64 bytes (not cut inside a UTF-8 character).
+std::string SearchClean(const std::string& s)
+{
+	std::string out;
+	for (const char c : s)
+	{
+		if (static_cast<unsigned char>(c) < 0x20)
+			continue;
+		if (c == ' ' && (out.empty() || out.back() == ' '))
+			continue;
+		out += c;
+	}
+	while (!out.empty() && out.back() == ' ')
+		out.pop_back();
+	if (out.size() > 64)
+	{
+		out.resize(64);
+		while (!out.empty() && (static_cast<unsigned char>(out.back()) & 0xC0) == 0x80)
+			out.pop_back();
+		if (!out.empty() && (static_cast<unsigned char>(out.back()) & 0xC0) == 0xC0)
+			out.pop_back();
+	}
+	return out;
+}
+} // namespace
+
+bool App::SearchMatches(const GameInfo& g) const
+{
+	const std::string& q = m_search.applied;
+	if (q.empty())
+		return true;
+	std::string plain;
+	for (const char c : g.serial)
+		if (c != '-')
+			plain += c;
+	const std::string hay = SearchLower(g.title + " " + g.serial + " " + plain + " " + g.region + " " + g.extra + " " + g.stem);
+	for (size_t at = 0; at < q.size();)
+	{
+		size_t end = q.find(' ', at);
+		if (end == std::string::npos)
+			end = q.size();
+		if (end > at && hay.find(q.substr(at, end - at)) == std::string::npos)
+			return false; // every word of the search must be somewhere in the game's names
+		at = end + 1;
+	}
+	return true;
+}
+
+void App::SetSearch(const std::string& text)
+{
+	const std::string clean = SearchClean(text);
+	const bool changed_text = clean != m_search.text;
+	m_search.text = clean;
+	const std::string applied = SearchLower(clean);
+	if (applied != m_search.applied)
+	{
+		// The game picked stays picked while it matches; else the next one on the shelf. With no match the shelf is empty, and
+		// clearing the search brings back the game that was picked last.
+		const int keep = m_games.empty() ? m_search_return : m_index[static_cast<size_t>(m_selected)];
+		if (!m_games.empty() && m_index[static_cast<size_t>(m_selected)] >= 0)
+			m_search_return = m_index[static_cast<size_t>(m_selected)];
+		m_search.applied = applied;
+		ApplyHidden(keep);
+		m_flip_latched = false;
+		m_select_time = m_time;
+		std::printf("[frontend] search \"%s\": %zu of %zu games\n", clean.c_str(), m_games.size(), m_games.size() + m_shelved.size());
+		std::fflush(stdout);
+	}
+	if (changed_text && m_cfg.search_report)
+		m_cfg.search_report(clean);
+}
+
+void App::OpenSearch()
+{
+	if (m_search.typing)
+		return;
+	m_search.typing = true;
+	m_search.system = false;
+	m_search.page = 0; // the letters, on "q"
+	m_search.row = 1;
+	m_search.col = 0;
+	m_search.held_x = m_search.held_y = 0;
+	if (m_cfg.text_entry.open && m_cfg.text_entry.open("Search games", m_search.text, false, 64))
+		m_search.system = true; // the PS5's keyboard: it has the pad, and the result comes when it closes
+	std::printf("[frontend] search: %s keyboard\n", m_search.system ? "the PS5's" : "the panel's");
+	std::fflush(stdout);
+}
+
+void App::CloseSearch()
+{
+	m_search.typing = false;
+	m_search.system = false;
+}
+
+void App::UpdateSearch(const Input& in, double dt)
+{
+	using Panel = AchievementAccountPanel;
+	Search& s = m_search;
+	if (s.system)
+		return; // the PS5's keyboard is up: Update polls it
+	auto pressed = [&](bool now, bool before) { return now && !before; };
+	// The D-pad, repeating while it is held.
+	const int dx = in.left ? -1 : in.right ? 1 : 0, dy = in.up ? -1 : in.down ? 1 : 0;
+	const bool fresh = (in.left && !m_prev.left) || (in.right && !m_prev.right) || (in.up && !m_prev.up) || (in.down && !m_prev.down);
+	bool step = false;
+	if ((dx || dy) && fresh)
+	{
+		step = true;
+		s.held_x = dx;
+		s.held_y = dy;
+		s.held_for = 0;
+		s.next_repeat = 0.34;
+	}
+	else if ((dx || dy) && dx == s.held_x && dy == s.held_y)
+	{
+		s.held_for += dt;
+		while (s.held_for >= s.next_repeat)
+		{
+			step = true;
+			s.next_repeat += 0.075;
+		}
+	}
+	else
+		s.held_x = s.held_y = 0;
+	if (step)
+	{
+		bool moved = false;
+		if (dy != 0)
+		{
+			const int to = std::clamp(s.row + dy, 0, Panel::FnRow);
+			if (to != s.row)
+			{
+				const float x = Panel::KeyCentre(s.page, s.row, s.col);
+				int best = 0;
+				for (int c = 1; c < Panel::RowKeys(s.page, to); c++)
+					if (std::abs(Panel::KeyCentre(s.page, to, c) - x) < std::abs(Panel::KeyCentre(s.page, to, best) - x))
+						best = c;
+				s.row = to;
+				s.col = best;
+				moved = true;
+			}
+		}
+		if (dx != 0)
+		{
+			const int to = std::clamp(s.col + dx, 0, Panel::RowKeys(s.page, s.row) - 1);
+			moved = moved || to != s.col;
+			s.col = to;
+		}
+		Sound(moved ? Sfx::Move : Sfx::Edge, 0.3f);
+	}
+	auto erase = [&] {
+		std::string t = s.text;
+		if (!t.empty())
+		{
+			t.pop_back();
+			while (!t.empty() && (static_cast<unsigned char>(t.back()) & 0xC0) == 0x80)
+				t.pop_back();
+			if (!t.empty() && (static_cast<unsigned char>(t.back()) & 0xC0) == 0xC0)
+				t.pop_back();
+		}
+		SetSearch(t);
+	};
+	if (pressed(in.square, m_prev.square))
+	{
+		erase();
+		Sound(Sfx::Move, 0.3f);
+	}
+	if (pressed(in.triangle, m_prev.triangle))
+	{
+		SetSearch(std::string());
+		Sound(Sfx::Move, -0.3f);
+	}
+	if (pressed(in.l1, m_prev.l1))
+		s.page = (s.page + Panel::Pages - 1) % Panel::Pages;
+	if (pressed(in.r1, m_prev.r1))
+		s.page = (s.page + 1) % Panel::Pages;
+	if (pressed(in.l1, m_prev.l1) || pressed(in.r1, m_prev.r1))
+	{
+		s.col = std::min(s.col, Panel::RowKeys(s.page, s.row) - 1);
+		Sound(Sfx::Move, 0.3f);
+	}
+	if (pressed(in.circle, m_prev.circle) || pressed(in.options, m_prev.options))
+	{
+		CloseSearch();
+		Sound(Sfx::Move, -0.3f);
+		return;
+	}
+	if (pressed(in.cross, m_prev.cross))
+	{
+		Sound(Sfx::Move, 0.3f);
+		if (s.row < Panel::FnRow)
+		{
+			std::string t = s.text;
+			t += Panel::PageRows[s.page][s.row][s.col];
+			SetSearch(t);
+		}
+		else
+			switch (s.col)
+			{
+				case Panel::FnShift: s.page = s.page == 0 ? 1 : 0; break;
+				case Panel::FnSymbols: s.page = s.page == 2 ? 0 : 2; break;
+				case Panel::FnSpace: SetSearch(s.text + " "); break;
+				case Panel::FnDelete: erase(); break;
+				case Panel::FnDone: CloseSearch(); return;
+			}
+		s.col = std::min(s.col, Panel::RowKeys(s.page, s.row) - 1);
+	}
+}
+
+// The search line: a glass pill at the top centre (a magnifier, what was typed with a caret, and how many games match), and under it,
+// while typing on the panel's keyboard, a compact keyboard sliding up from the bottom.
+void App::BuildSearch(std::vector<UiVertex>& ui, float W, float H, float k, uint32_t accent)
+{
+	using Panel = AchievementAccountPanel;
+	const Search& s = m_search;
+	const float pe = Smoothstep(0.0f, 1.0f, s.pill_anim), ke = Smoothstep(0.0f, 1.0f, s.kb_anim);
+	if (pe < 0.01f && ke < 0.01f)
+		return;
+	const uint32_t hi = Rgba(1, 1, 1), mid = Rgba(0.74f, 0.72f, 0.84f), lo = Rgba(0.52f, 0.50f, 0.64f);
+	const float sheet_e = Smoothstep(0.0f, 1.0f, m_sheet_anim);
+	if (pe >= 0.01f && sheet_e < 0.5f && m_account_anim < 0.5f)
+	{
+		const size_t begin = ui.size();
+		const bool typing = s.typing;
+		const float px = 46.0f * k, cpx = 32.0f * k, pill_h = 96.0f * k, pad = 38.0f * k;
+		int n = 0; // 2.11 (review): the games, not the disc entries
+		for (const int idx : m_index)
+		n += idx >= 0 ? 1 : 0;
+		char count[48];
+		if (s.applied.empty())
+			std::snprintf(count, sizeof(count), "%d games", n);
+		else if (n == 0)
+			std::snprintf(count, sizeof(count), "no match");
+		else
+			std::snprintf(count, sizeof(count), n == 1 ? "%d game" : "%d games", n);
+		const float count_w = m_fonts->Measure(count, cpx);
+		const float icon_w = 40.0f * k, gap = 26.0f * k;
+		const char* const hint_text = "Type to search";
+		const float max_text = W * 0.30f;
+		std::string shown = s.text;
+		while (shown.size() > 1 && m_fonts->Measure(shown.c_str(), px) > max_text)
+		{
+			shown.erase(0, 1);
+			while (!shown.empty() && (static_cast<unsigned char>(shown.front()) & 0xC0) == 0x80)
+				shown.erase(0, 1);
+		}
+		const float text_w = std::max(shown.empty() ? m_fonts->Measure(hint_text, px) : m_fonts->Measure(shown.c_str(), px), 360.0f * k);
+		const float w = pad + icon_w + gap + text_w + gap * 1.5f + count_w + pad;
+		const float x = std::floor((W - w) * 0.5f), y = 108.0f * k;
+		// Shadow, a hairline border (the accent while typing) and the glass.
+		Fonts::AddRoundedRect(ui, x - 6 * k, y + 10 * k, w + 12 * k, pill_h + 12 * k, pill_h * 0.5f + 6 * k, Rgba(0, 0, 0, 0.30f));
+		Fonts::AddRoundedRect(ui, x - 2 * k, y - 2 * k, w + 4 * k, pill_h + 4 * k, pill_h * 0.5f + 2 * k,
+			typing ? Rgba(Mix(m_glow[0], 1.0f, 0.5f), Mix(m_glow[1], 1.0f, 0.5f), Mix(m_glow[2], 1.0f, 0.5f), 0.85f) : Rgba(1, 1, 1, 0.18f));
+		const uint32_t glass = Rgba(0.045f, 0.050f, 0.105f, 0.95f);
+		Fonts::AddRoundedRect(ui, x, y, w, pill_h, pill_h * 0.5f, glass);
+		// The magnifier: a ring and a short handle.
+		const float ix = x + pad, iy = y + pill_h * 0.5f - 21.0f * k, d = 30.0f * k;
+		const uint32_t ink = typing || !s.text.empty() ? hi : mid;
+		Fonts::AddRoundedRect(ui, ix, iy, d, d, d * 0.5f, ink);
+		Fonts::AddRoundedRect(ui, ix + 4.5f * k, iy + 4.5f * k, d - 9.0f * k, d - 9.0f * k, (d - 9.0f * k) * 0.5f, glass);
+		for (int i = 0; i < 4; i++)
+			Fonts::AddRoundedRect(ui, ix + d * 0.78f + i * 4.6f * k, iy + d * 0.78f + i * 4.6f * k, 7.0f * k, 7.0f * k, 3.0f * k, ink);
+		// What was typed (or the hint), and the caret while the keyboard is up.
+		const float tx = x + pad + icon_w + gap, ty = y + pill_h * 0.5f + px * 0.36f;
+		if (shown.empty())
+		{
+			m_fonts->AddText(ui, hint_text, tx, ty, px, lo, 0.3f);
+			if (typing && std::fmod(m_time, 1.0) < 0.6)
+				Fonts::AddRoundedRect(ui, tx - 2 * k, y + 24 * k, 4 * k, pill_h - 48 * k, 2 * k, accent);
+		}
+		else
+		{
+			const float adv = m_fonts->AddText(ui, shown.c_str(), tx, ty, px, hi, 0.3f);
+			if (typing && std::fmod(m_time, 1.0) < 0.6)
+				Fonts::AddRoundedRect(ui, tx + adv + 4 * k, y + 24 * k, 4 * k, pill_h - 48 * k, 2 * k, accent);
+		}
+		m_fonts->AddText(ui, count, x + w - pad, y + pill_h * 0.5f + cpx * 0.36f, cpx, n == 0 && !s.applied.empty() ? Rgba(1.0f, 0.78f, 0.55f) : lo,
+			0.3f, Fonts::Right);
+		FadeRange(ui, begin, ui.size(), pe * (1.0f - sheet_e));
+	}
+	if (ke >= 0.01f)
+	{
+		const float ks = k * 0.70f;
+		const float key_w = 152 * ks, gap = 16 * ks, pad = 48 * ks, key_h = 108 * ks;
+		const float w = Panel::Columns * key_w + (Panel::Columns - 1) * gap + 2 * pad;
+		const float h = 5 * key_h + 4 * gap + 2 * pad + 64 * ks;
+		const float x = std::floor((W - w) * 0.5f);
+		const float rest = H - h - 176.0f * k;
+		const float y = rest + (1.0f - ke) * (h + 240.0f * k);
+		const size_t begin = ui.size();
+		BuildPanelKeyboard(ui, x, y, w, ks, "Search", s.page, s.row, s.col);
+		FadeRange(ui, begin, ui.size(), Clamp(ke * 1.5f, 0.0f, 1.0f));
 	}
 }
 } // namespace fe

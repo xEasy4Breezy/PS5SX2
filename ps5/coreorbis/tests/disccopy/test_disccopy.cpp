@@ -6,6 +6,7 @@
 // Copyright (C) 2026 swordpdf
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "../../orbis-shims/OrbisDiscCopy.h"
+#include "../../orbis-shims/OrbisDiscResume.h"
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
@@ -97,6 +98,49 @@ int main()
 		const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 		std::printf("      overlapped: %.0f ms (in turn it would be 640)\n", ms);
 		Check(!r.failed && ms < 520, "reads run while writes do (well under the 640 ms of one after the other)");
+	}
+	// 2.11: a copy cut short by the app's restart is taken up again where its state says.
+	{
+	Drive d; d.bytes = (40u << 20) + 2048 * 7;
+	d.bad = {3, 20000}; // one before the cut, one after
+	std::vector<uint8_t> whole;
+	const auto full = Copy(d.bytes, 4 << 20, 4, 1, 4096, [&](uint64_t o, void* b, size_t l) { return d.Read(o, b, l); },
+	[&](const void* b, size_t l) { whole.insert(whole.end(), (const uint8_t*)b, (const uint8_t*)b + l); return true; },
+	[](uint64_t, uint64_t) {}, [](uint64_t) {});
+	Check(!full.failed && full.bad_sectors == 2, "(reference copy with two bad sectors)");
+	// cut: the first 16 MiB were written (sector 3 as zeros: one bad counted), then the process died
+	const uint64_t cut = 16u << 20;
+	std::vector<uint8_t> out(whole.begin(), whole.begin() + cut);
+	std::vector<uint64_t> prog;
+	uint64_t bad_seen = 0;
+	const auto rest = CopyFrom(cut, 1, d.bytes, 4 << 20, 4, 1, 4096, [&](uint64_t o, void* b, size_t l) { return d.Read(o, b, l); },
+	[&](const void* b, size_t l) { out.insert(out.end(), (const uint8_t*)b, (const uint8_t*)b + l); return true; },
+	[&](uint64_t done, uint64_t bad) { prog.push_back(done); bad_seen = bad; }, [](uint64_t) {});
+	Check(!rest.failed && rest.done == d.bytes && rest.bad_sectors == 2, "a copy taken up at 16 MiB finishes, counting the earlier bad sector");
+	Check(out == whole, "and the file is byte for byte the whole copy");
+	Check(!prog.empty() && prog.front() > cut && prog.back() == d.bytes && bad_seen == 2, "progress counts from the cut up to the whole size");
+	const auto none = CopyFrom(d.bytes, 0, d.bytes, 4 << 20, 4, 1, 4096, [&](uint64_t o, void* b, size_t l) { return d.Read(o, b, l); },
+	[](const void*, size_t) { return true; }, [](uint64_t, uint64_t) {}, [](uint64_t) {});
+	Check(!none.failed && none.done == d.bytes, "taken up at the end there is nothing left to do");
+	const auto odd = CopyFrom(cut + 100, 0, d.bytes, 4 << 20, 4, 1, 4096, [&](uint64_t o, void* b, size_t l) { return d.Read(o, b, l); },
+	[](const void*, size_t) { return true; }, [](uint64_t, uint64_t) {}, [](uint64_t) {});
+	Check(!odd.failed && odd.done == d.bytes, "an offset that is not a whole sector is taken down to one");
+	}
+	{
+	ResumeState st; st.serial = "SLUS-20312"; st.total = 4000ull << 20; st.done = 1500ull << 20; st.bad = 2;
+	ResumeState back;
+	Check(ParseResumeState(FormatResumeState(st), back) && back.serial == st.serial && back.total == st.total && back.done == st.done && back.bad == 2,
+	"the state file reads back what was written");
+	Check(!ParseResumeState("", back) && !ParseResumeState("SLUS-20312 4000", back) && !ParseResumeState("garbage", back), "a damaged state file is refused");
+	const uint64_t at = ResumeOffset(st, "SLUS-20312", st.total, st.done + 5);
+	Check(at == (1500ull << 20) - (16ull << 20) && at % 2048 == 0, "carries on 16 MiB before where the state says");
+	Check(ResumeOffset(st, "SLES-50001", st.total, st.done) == 0, "another disc: start over");
+	Check(ResumeOffset(st, "SLUS-20312", st.total + 2048, st.done) == 0, "the same serial at another size: start over");
+	Check(ResumeOffset(st, "SLUS-20312", st.total, st.done - 1) == 0, "a .part shorter than the state says (a power cut): start over");
+	ResumeState early = st; early.done = 8ull << 20;
+	Check(ResumeOffset(early, "SLUS-20312", st.total, early.done) == 0, "hardly started: not worth carrying on");
+	ResumeState over = st; over.done = st.total + 1;
+	Check(ResumeOffset(over, "SLUS-20312", st.total, over.done) == 0, "a state past the disc's size is no state");
 	}
 	std::printf(fails ? "%d FAILED\n" : "all passed\n", fails);
 	return fails ? 1 : 0;

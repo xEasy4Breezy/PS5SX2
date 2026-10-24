@@ -37,11 +37,12 @@ struct GameInfo
 // A disc image's file name: .iso, (vk-285-108) .chd, (vk-285-113) .cso or .zso, (2026-10-08) .bin or .img, in any case,
 // not hidden. ScanGames leaves out a .bin or .img under 16 MB or without an ISO 9660 volume (an audio track).
 bool IsDiscImageName(const char* name);
-// 2026-10-08: an .elf (a PS2 executable). ScanGames lists one whose first bytes are an ELF header; it has no serial.
+// 2026-10-08: an .elf (a PS2 executable). 2.11: ScanGames no longer lists any (they are no disc images: IsDiscImageName is false for one).
 bool IsElfName(const char* name);
 
-// Lists the disc images in `dirs` (the first folder wins for a name found twice), sorted by title.
-std::vector<GameInfo> ScanGames(const std::vector<std::string>& dirs);
+// Lists the disc images in `dirs` (the first folder wins for a name found twice), sorted by title. Each folder's own folders are
+// opened too, one level down; PS5SX2/ScanSubfolders off (`subfolders` false): only the files directly in each folder.
+std::vector<GameInfo> ScanGames(const std::vector<std::string>& dirs, bool subfolders = true);
 
 // "SLUS-21351" from the image's SYSTEM.CNF (ISO 9660); empty if unreadable. A .cso or .zso is decompressed here
 // (zlib, LZ4). A .chd is read through libchdr

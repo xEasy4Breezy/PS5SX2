@@ -3,6 +3,7 @@
 // Copyright (C) 2026 swordpdf
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <thread>
 #include "fe_text.h"
 
 #include <algorithm>
@@ -84,15 +85,18 @@ bool Fonts::Init(const uint8_t* text_font, size_t text_size, const uint8_t* icon
 	m_atlas.assign(static_cast<size_t>(m_atlas_w) * m_atlas_h, 0);
 	m_pen_x = m_pen_y = m_row_h = 0;
 
+	// 2.03: the glyphs' distance fields are drawn on several threads (about 400 ms in turn, most of the shelf's start), then packed
+	// into the atlas in the same order as before, so the atlas is the same.
+	std::vector<std::pair<int, uint32_t>> wanted;
 	for (uint32_t cp = 32; cp < 127; cp++)
-		AddGlyph(0, cp);
+		wanted.push_back({0, cp});
 	for (uint32_t cp = 160; cp < 256; cp++)
-		AddGlyph(0, cp);
+		wanted.push_back({0, cp});
 	// vk-285-114: 0x2039 and 0x203A, the options sheet's arrows either side of a value.
 	const uint32_t extra[] = {0x2022, 0x2026, 0x2013, 0x2014, 0x2018, 0x2019, 0x201C, 0x201D, 0x2122, 0x2190,
 		0x2192, 0x25B8, 0x2039, 0x203A, 0xFFFD};
 	for (uint32_t cp : extra)
-		AddGlyph(0, cp);
+		wanted.push_back({0, cp});
 	const char* icons[] = {icon::Cross, icon::Circle, icon::Triangle, icon::Square, icon::L1, icon::R1,
 		icon::DpadLeftRight, icon::DpadUpDown, icon::Options,
 		// vk-285-116: the Controls tab's.
@@ -100,14 +104,31 @@ bool Fonts::Init(const uint8_t* text_font, size_t text_size, const uint8_t* icon
 	for (const char* s : icons)
 	{
 		const char* p = s;
-		AddGlyph(1, NextCodepoint(p));
+		wanted.push_back({1, NextCodepoint(p)});
 	}
 	if (m_fonts.size() > 2)
 		for (const char* s : {icon::Discord, icon::XTwitter})
 		{
 			const char* p = s;
-			AddGlyph(2, NextCodepoint(p));
+			wanted.push_back({2, NextCodepoint(p)});
 		}
+
+	std::vector<RenderedGlyph> rendered(wanted.size());
+	{
+		const size_t threads = std::min<size_t>(8, wanted.size());
+		std::vector<std::thread> workers;
+		for (size_t t = 1; t < threads; t++)
+			workers.emplace_back([&, t]() {
+				for (size_t i = t; i < wanted.size(); i += threads)
+					rendered[i] = RenderGlyph(*m_fonts[static_cast<size_t>(wanted[i].first)], wanted[i].first, wanted[i].second);
+			});
+		for (size_t i = 0; i < wanted.size(); i += threads)
+			rendered[i] = RenderGlyph(*m_fonts[static_cast<size_t>(wanted[i].first)], wanted[i].first, wanted[i].second);
+		for (std::thread& w : workers)
+			w.join();
+	}
+	for (size_t i = 0; i < wanted.size(); i++)
+		PackGlyph(wanted[i].second, rendered[i]);
 	return true;
 }
 
@@ -171,16 +192,22 @@ unsigned char* SdfFromCoverage(const stbtt_fontinfo* info, float scale, int glyp
 
 bool Fonts::AddGlyph(int font, uint32_t cp)
 {
-	FontData& f = *m_fonts[static_cast<size_t>(font)];
+	RenderedGlyph r = RenderGlyph(*m_fonts[static_cast<size_t>(font)], font, cp);
+	return PackGlyph(cp, r);
+}
+
+// Draws one glyph's distance field. Reads the font only: it may run on several threads at once.
+Fonts::RenderedGlyph Fonts::RenderGlyph(const FontData& f, int font, uint32_t cp)
+{
+	RenderedGlyph r;
+	r.font = font;
 	const int index = stbtt_FindGlyphIndex(&f.info, static_cast<int>(cp));
 	if (index == 0 && cp != 32)
-		return false;
+		return r; // not in the font
+	r.valid = true;
 	int advance = 0, lsb = 0;
 	stbtt_GetGlyphHMetrics(&f.info, index, &advance, &lsb);
-
-	Glyph g = {};
-	g.font = font;
-	g.advance = advance * f.base_scale;
+	r.advance = advance * f.base_scale;
 	int w = 0, h = 0, xoff = 0, yoff = 0;
 	unsigned char* sdf = stbtt_GetGlyphSDF(&f.info, f.base_scale, index, kPad, 128, 128.0f / kSpread, &w, &h, &xoff, &yoff);
 	if (sdf && w > 0 && h > 0 && *std::max_element(sdf, sdf + static_cast<size_t>(w) * h) < 128)
@@ -188,6 +215,24 @@ bool Fonts::AddGlyph(int font, uint32_t cp)
 		stbtt_FreeSDF(sdf, nullptr);
 		sdf = SdfFromCoverage(&f.info, f.base_scale, index, kPad, 128.0f / kSpread, &w, &h, &xoff, &yoff);
 	}
+	r.sdf = sdf;
+	r.w = w;
+	r.h = h;
+	r.xoff = xoff;
+	r.yoff = yoff;
+	return r;
+}
+
+// Puts a drawn glyph into the atlas (one thread, in order) and records it.
+bool Fonts::PackGlyph(uint32_t cp, RenderedGlyph& r)
+{
+	if (!r.valid)
+		return false;
+	unsigned char* sdf = r.sdf;
+	const int w = r.w, h = r.h, xoff = r.xoff, yoff = r.yoff;
+	Glyph g = {};
+	g.font = r.font;
+	g.advance = r.advance;
 	if (sdf && w > 0 && h > 0)
 	{
 		if (m_pen_x + w + 1 > m_atlas_w)
@@ -199,6 +244,7 @@ bool Fonts::AddGlyph(int font, uint32_t cp)
 		if (m_pen_y + h + 1 > m_atlas_h)
 		{
 			stbtt_FreeSDF(sdf, nullptr);
+			r.sdf = nullptr;
 			return false; // atlas full
 		}
 		for (int y = 0; y < h; y++)
@@ -216,6 +262,7 @@ bool Fonts::AddGlyph(int font, uint32_t cp)
 	}
 	if (sdf)
 		stbtt_FreeSDF(sdf, nullptr);
+	r.sdf = nullptr;
 	m_glyphs[cp] = g;
 	return true;
 }

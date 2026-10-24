@@ -120,6 +120,8 @@ enum class Str : int
 	RaUnreachable,      // "Couldn't reach RetroAchievements. You're still signed in: ..." (the token sign-in at a game's start)
 	RaUnsent,           // "An unlock couldn't be sent to RetroAchievements before closing ..." (back to the shelf, offline)
 	ShelfNoBios,        // vk-285-134: "No PS2 BIOS found: games can't start. Copy your BIOS file ... to %s" (the shelf's line)
+	NotifyTileGameMissing, // 2.12: "PS5SX2: the game of this home screen tile was not found (%s). Is its drive connected? The shelf opens instead." (%s: the file's name)
+	NotifyTileGameInvalid, // 2.12: "PS5SX2: this home screen tile doesn't name a game PS5SX2 can start. The shelf opens instead."
 	Count
 };
 

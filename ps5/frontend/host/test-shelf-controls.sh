@@ -45,6 +45,14 @@ run system-menu-not-armed "game 2" "wait 1" "press square" "wait 0.4" "press r1"
   "press cross" "wait 4.5" "press cross" "wait 1" "expect systemmenu=0" "expect done=0" "expect sheet=1"
 run tabs-stop "game 4" "wait 1" "press square" "wait 0.5" "expect tab=0" "press l2" "wait 0.3" "expect tab=0" "press r2" "wait 0.3" \
   "expect tab=1" "press r2" "wait 0.3" "expect tab=2" "press r2" "wait 0.3" "expect tab=2" "press l2" "wait 0.3" "expect tab=1"
+# 2.11 (swordpdf: the right stick was too sensitive): the stick turns the picked case only on the plain shelf (and only past 0.35 of a push: test-search.sh
+# has the numbers); it does nothing under the options sheet, and it moves nothing else (the selection stays).
+run stick-not-under-sheet "game 2" "wait 1" "press square" "wait 0.5" "expect sheet=1" "stick 1 0" "wait 1.5" "expect flip100=0" "stick 0 0" "press circle" "wait 0.5" \
+  "expect sheet=0" "expect selected=2"
+run stick-turns-only-the-case "game 2" "wait 1" "stick 1 0" "wait 1.2" "expect flip100=100" "expect selected=2" "expect sheet=0" "expect account=0" "stick 0 0" "wait 1.5" \
+  "expect flip100=0" "expect selected=2"
+# A click (R3) holds the case over, about as fast as a full push; moving the selection puts it back.
+run click-holds-case "game 2" "wait 1" "press r3" "wait 0.8" "expect flip100>=98" "press l1" "wait 1.5" "expect flip100=0" "expect selected=0"
 if [[ $failed != 0 ]]; then
   echo "shelf controls: FAILED"
   exit 1

@@ -22,9 +22,18 @@
 #pragma once
 
 #include <string>
+#include <vector>
 
 // "/data/PCSX2/<sub>" when that folder exists, else "/data/PCSX2".
 std::string OrbisDir(const char* sub);
+// 2026-10-16 (AI-assisted; PS5SX2/GameFolders, ps5/frontend/fe_roots.h): where a copied PS2 disc goes and where a copy of it is looked
+// for. No games folder set: games/ (OrbisDir("games")) for both, as before. Set: the folders games are listed from (search), and the
+// first of them that is no NFS share (copy_to). main-boot.cpp tells these once the folders are looked up (OrbisSetGameDirs).
+void OrbisSetGameDirs(bool only_set, const std::vector<std::string>& search, const std::string& copy_to);
+// The folder a disc is copied into; "" when games folders are set and none can be written to (the caller says so).
+std::string OrbisGamesDestDir();
+// The folders a copy of a disc is looked for in (each flat).
+std::vector<std::string> OrbisGameSearchDirs();
 // A switch file: "/data/PCSX2/flags/<name>" when it's there, else "/data/PCSX2/<name>" (the old place).
 std::string OrbisFlagPath(const char* name);
 // Whether that switch is on (the file exists in either place). vk-285-105: from a snapshot once

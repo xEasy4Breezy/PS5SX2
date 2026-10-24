@@ -1183,6 +1183,17 @@ void OrbisVkFrameGenDraw();
 // since then besides the generated ones (the game's last frame, a repeat presented after it), GS thread only.
 static u32 s_orbis_fg_vsyncs = 0;
 static u32 s_orbis_fg_presents = 0;
+// 2.11: a vsync that does not reach the generator, for the "[fg] status" line (GSDeviceVK.cpp; OrbisFrameGenGate.h). kind 0: presenting
+// skipped because the picture repeated the game's last frame, 1: blank, 2: not a new frame of the game, 3: skipped by the present throttle.
+void OrbisVkFrameGenNote(u32 kind, double ps2_hz, float speed);
+static void OrbisFgNote(u32 kind)
+{
+	if (!g_orbis_fg_wanted)
+		return;
+	const float target = VMManager::GetTargetSpeed();
+	const float speed = target > 0.0f ? PerformanceMetrics::GetSpeed() / target : PerformanceMetrics::GetSpeed();
+	OrbisVkFrameGenNote(kind, GetVerticalFrequency(), speed);
+}
 
 // Test build 1: the TESTING watermark in the middle of the game's picture, faint (its opacity is in
 // the image), sized for the display's height. The texture is made once per GS device.
@@ -2837,6 +2848,9 @@ void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
 	// Skip presentation when running uncapped while vsync is on.
 	if (skip_frame || g_gs_device->ShouldSkipPresentingFrame())
 	{
+#ifdef ORBIS_VULKAN
+		OrbisFgNote(skip_frame ? 0 : 3); // 2.11: the "[fg] status" line counts what never reaches the generator
+#endif
 		const bool began = BeginPresentFrame(true);
 		ORBIS_VS_MARK(ORBIS_VS_BEGIN);
 		if (began)
@@ -2947,6 +2961,8 @@ void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
 				EndPresentFrame();
 			}
 		}
+		else if (g_orbis_fg_wanted)
+			OrbisFgNote(!current || blank_frame ? 1 : 2); // 2.11: a blank picture, or not a new frame of the game
 #endif
 		const bool began = BeginPresentFrame(false);
 		ORBIS_VS_MARK(ORBIS_VS_BEGIN);

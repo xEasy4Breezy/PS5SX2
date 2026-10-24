@@ -31,6 +31,10 @@
 #ifndef _WIN32
 #include <time.h>
 #endif
+#ifdef __PROSPERO__
+#include <cstdio>
+#include <sys/stat.h>
+#endif
 #include <memory>
 
 cdvdStruct cdvd;
@@ -162,15 +166,63 @@ static std::string cdvdGetNVRAMPath()
 	return Path::ReplaceExtension(BiosPath, "nvm");
 }
 
+#ifdef __PROSPERO__
+// PS5 port (2.11, AI-assisted; testers: "if you turn fast boot off, every time you start a game it wants you to set up the PS2 BIOS
+// configuration again"). The BIOS's settings (language, time zone, ...) live in the NVM, a file beside the BIOS. When that file can't
+// be written there (a BIOS folder on a read-only or foreign-owned drive, a folder the app may not write to) nothing is kept and the
+// BIOS asks again at every start. The same file is then kept in /data/PCSX2/nvm, which the app writes (the memory cards are there), and the
+// newer of the two is read. The lines "[nvm] ..." in boot.log say what was read, where it was saved and why not.
+static std::string cdvdGetNVRAMFallbackPath()
+{
+	return std::string("/data/PCSX2/nvm/") + std::string(Path::GetFileName(cdvdGetNVRAMPath()));
+}
+
+static time_t cdvdNVRAMFileTime(const std::string& path)
+{
+	struct stat st = {};
+	return stat(path.c_str(), &st) == 0 ? st.st_mtime : 0;
+}
+
+static std::string cdvdNVRAMHex(const u8* p)
+{
+	char buf[40];
+	std::snprintf(buf, sizeof(buf), "%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x", p[0], p[1], p[2], p[3], p[4], p[5],
+		p[6], p[7], p[8], p[9], p[10], p[11], p[12], p[13], p[14], p[15]);
+	return buf;
+}
+
+static void cdvdLogNVRAM(const char* what)
+{
+	const NVMLayout* l = getNvmLayout();
+	std::printf("[nvm] %s: config0 %s | config1 block 1 %s | config2 %s\n", what, cdvdNVRAMHex(&s_nvram[l->config0]).c_str(),
+		cdvdNVRAMHex(&s_nvram[l->config1 + 0x10]).c_str(), cdvdNVRAMHex(&s_nvram[l->config2]).c_str());
+	std::fflush(stdout);
+}
+#endif
+
 void cdvdLoadNVRAM()
 {
 	Error error;
-	const std::string nvmfile = cdvdGetNVRAMPath();
+	std::string nvmfile = cdvdGetNVRAMPath();
+#ifdef __PROSPERO__
+	{
+		const std::string alt = cdvdGetNVRAMFallbackPath();
+		const time_t beside = cdvdNVRAMFileTime(nvmfile), kept = cdvdNVRAMFileTime(alt);
+		if (kept != 0 && (beside == 0 || kept > beside))
+			nvmfile = alt;
+		std::printf("[nvm] BIOS settings file: %s (beside the BIOS %s, in /data/PCSX2/nvm %s)\n", nvmfile.c_str(), beside ? "there" : "not there",
+			kept ? "there" : "not there");
+		std::fflush(stdout);
+	}
+#endif
 	auto fp = FileSystem::OpenManagedCFileTryIgnoreCase(nvmfile.c_str(), "rb", &error);
 	if (!fp || std::fread(s_nvram, sizeof(s_nvram), 1, fp.get()) != 1)
 	{
 		ERROR_LOG("Failed to open or read NVRAM at {}: {}", Path::GetFileName(nvmfile), error.GetDescription());
 		cdvdCreateNewNVM();
+#ifdef __PROSPERO__
+		cdvdLogNVRAM("no settings file could be read: a new one");
+#endif
 	}
 	else
 	{
@@ -184,7 +236,14 @@ void cdvdLoadNVRAM()
 		{
 			ERROR_LOG("Language or Region Parameters missing, filling in defaults");
 			cdvdCreateNewNVM();
+#ifdef __PROSPERO__
+			cdvdLogNVRAM("the file read had no language or region: defaults filled in");
+#endif
 		}
+#ifdef __PROSPERO__
+		else
+			cdvdLogNVRAM("the settings file was read");
+#endif
 	}
 
 	// Also load the mechacon version while we're here.
@@ -204,10 +263,10 @@ void cdvdLoadNVRAM()
 	DEV_LOG("Mechacon version: 0x{:08X}", s_mecha_version);
 }
 
-void cdvdSaveNVRAM()
+// True when `nvmfile` holds the NVRAM afterwards (it was written, or it already was the same).
+static bool cdvdSaveNVRAMTo(const std::string& nvmfile)
 {
 	Error error;
-	const std::string nvmfile = cdvdGetNVRAMPath();
 	auto fp = FileSystem::OpenManagedCFileTryIgnoreCase(nvmfile.c_str(), "r+b", &error);
 	if (!fp)
 	{
@@ -215,7 +274,11 @@ void cdvdSaveNVRAM()
 		if (!fp) [[unlikely]]
 		{
 			ERROR_LOG("Failed to open NVRAM at {} for updating: {}", Path::GetFileName(nvmfile), error.GetDescription());
-			return;
+#ifdef __PROSPERO__
+			std::printf("[nvm] %s can't be opened for writing: %s\n", nvmfile.c_str(), error.GetDescription().c_str());
+			std::fflush(stdout);
+#endif
+			return false;
 		}
 	}
 
@@ -224,18 +287,42 @@ void cdvdSaveNVRAM()
 		std::memcmp(existing_nvram, s_nvram, NVRAM_SIZE) == 0)
 	{
 		DEV_LOG("NVRAM has not changed, not writing to disk.");
-		return;
+		return true;
 	}
 
 	if (FileSystem::FSeek64(fp.get(), 0, SEEK_SET) == 0 &&
-		std::fwrite(s_nvram, NVRAM_SIZE, 1, fp.get()) == 1)
+		std::fwrite(s_nvram, NVRAM_SIZE, 1, fp.get()) == 1 && std::fflush(fp.get()) == 0)
 	{
 		INFO_LOG("NVRAM saved to {}.", Path::GetFileName(nvmfile));
+#ifdef __PROSPERO__
+		std::printf("[nvm] saved to %s\n", nvmfile.c_str());
+		std::fflush(stdout);
+#endif
+		return true;
 	}
+	ERROR_LOG("Failed to save NVRAM to {}: {}", Path::GetFileName(nvmfile), Error::CreateErrno(errno).GetDescription());
+#ifdef __PROSPERO__
+	std::printf("[nvm] %s can't be written: errno %d\n", nvmfile.c_str(), errno);
+	std::fflush(stdout);
+#endif
+	return false;
+}
+
+void cdvdSaveNVRAM()
+{
+#ifdef __PROSPERO__
+	// The file beside the BIOS first (as everywhere); when that fails, /data/PCSX2/nvm (read first at the next start while it is the newer).
+	if (cdvdSaveNVRAMTo(cdvdGetNVRAMPath()))
+		return;
+	::mkdir("/data/PCSX2/nvm", 0777);
+	if (cdvdSaveNVRAMTo(cdvdGetNVRAMFallbackPath()))
+		std::printf("[nvm] kept in %s instead\n", cdvdGetNVRAMFallbackPath().c_str());
 	else
-	{
-		ERROR_LOG("Failed to save NVRAM to {}: {}", Path::GetFileName(nvmfile), Error::CreateErrno(errno).GetDescription());
-	}
+		std::printf("[nvm] not kept anywhere: the BIOS will ask for its settings again at the next start\n");
+	std::fflush(stdout);
+#else
+	cdvdSaveNVRAMTo(cdvdGetNVRAMPath());
+#endif
 }
 
 static void cdvdReadNVM(u8* dst, int offset, int bytes)
@@ -1295,6 +1382,12 @@ __fi void cdvdSectorReady()
 		cdvdUpdateStatus(CDVD_STATUS_PAUSE);
 }
 
+#ifdef __PROSPERO__
+// PS5SX2: CDVDdiscReader.cpp (the discasync hunk in cdvdReadInterrupt below)
+extern bool g_cdvd_async_enabled;
+extern bool g_cdvd_async_ok;
+#endif
+
 // inlined due to being referenced in only one place.
 __fi void cdvdReadInterrupt()
 {
@@ -1352,6 +1445,25 @@ __fi void cdvdReadInterrupt()
 	{
 		if (cdvd.ReadErr == 0)
 		{
+#ifdef __PROSPERO__
+			// PS5SX2 (2.11, AI-assisted; switch file discasync, off by default): a PS2 game played from a disc drive. When the drive has not delivered
+			// the block yet, the disc reader (CDVDdiscReader.cpp, DISCgetBuffer) answers -2 for this one call, and instead of standing here until it
+			// does, the read interrupt comes again 1 ms of IOP time later: frames, audio and the menu request go on while the drive seeks. The data is
+			// late in emulated time by what the drive took; the default (without the switch file) is the wait below. Only this call can get -2 that way.
+			if (g_cdvd_async_enabled)
+			{
+				g_cdvd_async_ok = true;
+				cdvd.ReadErr = DoCDVDgetBuffer(&cdr.Transfer[0]);
+				g_cdvd_async_ok = false;
+				if (cdvd.ReadErr == -2)
+				{
+					cdvd.ReadErr = 0;
+					CDVDREAD_INT(PSXCLK / 1000);
+					return;
+				}
+			}
+			else
+#endif
 			while ((cdvd.ReadErr = DoCDVDgetBuffer(&cdr.Transfer[0])), cdvd.ReadErr == -2)
 			{
 				// not finished yet ... block on the read until it finishes.
@@ -2846,7 +2958,10 @@ static void cdvdWrite16(u8 rt) // SCOMMAND
 				// file only at VM shutdown -- and on the PS5 the app is left by a re-exec or the PS button, so that never
 				// runs. Write it when the BIOS closes a config write instead (the file is only rewritten if it changed).
 				if (cdvd.CReadWrite == 1)
+				{
+					cdvdLogNVRAM("the BIOS closed a settings write (CdCloseConfig)");
 					cdvdSaveNVRAM();
+				}
 #endif
 				cdvd.CReadWrite = 0;
 				cdvd.COffset = 0;

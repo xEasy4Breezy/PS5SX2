@@ -2957,6 +2957,13 @@ void VMManager::Internal::EntryPointCompilingOnCPUThread()
 		Color_StrongGreen, fmt::format("ELF {} with entry point at 0x{:08X} is executing.", s_elf_path, s_elf_entry_point));
 	s_elf_executed = true;
 
+#ifdef __PROSPERO__
+	// PS5 port (2.11): the BIOS has done its part (a full boot's setup included) and the game's code starts: the BIOS's settings are written
+	// now too, besides at the BIOS's own CdCloseConfig, because the app is left by a re-exec or the PS button and never shuts the VM down.
+	// (Only rewritten when they changed: CDVD.cpp.)
+	cdvdSaveNVRAM();
+#endif
+
 	if (reset_speed_limiter)
 	{
 		UpdateTargetSpeed();

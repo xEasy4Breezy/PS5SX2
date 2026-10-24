@@ -300,6 +300,13 @@ LZ4_CSRCS := $(PS5_THIRD)/lz4/lz4.c
 CSO_INCLUDES := -I$(PS5_THIRD)/lz4
 C_SRCS := $(C_SRCS) $(LZ4_CSRCS)
 
+# b176 (swordpdf: "we forgot to add the new texture packs links"): the .7z HD texture packs (192 of the community's Google Drive packs) are read by
+# frontend/fe_sevenzip.c with the LZMA SDK already in 3rdparty/lzma (public domain): the 7z container, its CRC, LZMA2, and the filter files 7zDec.c
+# links (the reader refuses those coders). LzmaDec.c is built above (CHD_CSRCS). Quiet like the CHD code: not ours to change.
+SZ7_CSRCS := $(addprefix $(PCSX2)/3rdparty/lzma/src/,7zArcIn.c 7zBuf.c 7zCrc.c 7zCrcOpt.c 7zDec.c 7zStream.c Bcj2.c Bra.c Bra86.c BraIA64.c CpuArch.c Delta.c Lzma2Dec.c)
+SZ7_INCLUDES := -I$(PCSX2)/3rdparty/lzma/include
+C_SRCS := $(C_SRCS) $(SZ7_CSRCS)
+
 # 2026-10-05 (AI-assisted): libarchive's reading side (RAR 4 and 5, zip), for the HD texture packs (fe_texpacks.cpp):
 # archive.org's packs are RAR 5 files. ps5/third_party/README.md says what is vendored and how config.h was made.
 LIBARCHIVE_CSRCS := $(wildcard $(PS5_THIRD)/libarchive/libarchive/*.c)
@@ -337,11 +344,11 @@ SHIM_SRCS := ./orbis-shims/ProsperoInput.cpp ./orbis-shims/ProsperoCDVD.cpp \
   ./orbis-shims/ProsperoHenJailbreak.cpp \
   ./orbis-shims/ps5_shaderc.cpp ./orbis-shims/orbis_vk.cpp ./orbis-shims/orbis_eeprof.cpp \
   ./orbis-shims/game_select.cpp ./orbis-shims/orbis_paths.cpp ./orbis-shims/orbis_memprobe.cpp \
-  ./orbis-shims/ProsperoKbdMouse.cpp ./orbis-shims/ProsperoNotify.cpp ./orbis-shims/ProsperoUsbPad.cpp ./orbis-shims/ProsperoMic.cpp ./orbis-shims/ProsperoDiscDump.cpp ./orbis-shims/ProsperoDiscSpeed.cpp \
+  ./orbis-shims/ProsperoKbdMouse.cpp ./orbis-shims/ProsperoNotify.cpp ./orbis-shims/ProsperoImeRelay.cpp ./orbis-shims/ProsperoRelaunch.cpp ./orbis-shims/ProsperoUsbPad.cpp ./orbis-shims/ProsperoMic.cpp ./orbis-shims/ProsperoDiscDump.cpp ./orbis-shims/ProsperoDiscSpeed.cpp \
   ./orbis-shims/ProsperoHTTPDownloader.cpp ./orbis-shims/ProsperoHTTPConsole.cpp ./orbis-shims/ProsperoAchievements.cpp \
   ./orbis-shims/ProsperoAchievementBrowser.cpp \
   ./orbis-shims/orbis_gs_shaders.cpp \
-  ./orbis-shims/ps5_framegen.cpp \
+  ./orbis-shims/ps5_framegen.cpp ./orbis-shims/OrbisVideoOutMode.cpp \
   ./orbis-shims/OrbisNfs.cpp ./orbis-shims/OrbisDiscDrive.cpp ./orbis-shims/OrbisIOCtlSrc.cpp
 
 SHIM_ASM := ./orbis-shims/ProsperoTLS.S
@@ -356,8 +363,8 @@ FE_SRCS := $(FE_DIR)/fe_app.cpp $(FE_DIR)/fe_covers.cpp $(FE_DIR)/fe_games.cpp \
   $(FE_DIR)/fe_patchdl.cpp $(FE_DIR)/fe_bios.cpp
 # vk-285-50: Project Nayuki's QR Code generator (MIT, C) for the shelf's QR tile, and the files
 # fe_ps5.cpp embeds from frontend/assets (the settings page, its icons, Font Awesome's brands font).
-FE_CSRCS := $(FE_DIR)/third_party/qrcodegen/qrcodegen.c
-FE_ASSETS := $(wildcard $(FE_DIR)/assets/web/*) $(wildcard $(FE_DIR)/assets/fonts/*.otf) $(FE_DIR)/assets/presets.ini
+FE_CSRCS := $(FE_DIR)/third_party/qrcodegen/qrcodegen.c $(FE_DIR)/fe_sevenzip.c
+FE_ASSETS := $(wildcard $(FE_DIR)/assets/web/*) $(wildcard $(FE_DIR)/assets/fonts/*.otf) $(FE_DIR)/assets/presets.ini $(FE_DIR)/assets/hd-pack-sources.json $(FE_DIR)/assets/launchbox-covers.txt
 FE_HDRS := $(wildcard $(FE_DIR)/*.h) $(FE_DIR)/fe_shaders.inc $(FE_DIR)/third_party/qrcodegen/qrcodegen.h $(FE_ASSETS)
 
 SRCS := $(SRCS) $(PCSX2)/pcsx2/USB/usb-mic/usb-mic.cpp \
@@ -444,6 +451,8 @@ OBJS := $(patsubst $(PCSX2)/%.cpp,$(OBJDIR)/%.o,$(filter %.cpp,$(SRCS))) \
 # amd64 .S isn't vendored) without the legacy formats or the trace hooks.
 $(patsubst $(PCSX2)/%.c,$(OBJDIR)/%.o,$(CHD_CSRCS)): CFLAGS += $(CHD_INCLUDES) -DZ7_ST \
   -DZSTD_DISABLE_ASM=1 -DZSTD_LEGACY_SUPPORT=0 -DZSTD_NO_TRACE=1
+# b176: the 7z reader's SDK files (single-threaded, quiet), and the reader itself (our code: warnings on; the SDK's headers are included as system headers)
+$(patsubst $(PCSX2)/%.c,$(OBJDIR)/%.o,$(SZ7_CSRCS)): CFLAGS += $(SZ7_INCLUDES) -DZ7_ST -w
 $(OBJDIR)/pcsx2/CDVD/ChdFileReader.o $(OBJDIR)/frontend/fe_games.o: CXXFLAGS += -I$(PCSX2)/3rdparty/libchdr/include
 $(OBJDIR)/pcsx2/CDVD/CsoFileReader.o $(OBJDIR)/frontend/fe_games.o: CXXFLAGS += $(CSO_INCLUDES)
 # vk-285-113: the settings page's server thread runs fe_web.cpp's handlers and fe_games.cpp's scans; a 64 KB array in
@@ -526,6 +535,31 @@ $(OBJDIR)/shim/orbis-shims/ProsperoNotify.o: ./orbis-shims/ProsperoNotify.cpp $(
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -DORBIS_NOTIFY_RELAY_ELF=\"$(abspath $(NOTIFY_RELAY_ELF))\" -c $< -o $@
 
+# 2.11 (AI-assisted): the keyboard relay payload (ime-relay/ime_relay.c), the same way: it imports libSceImeDialog, which this
+# process can't load on 11.40 and later, and is embedded in ProsperoImeRelay.o (see ProsperoImeRelay.cpp). Experimental, used
+# only with the flag file flags/imerelay.
+IME_RELAY_ELF := $(OBJDIR)/ime-relay/ime_relay.elf
+$(IME_RELAY_ELF): ./ime-relay/ime_relay.c
+	@mkdir -p $(dir $@)
+	$(CC) -Wall -Werror -O2 -o $@ $< -lSceImeDialog
+	$(PS5_PAYLOAD_SDK)/bin/prospero-strip $@
+$(OBJDIR)/shim/orbis-shims/ProsperoImeRelay.o: ./orbis-shims/ProsperoImeRelay.cpp $(IME_RELAY_ELF)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -DORBIS_IME_RELAY_ELF=\"$(abspath $(IME_RELAY_ELF))\" -c $< -o $@
+
+# 2.11 (AI-assisted): the relaunch payload (relaunch/relaunch.c), the same way: "back to the menu" (L1 + R1 + Touch) closes the app
+# the plain way (LoadExec("exit")) and this payload, started through the console's ELF loader before the close, starts the main app
+# again afterwards (see ProsperoRelaunch.cpp, orbis-shims/OrbisLeavePlan.h). No -l flags: it looks its system calls up by name (dlsym).
+# An ELF with no entry point has no C runtime: build it with the llvm-18 view (reference-eboot-build-pipeline) and check `readelf -h`.
+RELAUNCH_ELF := $(OBJDIR)/relaunch/relaunch.elf
+$(RELAUNCH_ELF): ./relaunch/relaunch.c
+	@mkdir -p $(dir $@)
+	$(CC) -Wall -Werror -O2 -o $@ $<
+	$(PS5_PAYLOAD_SDK)/bin/prospero-strip $@
+$(OBJDIR)/shim/orbis-shims/ProsperoRelaunch.o: ./orbis-shims/ProsperoRelaunch.cpp $(RELAUNCH_ELF)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -DORBIS_RELAUNCH_ELF=\"$(abspath $(RELAUNCH_ELF))\" -c $< -o $@
+
 # The shaderc shim includes glslang's C interface.
 $(OBJDIR)/shim/orbis-shims/ps5_shaderc.o: ./orbis-shims/ps5_shaderc.cpp
 	@mkdir -p $(dir $@)
@@ -548,6 +582,11 @@ $(OBJDIR)/frontend/%.o: $(FE_DIR)/%.cpp $(FE_HDRS)
 $(OBJDIR)/frontend/%.o: $(FE_DIR)/%.c
 	@mkdir -p $(dir $@)
 	$(CC) -O2 -DNDEBUG -march=znver2 -std=c99 -c $< -o $@
+
+# b176: the .7z reader: the SDK's headers, single-threaded, the same C flags as the SDK files it links with (not -std=c99: it uses pread, which that hides)
+$(OBJDIR)/frontend/fe_sevenzip.o: $(FE_DIR)/fe_sevenzip.c $(FE_DIR)/fe_sevenzip.h
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) $(SZ7_INCLUDES) -DZ7_ST -Wall -Wextra -Wno-unused-parameter -c $< -o $@
 
 $(OBJDIR)/%.o: $(PCSX2)/%.c
 	@mkdir -p $(dir $@)

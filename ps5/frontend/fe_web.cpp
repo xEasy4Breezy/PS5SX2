@@ -448,8 +448,58 @@ void* WebServer::ThreadMain(void* self)
 
 void WebServer::SetNowPlaying(const std::string& image_path)
 {
+	SetNowPlaying(image_path, std::string(), std::string());
+}
+
+void WebServer::SetNowPlaying(const std::string& image_path, const std::string& settings_stem, const std::string& serial)
+{
 	std::lock_guard<std::mutex> lock(m_mutex);
 	m_now_playing = image_path.substr(image_path.rfind('/') + 1);
+	m_now_extra = GameInfo();
+	if (!m_now_playing.empty() && !settings_stem.empty())
+	{
+		// 2.11: the entry the list gets when no file in it is this game (Games()): the disc in a drive, an image outside the folders.
+		m_now_extra.path = image_path;
+		m_now_extra.file = m_now_playing;
+		m_now_extra.stem = settings_stem;
+		m_now_extra.serial = serial;
+		MakeTitle(settings_stem, m_now_extra.title, m_now_extra.region, m_now_extra.extra);
+	}
+	m_games_time = -1e9; // the list is made again at the next request: it holds this game now (or no longer does)
+}
+
+void WebServer::SetSearchReported(const std::string& text)
+{
+	std::lock_guard<std::mutex> lock(m_search_mutex);
+	m_search_text = text;
+}
+
+bool WebServer::TakeSearchFromPage(std::string& text)
+{
+	std::lock_guard<std::mutex> lock(m_search_mutex);
+	if (!m_search_pending)
+		return false;
+	m_search_pending = false;
+	text = m_search_from_page;
+	return true;
+}
+
+// 2.11: POST /api/search, the body the text to search the shelf for ("" shows every game).
+void WebServer::ApiSearch(const Request& req, Response& res)
+{
+	std::string text;
+	for (const char c : req.body)
+		if (static_cast<unsigned char>(c) >= 0x20 && text.size() < 64)
+			text += c;
+	{
+		std::lock_guard<std::mutex> lock(m_search_mutex);
+		m_search_from_page = text;
+		m_search_text = text;
+		m_search_pending = true;
+	}
+	if (!m_cfg.change_log.empty())
+		AppendSettingsLog(m_cfg.change_log, "page: shelf search \"" + text + "\"");
+	res.body = "{\"ok\":true}";
 }
 
 bool WebServer::Address(std::string& url, std::string& shown) const
@@ -664,6 +714,8 @@ void WebServer::Route(const Request& req, Response& res)
 	}
 	if (req.path == "/api/state" && req.method == "GET")
 		ApiState(res);
+	else if (req.path == "/api/search" && req.method == "POST") // 2.11
+		ApiSearch(req, res);
 	else if (req.path == "/api/achievements" && req.method == "GET")
 		ApiAchievements(res);
 	else if (req.path == "/api/achievement-badge" && req.method == "GET")
@@ -688,6 +740,8 @@ void WebServer::Route(const Request& req, Response& res)
 		ApiMemcards(res);
 	else if (req.path == "/api/memcards" && req.method == "POST")
 		ApiMemcardCreate(req, res);
+	else if (req.path == "/api/tile" && (req.method == "GET" || req.method == "POST")) // 2.12
+		ApiTile(req, res);
 	else
 	{
 		res.status = req.method == "GET" || req.method == "POST" ? 404 : 405;
@@ -700,9 +754,24 @@ std::vector<GameInfo> WebServer::Games()
 	std::lock_guard<std::mutex> lock(m_mutex);
 	if (Now() - m_games_time > 10.0) // a game copied in shows up within seconds
 	{
-		m_games = ScanGames(m_cfg.game_dirs);
+		m_games = ScanGames(m_cfg.game_dirs, m_cfg.scan_subfolders);
+		// 2.11: the running game when no file of the list is it (the disc in a drive: /dev/cd0 is no image in a folder).
+		bool live_listed = false;
+		if (!m_now_extra.file.empty() &&
+			std::none_of(m_games.begin(), m_games.end(), [&](const GameInfo& g) { return g.file == m_now_extra.file; }))
+		{
+			m_games.push_back(m_now_extra);
+			live_listed = true;
+		}
 		for (GameInfo& g : m_games)
 		{
+			// The running game's serial came with it: the drive it plays from is not opened a second time from here.
+			if (live_listed && g.file == m_now_extra.file && g.path == m_now_extra.path)
+			{
+				ApplyGameDbTitle(g);
+				ReadBadges(g, m_cfg.settings_dir, m_cfg.gs_ini, m_cfg.patches_dir);
+				continue;
+			}
 			// Test build 1: an image's serial is read once (per size), not at every rescan.
 			const auto it = m_serials.find(g.path);
 			if (it != m_serials.end() && it->second.first == g.bytes)
@@ -766,7 +835,12 @@ void WebServer::ApiState(Response& res)
 		else
 			game = "{\"id\":" + Json(playing) + ",\"title\":" + Json(playing) + ",\"serial\":\"\"}";
 	}
-	res.body = "{\"app\":\"PS5SX2\",\"build\":" + Json(m_cfg.build_tag) + ",\"test\":" + std::to_string(m_cfg.test_build) +
+	std::string search_now;
+	{
+		std::lock_guard<std::mutex> lock(m_search_mutex);
+		search_now = m_search_text; // 2.11
+	}
+	res.body = "{\"app\":\"PS5SX2\",\"build\":" + Json(m_cfg.build_tag) + ",\"test\":" + std::to_string(m_cfg.test_build) + ",\"search\":" + Json(search_now) +
 		       ",\"language\":" + Json(LanguageCode()) + ",\"strings\":" + strings + ",\"mode\":" + Json(playing.empty() ? "menu" : "game") + ",\"playing\":" + game + "}";
 }
 
@@ -1342,7 +1416,7 @@ void WebServer::ApiDiscs(Response& res)
 	bool first = true;
 	for (const GameInfo& g : Games())
 	{
-		if (IsElfName(g.file.c_str()))
+		if (IsElfName(g.file.c_str()) || g.path.compare(0, 5, "/dev/") == 0) // 2.11: a disc in a drive is the "current" one, not a row of its own
 			continue;
 		out += std::string(first ? "" : ",") + "{\"path\":" + Json(g.path) + ",\"title\":" + Json(g.title) + "}";
 		first = false;
@@ -1520,6 +1594,142 @@ void WebServer::ApiMemcardCreate(const Request& req, Response& res)
 	std::fflush(stdout);
 	Log(req, "memory card made: " + name + " (" + mb_text + " MB, blank)");
 	res.body = CardsJson(m_cfg.memcards_dir, name);
+}
+
+// 2.12 (swordpdf: "add an option to add a game from the shelf to the xmb ... we should also be able to delete it, again, from the shelf"): the settings page's copy of the
+// sheet's "Home screen tile" row (fe_gametile.h has every rule; the shelf's row and this answer use the same functions, so they say the same words). The page names a
+// game by its image file, as everywhere; the path is the server's (FindGame), never the browser's. GET ?id=<file>: {"available":false,"why":...} when game tiles are off
+// or the game is no plain image file, else the row: {"available":true,"id","phase","busy","value","help","tile","reason","can":"add|remove|none"}. POST "add\n<file>" or
+// "remove\n<file>" asks the helper (one request file per press, in tiles_dir) and answers with the row; 409 while the row is busy, when the helper is not running, or for
+// the tile this process runs from. The page polls this while the row is busy, so an ask is followed here, and an unanswered one is taken back after 15 s.
+void WebServer::ApiTile(const Request& req, Response& res)
+{
+	std::string op, id;
+	if (req.method == "POST")
+	{
+		const size_t nl = req.body.find('\n');
+		op = Trim(req.body.substr(0, nl));
+		if (nl != std::string::npos)
+		{
+			id = req.body.substr(nl + 1);
+			while (!id.empty() && (id.back() == '\n' || id.back() == '\r'))
+				id.pop_back();
+		}
+		if (op != "add" && op != "remove")
+		{
+			res.status = 400;
+			res.body = Error("expected: add|remove, then the image file on the next line");
+			return;
+		}
+	}
+	else
+		id = QueryValue(req.query, "id");
+	if (id.empty())
+	{
+		res.status = 400;
+		res.body = Error("no game named");
+		return;
+	}
+	std::vector<GameInfo> games;
+	const GameInfo* g = FindGame(id, games); // before the tiles' mutex: Games() holds m_mutex through a rescan
+	if (!g)
+	{
+		res.status = 404;
+		res.body = Error("no such game");
+		return;
+	}
+	const char* why = m_cfg.tiles_dir.empty() ? "off" : !gametile::RowEligible(g->path, g->file, g->damaged) ? "not a plain file" : nullptr;
+	if (why)
+	{
+		if (req.method == "POST")
+		{
+			res.status = 409;
+			res.body = Error(m_cfg.tiles_dir.empty() ? "game tiles are off (create the file gametiles in /data/PCSX2/flags)" : "this game can't have a tile");
+			return;
+		}
+		res.body = "{\"available\":false,\"id\":" + Json(id) + ",\"why\":" + Json(why) + "}";
+		return;
+	}
+	std::lock_guard<std::mutex> lock(m_tiles_mutex);
+	const std::string& dir = m_cfg.tiles_dir;
+	const std::string path = gametile::NormalizePath(g->path);
+	const double now = Now();
+	const bool own_tile = !m_cfg.own_tile_game.empty() && gametile::NormalizePath(m_cfg.own_tile_game) == path;
+	// Every game this page asked about is looked at (an old ask of another game is taken back at 15 s too), this one last; its view is the answer.
+	const bool alive = gametile::AliveFresh(dir, static_cast<long long>(std::time(nullptr)));
+	m_tile_state.Refresh(dir, false, m_tiles.AnyPending());
+	auto look = [&](const std::string& p) {
+		const std::string file = m_tiles.FileOf(p);
+		bool present = !file.empty() && gametile::RequestPresent(dir, file);
+		gametile::View v = m_tiles.Evaluate(p, m_tile_state.entries, alive, present, now);
+		if (v.withdraw)
+		{
+			const gametile::WithdrawResult r = gametile::WithdrawFile(dir, file);
+			m_tiles.WithdrawDone(p, r, now);
+			std::printf("[web] home screen tile: the request %s was not taken within %.0f s: %s\n", file.c_str(), gametile::kTakeS,
+				r == gametile::WithdrawResult::Withdrawn ? "taken back" : "gone already");
+			std::fflush(stdout);
+			if (r == gametile::WithdrawResult::AlreadyTaken)
+				v = m_tiles.Evaluate(p, m_tile_state.entries, alive, false, now);
+		}
+		return v;
+	};
+	for (const std::string& other : m_tiles.Paths())
+		if (other != path)
+			look(other);
+	gametile::View v = look(path);
+	if (req.method == "POST")
+	{
+		const bool add = op == "add";
+		if (v.phase == gametile::Phase::NoHelper)
+		{
+			res.status = 409;
+			res.body = Error("the helper that makes game tiles is not running");
+			return;
+		}
+		if (v.busy)
+		{
+			res.status = 409;
+			res.body = Error("still working");
+			return;
+		}
+		if (!add && own_tile)
+		{
+			res.status = 409;
+			res.body = Error("this game is running from its tile");
+			return;
+		}
+		if (v.can != (add ? gametile::Can::Add : gametile::Can::Remove))
+		{
+			res.status = 409;
+			res.body = Error(add ? "this game has a tile already" : "this game has no tile to take off");
+			return;
+		}
+		std::string cover;
+		if (add)
+		{
+			const std::string best = Covers().Best(*g).path;
+			if (gametile::CoverFileOk(best))
+				cover = best;
+		}
+		const std::string text = add ? gametile::FormatAdd(path, g->serial, g->title, cover) : gametile::FormatRemove(path);
+		std::string file, err;
+		if (text.empty() || !gametile::QueueRequest(dir, text, &file, &err))
+		{
+			res.status = 500;
+			res.body = Error(("couldn't ask the helper: " + (text.empty() ? std::string("not a path it can use") : err)).c_str());
+			return;
+		}
+		m_tiles.Ask(path, add, file, now, gametile::FindByPath(m_tile_state.entries, path));
+		v = m_tiles.Evaluate(path, m_tile_state.entries, true, true, now);
+		Log(req, std::string("home screen tile: ") + (add ? "add " : "take off ") + g->file + " (" + file + ")");
+	}
+	gametile::Can can = v.can;
+	if (own_tile && can == gametile::Can::Remove)
+		can = gametile::Can::None; // the tile this process runs from is taken off from the main app
+	res.body = "{\"available\":true,\"id\":" + Json(id) + ",\"phase\":" + Json(gametile::PhaseName(v.phase)) + ",\"busy\":" + (v.busy ? "true" : "false") +
+	           ",\"value\":" + Json(gametile::ValueText(v)) + ",\"help\":" + Json(gametile::HelpText(v, g->title, own_tile)) + ",\"tile\":" + Json(v.tile) +
+	           ",\"reason\":" + Json(v.reason) + ",\"can\":" + Json(gametile::CanName(can)) + "}";
 }
 
 void WebServer::Log(const Request& req, const std::string& what)

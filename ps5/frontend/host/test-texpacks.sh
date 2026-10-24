@@ -18,7 +18,8 @@ CXX=${CXX:-clang++-18}
 CC=${CC:-clang-18}
 work=$(mktemp -d "${TMPDIR:-/tmp}/texpacks.XXXXXX")
 trap 'rm -rf "$work"' EXIT
-san=(-fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer)
+# TEXPACKS_SAN="-fno-omit-frame-pointer" builds without the sanitizers (a machine without their runtimes)
+san=(${TEXPACKS_SAN:--fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer})
 
 mkdir -p "$work/obj"
 objs=()
@@ -31,6 +32,15 @@ done
 # hardware fixes test links with it (the image readers' lz4 and the libchdr stand-in).
 "$CC" -O1 -g -c "$pcsx2/ps5/third_party/lz4/lz4.c" -o "$work/obj/lz4.o"
 "$CC" -O1 -g -I"$pcsx2/3rdparty/libchdr/include" -c "$here/chd_stub.c" -o "$work/obj/chd_stub.o"
+# b176: the 7z reader (fe_sevenzip.c) and the LZMA SDK files it needs: 14 of 3rdparty/lzma/src (this harness links chd_stub.c, not libchdr, so LzmaDec.c is built
+# here too; Makefile.vk has it through CHD_CSRCS). The SDK reads its headers with unaligned 64-bit loads: the alignment check stays off for its objects.
+sdk="$pcsx2/3rdparty/lzma"
+for s in 7zArcIn 7zBuf 7zCrc 7zCrcOpt 7zDec 7zStream Bcj2 Bra Bra86 BraIA64 CpuArch Delta Lzma2Dec LzmaDec; do
+  "$CC" -O1 -g -w -DZ7_ST -I"$sdk/include" "${san[@]}" -fno-sanitize=alignment -c "$sdk/src/$s.c" -o "$work/obj/sz_$s.o"
+  objs+=("$work/obj/sz_$s.o")
+done
+"$CC" -O1 -g -Wall -Wextra -Wno-unused-parameter -DZ7_ST -I"$sdk/include" "${san[@]}" -c "$fe/fe_sevenzip.c" -o "$work/obj/fe_sevenzip.o"
+objs+=("$work/obj/fe_sevenzip.o")
 "$CXX" -std=c++20 -O1 -g -Wall -Wno-unused-function -I"$fe" -I"$pcsx2/pcsx2" -I"$la/libarchive" -I"$pcsx2/3rdparty/rapidjson/include" \
   -I"$pcsx2/3rdparty/vulkan/include" -I"$pcsx2/3rdparty/libchdr/include" -I"$pcsx2/ps5/third_party/lz4" "${san[@]}" \
   "$here/texpacks_test.cpp" "$fe/fe_texpacks.cpp" "$fe/fe_settings.cpp" "$fe/fe_games.cpp" "$fe/fe_covers.cpp" "$fe/fe_text.cpp" \
@@ -75,11 +85,32 @@ clash = make(clash_name + ".zip", [
     (clash_name + "/SLUS-22222/notes/e.txt", b"inside"),
     (clash_name + "/SLUS-22222/notes", b"a file where the folder is"),
 ])
+# 2.11: a pack for a Google Drive file (no md5 in any list): drive-only.zip
+make("drive-only.zip", [("Drive Only/SLUS-33333/replacements/x.png", b"a drive texture")])
+# 2.11: a pack whose entries run across the pack writer's 8 MiB buffers (exactly 8 MiB, one byte over, 20 MiB, one byte, none, 3 MiB x 3 after them):
+# big.zip, and big.manifest ("<name under replacements/> <size> <md5>") for the test to check every entry by
+import hashlib
+def blob(seed, n):
+    out = bytearray()
+    i = 0
+    while len(out) < n:
+        out += hashlib.sha256(seed + i.to_bytes(4, "big")).digest()
+        i += 1
+    return bytes(out[:n])
+big = [("a8.bin", 8 << 20), ("b8p1.bin", (8 << 20) + 1), ("c20.bin", 20 << 20), ("d1.bin", 1), ("e0.bin", 0), ("f3a.bin", 3 << 20), ("f3b.bin", 3 << 20), ("f3c.bin", 3 << 20)]
+entries = [("Big/SLUS-77777/replacements/" + n, blob(n.encode(), size)) for n, size in big]
+make("big.zip", entries)
+with open(os.path.join(d, "big.manifest"), "w") as m:
+    for (n, size), (_, data) in zip(big, entries):
+        m.write("%s %d %s\n" % (n, size, hashlib.md5(data).hexdigest()))
 open(os.path.join(d, "md5.txt"), "w").write(" ".join([good, two, many, clash]) + "\n")
 EOF
+
+# b176: the .7z fixtures (make_7z_fixtures.py texpacks: Python's lzma module and a 7z writer; nothing big is kept in the repository)
+python3 -I -X utf8 "$here/make_7z_fixtures.py" texpacks "$work/fixtures" > "$work/fixtures-7z.log"
 
 real=()
 if [[ -n ${TEXPACKS_REAL:-} ]]; then
   real=("${TEXPACKS_REAL%:*}" "${TEXPACKS_REAL##*:}")
 fi
-ASAN_OPTIONS=detect_leaks=1 "$work/texpacks_test" "$work/fixtures" "$work/run" "${real[@]}"
+HD_PACK_SOURCES="$fe/assets/hd-pack-sources.json" ASAN_OPTIONS=detect_leaks=1 "$work/texpacks_test" "$work/fixtures" "$work/run" "${real[@]}"

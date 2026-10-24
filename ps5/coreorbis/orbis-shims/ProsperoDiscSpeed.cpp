@@ -406,6 +406,13 @@ void OrbisDiscSpeedUp(const char* cd_path, uint64_t bytes, OrbisDiscReadMethod* 
 				Log("the copy reads at %.2f MB/s = %.2fx (the drive as it was: %.2f MB/s)", best, best * 1e6 / 1385000.0, base);
 			}
 		}
+		else if (base >= 3.5)
+		{
+			// 2.11 (lens-1 review): "the drive as it was" already reads faster than 2.0x (2.7 to 2.8 MB/s): a game played from this drive set it to 3.2x
+			// (IOCtlSrc::Reopen) and the app was left by a re-exec, which puts nothing back. Sending the 2.0 command now would make the copy slower than the drive
+			// is; no setting here beats what the drive already does, so it is left as it is (set_speed stays 0: nothing to put back after the copy either).
+			Log("no faster speed setting (best %.2f MB/s, the drive as it was %.2f MB/s): the drive is left as it is (already faster than 2.0)", best, base);
+		}
 		else
 		{
 			Log("no faster speed setting (best %.2f MB/s, the drive as it was %.2f MB/s): the drive back to 2.0", best, base);

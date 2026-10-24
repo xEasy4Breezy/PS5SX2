@@ -30,7 +30,7 @@ struct Texture
 struct BoxDraw
 {
 	Mat4 model;
-	VkDescriptorSet set = VK_NULL_HANDLE; // cover, placeholder, spine
+	VkDescriptorSet set = VK_NULL_HANDLE; // cover, placeholder, spine, back
 	float brightness = 1, cover_mix = 0, selected = 0;
 	float sheen_pos = 0, sheen_strength = 0, alpha = 1;
 };
@@ -92,7 +92,8 @@ public:
 	Texture* CreateTexture(uint32_t w, uint32_t h, VkFormat format, const void* pixels);
 	void DestroyTexture(Texture* t); // freed once the GPU is done with it
 
-	VkDescriptorSet AllocTextureSet(Texture* t0, Texture* t1, Texture* t2);
+	// 2.11: a fourth texture (the case's back; the white one when none is given).
+	VkDescriptorSet AllocTextureSet(Texture* t0, Texture* t1, Texture* t2, Texture* t3 = nullptr);
 	void FreeTextureSet(VkDescriptorSet set);
 
 	void SetAtlas(Texture* atlas);

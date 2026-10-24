@@ -79,6 +79,9 @@ constexpr const char* kCheatDiscKey = "PS5SX2/CheatDisc"; // vk-285-139: gs.ini,
 constexpr const char* kGameFoldersKey = "PS5SX2/GameFolders"; // folders separated by ';'
 constexpr const char* kBiosFolderKey = "PS5SX2/BiosFolder";
 constexpr const char* kNfsSharesKey = "PS5SX2/NfsShares"; // nfs:// addresses separated by ';'
+// 2026-10-16 (swordpdf: the texture replacements folder should be the one you set): the textures folder, a full path; unset: /data/PCSX2/textures
+// and the drives' texture folders as always. (The two switches under the folder rows are fe_roots.h's kScanUsbKey and kScanSubfoldersKey.)
+constexpr const char* kTexturesDirKey = "PS5SX2/TexturesDir";
 // A list setting's items (';' or '|' between them, spaces and a folder's last '/' off), and the list again.
 std::vector<std::string> SplitFolderList(const std::string& list);
 std::string JoinFolderList(const std::vector<std::string>& items);
@@ -100,10 +103,12 @@ public:
 		OnlinePatches, // 2026-10-08: "Get patches and cheats" (the app runs it: fe_patchdl.h)
 		SystemMenu,  // 2026-10-08: the sheet for all games: start the PS2's own menu with no disc (the app starts it)
 		ElfDisc,     // 2026-10-08: an ELF's sheet: the disc image it runs with (kElfDiscKey)
-		GameFolders, // vk-285-135: the sheet for all games: more game folders (the app's folder picker)
-		BiosFolder,  // vk-285-135: where the BIOS is looked for first (the folder picker)
+		GameFolders, // vk-285-135: the sheet for all games: the game folders (the app's folder picker); 2026-10-16: once one is added, the only ones listed
+		BiosFolder,  // vk-285-135: where the BIOS is looked for (the folder picker); 2026-10-16: the only place, once set
 		NfsShares,   // vk-285-135: NFS shares' addresses (the app's list, the PS5's keyboard)
+		TexturesFolder, // 2026-10-16: where texture packs are read from and HD packs are put (kTexturesDirKey; the folder picker)
 		CheatDisc,   // vk-285-139: the sheet for all games: the cheat disc (kCheatDiscKey, one of the shelf's images)
+		HomeTile,    // 2.12: a game's sheet: its tile on the PS5 home screen (the app asks the helper and draws the value and help: fe_gametile.h)
 	};
 
 	enum class From
@@ -131,6 +136,8 @@ public:
 	void SetTexturePackRow(bool on) { m_texture_pack_row = on; }
 	// 2026-10-08: a game's sheet gets the "Get patches and cheats" row (under Patches) when the app can fetch them.
 	void SetOnlinePatchRow(bool on) { m_online_patch_row = on; }
+	// 2.12: a game's sheet gets the "Home screen tile" row (under Shelf) when the app can ask the helper for it and the game can have a tile.
+	void SetHomeTileRow(bool on) { m_home_tile_row = on; }
 	// 2026-10-08: the sheet for all games gets the "PS2 system menu" row when the app can start it. TakeSystemMenu: true
 	// once, after the row was confirmed (Cross twice), for the app to start it.
 	void SetSystemMenuRow(bool on) { m_system_menu_row = on; }
@@ -216,6 +223,7 @@ private:
 	int m_tab = kTabSettings;
 	bool m_texture_pack_row = false;
 	bool m_online_patch_row = false; // 2026-10-08
+	bool m_home_tile_row = false;    // 2.12
 	bool m_system_menu_row = false, m_system_menu = false; // 2026-10-08
 	bool m_folder_rows = false; // vk-285-135
 	Kind m_folder_request = Kind::Header;

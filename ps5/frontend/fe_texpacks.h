@@ -14,6 +14,11 @@
 // The platform (HTTP, free space, the popup) is behind TexturePackPlatform: fe_ps5.cpp on the console, fe_host.cpp
 // and host/texpacks_test.cpp on a PC. Needs proper testing on the console.
 //
+// b176 (swordpdf: "we forgot to add the new texture packs links"): the 192 .7z packs of the community's Drive folder are read by fe_sevenzip.c (the LZMA SDK in
+// 3rdparty/lzma, one solid block at a time as a stream; limits, memory budget and refusals are in its header and in TexturePackManager::Unpack7z), through the same
+// pack writer as the other packs. Flag files in /data/PCSX2/flags: texpack_no7z (build 175's behaviour: the .7z packs are not offered), texpack_7z_bigdict
+// (a dictionary up to 256 MiB instead of 64 MiB), texpack_nomemgate (no free-memory check before an unpack).
+//
 // Copyright (C) 2026 swordpdf
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -44,11 +49,33 @@ struct TexturePack
 	uint64_t bytes = 0;
 	std::string md5; // lowercase hex, from the item's file list
 	uint32_t files = 0; // the archive's file count, from the list (0 when it doesn't say)
+	// 2.11: where the file is. "": archive.org's item (kTexturePackItem). "gdrive": a public Google Drive file `drive_id` (the community's
+	// folders, assets/hd-pack-sources.json): its size and checksum aren't in any list, so bytes is 0 and md5 empty until the download
+	// starts (the size is asked of Drive then; the archive's own checks catch a bad file when it is unpacked).
+	std::string host;
+	std::string drive_id;
+	std::string maker; // whose pack it is ("CCKrizalid"): the label's start
+	// b176: what the Drive list says about its size ("size", "unpacked" in assets/hd-pack-sources.json; optional, nothing writes them yet), for the
+	// shelf's help line ONLY. Never copied into `bytes` (or a job's): a Drive id stays the same when the maker uploads a new file, and the live probe of
+	// the file is the authority on its size.
+	uint64_t hint_bytes = 0, hint_unpacked = 0;
+	bool OnDrive() const { return host == "gdrive"; }
+	// The name of its files in the work folder: its md5, else "g" and its Drive id.
+	std::string Key() const { return md5.size() == 32 ? md5 : "g" + drive_id; }
 };
 
 // The item's file list (https://archive.org/metadata/<item>) -> its packs: original .rar and .zip files whose name holds
 // a serial. False (and `error`) when the text isn't that list.
 bool ParseTexturePackCatalog(const std::string& json, std::vector<TexturePack>& out, std::string& error);
+// 2.11: the other source, assets/hd-pack-sources.json (ps5/tools/make_hd_pack_sources.py makes it from the community's Google Drive folders
+// and their sheet): {"version":1,"packs":[{"id":"<Drive file id>","name":"<file name>","title":"Black","label":"CCKrizalid",
+// "maker":"CCKrizalid","serials":["SLUS-21376"],"size":863000000,"unpacked":1900000000}]} ("size" and "unpacked" are optional hints for the
+// shelf's text). Kept: .rar and .zip (libarchive) and, since b176, .7z (fe_sevenzip.c: LZMA2 / LZMA / stored blocks, streamed); anything
+// else is counted in `unsupported`. (The manager drops the .7z ones again, and logs them as left out, under the flag file texpack_no7z.)
+// False (and `error`) when the text isn't that list.
+bool ParseExtraTexturePacks(const std::string& json, std::vector<TexturePack>& out, std::string& error, int* unsupported = nullptr);
+// The address that gives a Drive file's bytes (ranges too, with no virus-scan page in between): drive.usercontent.google.com.
+std::string TexturePackDriveUrl(const std::string& drive_id);
 std::string TexturePackMetadataUrl();
 std::string TexturePackUrl(const TexturePack& pack);
 std::string PercentEncode(const std::string& text);
@@ -126,6 +153,9 @@ struct TexturePackPlatform
 	// the whole file came from 0), or < 0.
 	std::function<int(const std::string& url, uint64_t offset, uint64_t length, const std::function<bool(const void*, size_t)>& sink)>
 		get_range;
+	// 2.11: what a file's address says about it, from a one-byte range of it: the HTTP status (206), its whole size in `total` (0 when it says
+	// none) and its Content-Type in `type`. Google Drive's size isn't in any list. Unset: Drive packs can't start.
+	std::function<int(const std::string& url, uint64_t& total, std::string& type)> probe;
 	std::function<void()> abort; // fails the request in flight (Stop, Cancel), from another thread
 	std::function<uint64_t(const std::string& dir)> free_bytes; // UINT64_MAX when unknown
 	// A pack for this serial somewhere else the emulator looks first (a USB drive, the settings page's folder): its folder.
@@ -136,6 +166,14 @@ struct TexturePackPlatform
 	// Called first thing on each thread the manager starts (the worker, "worker"; the unpacker's file writers, "writer"):
 	// the console logs where it runs and lets it use all the title's CPUs (a thread made by the shelf's takes its CPU).
 	std::function<void(const char* role)> thread_start;
+	// 2.11: a flag file in /data/PCSX2/flags (texpack_sync, texpack_direct: how the pack's file is written); unset: none is on.
+	std::function<bool(const char* name)> flag;
+	// 2.11 (review): a short GET (about 12 s in all) for the project's Drive list, so a blocked host never keeps the worker from the jobs; unset: get_text.
+	std::function<int(const std::string& url, std::string& body)> get_text_quick;
+	// b176: the flexible memory the system still has free, in bytes (the C/C++ heap, the thread stacks and the JIT live in that pool; the C++
+	// is built without exceptions, so a failed `new` anywhere ends the app). A 7z unpack asks before it takes a dictionary and the pack writer's
+	// buffers, and is refused with a message when it wouldn't leave a margin. Unset, or UINT64_MAX: unknown, no check. Flag texpack_nomemgate: no check.
+	std::function<uint64_t()> free_memory;
 };
 
 class TexturePackManager
@@ -147,6 +185,11 @@ public:
 	~TexturePackManager();
 	TexturePackManager(const TexturePackManager&) = delete;
 	TexturePackManager& operator=(const TexturePackManager&) = delete;
+
+	// 2.11: the second source (ParseExtraTexturePacks's list): the one built into the app, then a file the player may add to
+	// (/data/PCSX2/hd-pack-sources.json; "" for none). Before Start. Their packs are listed beside archive.org's.
+	void SetExtraSources(const std::string& built_in_json, const std::string& extra_file, const std::string& fetched_file = std::string(),
+		const std::string& fetch_url = std::string());
 
 	// The worker: the list, then the downloads left from last time, then whatever Begin asks for.
 	void Start();
@@ -172,7 +215,11 @@ private:
 	struct Job
 	{
 		std::string serial, name, md5, title, settings, header;
-		uint64_t bytes = 0;
+		std::string host, drive_id; // 2.11: "gdrive" and the file's id (md5 empty then)
+		uint64_t bytes = 0;         // 0 for a Drive pack until Process has asked Drive
+		int unpack_tries = 0;       // b176: 7z unpacks begun and not ended (written into the job file before one starts): an unpack that ends the app is not resumed forever
+		std::string Key() const { return md5.size() == 32 ? md5 : "g" + drive_id; }
+		std::string Source() const { return host == "gdrive" ? "Google Drive" : "archive.org"; }
 	};
 	struct Progress
 	{
@@ -197,10 +244,20 @@ private:
 	bool SetAside(const std::string& path);
 	void EmptySetAside();
 	void LoadCatalog();
+	// 2.11 (swordpdf: "the hd texture packs sources didn't get updated"): the Drive list built into the app goes stale as the Drive grows. The worker fetches the
+	// project's current copy (fetch_url, the list in the repository), keeps it in fetched_file and uses it at once and at the next start; at most every 6 hours.
+	// The merged list: that copy first, then the built-in one, then the player's own file; of the same Drive file the first wins. Flag nohdsources: no fetch.
+	void RefreshExtraSources();
+	bool ReadJobFile(const std::string& serial, Job& out) const; // the job file's own record of the pack (name, checksum, Drive id): what a pack's files are called
+	std::vector<TexturePack> MergeExtra(const std::string& fetched_json, int& unsupported);
 	void ResumeJobs();
 	void Process(const Job& job);
 	bool Download(const Job& job, const std::string& part, const std::string& full);
 	bool Unpack(const Job& job, const std::string& full, const std::string& staging, uint32_t& files, bool& no_space, std::string& error);
+	// b176: the same for a .7z (fe_sevenzip.c, streamed through the same pack writer). `drop`: the pack can never be used here (a method or
+	// dictionary the reader refuses ...): the download and the job are deleted and the refusal is kept for the next try (RefusedFile).
+	bool Unpack7z(const Job& job, const std::string& full, const std::string& staging, uint32_t& files, bool& no_space, std::string& error, bool& drop);
+	std::string RefusedFile(const Job& job) const; // <work>/<key>.<serial>.refused: why a 7z was refused for this game (and under which limits), so a new try does not download it again
 	void Finish(const Job& job, uint32_t files);
 	void SetState(const std::string& serial, TexturePackStatus::State state, uint64_t done = 0, uint64_t total = 0,
 		const std::string& message = {});
@@ -210,6 +267,7 @@ private:
 	void DeleteJobFiles(const Job& job);
 	bool WriteJob(const Job& job);
 	Installed LookAtFolder(const std::string& serial) const;
+	const TexturePack* FindPack(const std::string& name) const;
 	std::vector<TexturePack> PacksFor(const std::string& serial) const;
 	double Now() const;
 
@@ -230,6 +288,10 @@ private:
 	} m_catalog_state = Catalog::Loading;
 	std::string m_catalog_error;
 	std::vector<TexturePack> m_catalog;
+	std::vector<TexturePack> m_extra; // 2.11: Drive's, from SetExtraSources (before Start) and RefreshExtraSources (the worker)
+	std::string m_built_in_json, m_extra_file, m_fetched_file, m_fetch_url;
+	bool m_sources_refreshed = false; // the worker thread's: done once per start, when it has nothing else to do
+	int m_extra_unsupported = 0;
 	std::deque<Job> m_queue;
 	std::deque<std::string> m_removals;
 	std::map<std::string, Progress> m_progress; // by serial: queued, running, failed

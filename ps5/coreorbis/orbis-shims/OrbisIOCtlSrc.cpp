@@ -22,6 +22,8 @@
 #include "common/Error.h"
 
 #include "OrbisDiscDrive.h"
+#include "OrbisDiscReadAhead.h"
+#include "OrbisDiscReady.h"
 
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -39,15 +41,46 @@
 
 // (disc globals live in CDVDdiscReader.cpp already.)
 
+// The switch files (OrbisPaths.h). Weak, so the console test of this file (tests/discdrive), which does not link orbis_paths.cpp, still builds: every
+// switch is off there.
+bool OrbisFlag(const char* name) __attribute__((weak));
+
 namespace
 {
-// DiscReady asks the drive at most this often; the CDVD thread calls it on every loop (every 10 ms with no disc).
-constexpr s64 kReadyEveryMs = 500;
+bool Flag(const char* name)
+{
+  return OrbisFlag && OrbisFlag(name);
+}
+
+// Sony's own read speed command (OrbisDiscScsi.h: SieSetReadSpeed), rotation 0: 0x20 is the drive's 2.0x, 0x32 its 3.2x (4.4 MB/s on a DVD).
+bool SetSonySpeed(int pass, uint16_t speed)
+{
+  orbis_mmc::Sense sense;
+  return OrbisDiscDrive::Command(pass, orbis_mmc::SieSetReadSpeed(0, speed), nullptr, 0, 10000, &sense);
+}
+
+// The read-ahead's counters as one line of boot.log when the drive is closed. (While a game plays, the CDVD thread's line every 10 s has them:
+// CDVDdiscThread.cpp, IOCtlSrc::DriveStats.)
+void LogReadAhead(const std::string& name, const orbis_disc::ReadAhead& ra)
+{
+  const orbis_disc::ReadAhead::Stats& s = ra.GetStats();
+  std::printf("[disc] %s read-ahead %s: %llu reads asked, %llu served from memory, %llu window reads, %llu plain reads, %llu failed windows, "
+              "%llu MiB from the drive\n",
+    name.c_str(), ra.Enabled() ? "on" : "off (flag nodiscreadahead)", static_cast<unsigned long long>(s.calls),
+    static_cast<unsigned long long>(s.hits), static_cast<unsigned long long>(s.window_reads), static_cast<unsigned long long>(s.direct_reads),
+    static_cast<unsigned long long>(s.window_failures), static_cast<unsigned long long>(s.sectors_from_drive / 512));
+  std::fflush(stdout);
+}
 
 s64 NowMs()
 {
   return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
+
+// 2.11: the last time a read really reached the drive (Pread2048 and READ CD succeeded; NOT a read the windows answered from memory). DiscReady takes
+// it as proof that the disc is there (no TEST UNIT READY then) and the keep-alive thread skips its read after one: one atomic for both
+// (OrbisDiscReady.h). DiscReady asks the drive at most every ReadyPolicy::kEveryMs; the CDVD thread calls it on every loop.
+orbis_disc::LastRead s_last_read;
 
 // At most this many failed reads are logged (a scratched disc would otherwise fill the log).
 std::atomic<int> s_read_failures{0};
@@ -92,7 +125,10 @@ bool Pread2048(int fd, u32 sector, u32 count, u8* buffer)
   const ssize_t want = 2048 * static_cast<ssize_t>(count);
   const ssize_t got = pread(fd, buffer, static_cast<size_t>(want), sector * 2048ULL);
   if (got == want)
+  {
+    s_last_read.Note(NowMs());
     return true;
+  }
   if (s_read_failures.fetch_add(1) < 50)
   {
     if (got == -1)
@@ -105,14 +141,27 @@ bool Pread2048(int fd, u32 sector, u32 count, u8* buffer)
 }
 } // namespace
 
+s64 OrbisDiscLastReadMs()
+{
+  return s_last_read.Get();
+}
+
 IOCtlSrc::IOCtlSrc(std::string filename)
   : m_filename(std::move(filename))
 {
+  // 2.11: read-ahead windows (OrbisDiscReadAhead.h); the switch file nodiscreadahead turns them off.
+  m_ahead = std::make_unique<orbis_disc::ReadAhead>();
+  m_ahead->SetEnabled(!Flag("nodiscreadahead"));
+  m_ready_policy = std::make_unique<orbis_disc::ReadyPolicy>();
 }
 
 IOCtlSrc::~IOCtlSrc()
 {
   std::lock_guard<std::mutex> lock(m_lock);
+  if (m_pass >= 0 && m_fast)
+    SetSonySpeed(m_pass, 0x20); // the drive back to its 2.0x
+  if (m_ahead && m_ahead->GetStats().calls)
+    LogReadAhead(m_filename, *m_ahead);
   if (m_pass >= 0)
     close(m_pass);
   if (m_device != -1)
@@ -132,6 +181,10 @@ bool IOCtlSrc::Reopen(Error* error)
   m_layer_break = 0;
   m_media_type = 0;
   m_raw_off = false;
+  m_fast = false; // (a new disc: the drive is at its own speed again)
+  m_ahead->Reset();
+  m_ready_policy->Reset(); // (and the settle window of the old speed command)
+  s_last_read.Clear();     // (a read of the old disc proves nothing about this one)
   m_toc.clear();
 
   m_device = open(m_filename.c_str(), O_RDONLY);
@@ -180,12 +233,42 @@ bool IOCtlSrc::Reopen(Error* error)
   }
   m_said_unreadable = false;
   const std::string drive = m_pass >= 0 ? OrbisDiscDrive::Describe(m_pass) : std::string();
+  // The PS5's own drive reads a DVD at 2.0x (2.78 MB/s) unless asked; it takes 3.2x (4.4 MB/s, +59%) and nothing faster (disc drive test logs,
+  // 2026-10-16, three consoles). 2.11: on by default for the PS5's own drive (SONY PS-SYSTEM) and DVDs; the switch file nodisc32 asks for 2.0x
+  // instead (the old switch file disc32 does nothing now). A USB drive, a CD and a drive that refuses get no speed command.
+  if (m_pass >= 0 && m_media_type >= 0 && drive.find("PS-SYSTEM") != std::string::npos)
+  {
+    // The drive keeps the speed it was given for as long as its disc stays in, and the app that gave it 3.2x may have been closed by the PS button
+    // (nothing runs then to put it back): the switch file nodisc32 sends the 2.0x command, else a run "without 3.2x" would read at 3.2x all the same.
+    const bool want_fast = !Flag("nodisc32");
+    const bool taken = SetSonySpeed(m_pass, want_fast ? 0x32 : 0x20);
+    m_fast = taken && want_fast; // (only 3.2x is put back by the destructor)
+    // The speed change can be reported as UNIT ATTENTION by the next command: taken here, like the one at the start of this function, so
+    // that DiscReady's next UNIT ATTENTION means a real disc change. The drive needs ~0.7 s to change speed (the first read after the
+    // command took 497-710 ms): nothing is asked of it for 3 s after it (ReadyPolicy::kSettleMs).
+    int unit_attentions = 0;
+    orbis_mmc::Sense after;
+    bool after_ready = false;
+    if (taken)
+    {
+      for (int i = 0; i < 3 && !(after_ready = OrbisDiscDrive::Ready(m_pass, &after)) && after.valid && after.key == 6; i++)
+        unit_attentions++;
+      m_ready_policy->StartSettle(NowMs());
+    }
+    std::printf("[disc] %s: drive speed %s %s%s%s%s\n", m_filename.c_str(), want_fast ? "3.2x" : "2.0x (switch file nodisc32)", taken ? "taken" : "refused",
+      unit_attentions ? " (a UNIT ATTENTION followed it, taken)" : "", taken && !after_ready ? "; TEST UNIT READY right after it: " : "",
+      taken && !after_ready ? orbis_mmc::SenseText(after).c_str() : "");
+    std::fflush(stdout);
+  }
   std::printf("[disc] %s: %s, %s, %u sectors, layer break %u, %zu track(s); pass-through %s%s\n", m_filename.c_str(),
     drive.empty() ? "(drive not named)" : drive.c_str(),
     m_media_type < 0 ? "CD" : m_media_type == 0 ? "DVD, one layer" : m_media_type == 1 ? "DVD, two layers (PTP)" : "DVD, two layers (OTP)",
     m_sectors, m_layer_break, m_toc.size(), m_pass >= 0 ? pass_name.c_str() : "not found",
     m_pass < 0 && m_media_type < 0 ? " (CD sectors made from their data; XA streams won't play)" : "");
   std::fflush(stdout);
+  // The drive just answered the disc's layers or table of contents: it is ready (DiscReady, which may not ask for a while after the speed
+  // command, hands this on until it does).
+  m_ready = true;
   return true;
 }
 
@@ -285,7 +368,7 @@ bool IOCtlSrc::ReadCDInfo()
 
 void IOCtlSrc::SetSpindleSpeed(bool restore_defaults) const
 {
-  (void)restore_defaults;
+  (void)restore_defaults; // (the drive speed is set in Reopen and put back in the destructor)
 }
 
 u32 IOCtlSrc::GetSectorCount() const
@@ -301,7 +384,10 @@ const std::vector<toc_entry>& IOCtlSrc::ReadTOC() const
 bool IOCtlSrc::ReadSectors2048(u32 sector, u32 count, u8* buffer) const
 {
   std::lock_guard<std::mutex> lock(m_lock);
-  return m_device != -1 && Pread2048(m_device, sector, count, buffer);
+  if (m_device == -1)
+    return false;
+  // Through the read-ahead windows: a seek costs the drive 150-250 ms, so a miss reads 128-512 KiB, not the 32 KiB PCSX2 asked for.
+  return m_ahead->Read(sector, count, buffer, m_sectors, [this](u32 s, u32 c, u8* b) { return Pread2048(m_device, s, c, b); });
 }
 
 bool IOCtlSrc::ReadSectors2352(u32 sector, u32 count, u8* buffer) const
@@ -311,7 +397,10 @@ bool IOCtlSrc::ReadSectors2352(u32 sector, u32 count, u8* buffer) const
     return false;
   if (m_pass >= 0 && !m_raw_off &&
       OrbisDiscDrive::ReadRaw(m_pass, sector, count, buffer, AllData(m_toc, m_sectors, sector, sector + count - 1)))
+  {
+    s_last_read.Note(NowMs()); // (a READ CD that reached the drive and came back whole)
     return true;
+  }
   // No pass-through, or READ CD refused (or short): the sectors made from their 2048 bytes of data.
   u8 data[2048];
   for (u32 n = 0; n < count; n++)
@@ -333,6 +422,10 @@ bool IOCtlSrc::ReadSectors2352(u32 sector, u32 count, u8* buffer) const
 
 bool IOCtlSrc::ReadTrackSubQ(cdvdSubQ* subq) const
 {
+  // 2.11: a DVD has no Q sub-channel (DISCreadSubQ fills in track 1, index 1 itself when this says no). Asking would send the drive a command, and
+  // wait for m_lock behind the CDVD thread's window reads, in the middle of a game: the CPU thread called this from the CDVD status command.
+  if (m_media_type >= 0)
+    return false;
   std::lock_guard<std::mutex> lock(m_lock);
   u8 data[16] = {};
   if (m_pass < 0 || !OrbisDiscDrive::Command(m_pass, orbis_mmc::ReadSubChannelQ(sizeof(data)), data, sizeof(data), 5000))
@@ -361,38 +454,62 @@ bool IOCtlSrc::DiscReady()
   {
     std::lock_guard<std::mutex> lock(m_lock);
     const s64 now = NowMs();
-    if (m_ready_checked_ms >= 0 && now - m_ready_checked_ms < kReadyEveryMs)
+    // 2.11 (OrbisDiscReady.h): the drive is asked at most every 500 ms; not at all for 3 s after the speed command, nor within 2 s of a read that
+    // really reached the drive (that read proves a known disc is there and spinning); and a doubtful answer must come twice in a row.
+    const s64 proof = m_sectors != 0 && m_ready ? s_last_read.Get() : -1;
+    if (!m_ready_policy->ShouldAsk(now, proof))
       return m_ready && m_sectors != 0;
-    m_ready_checked_ms = now;
     // m_device == -1: it didn't open last time (no disc in it then): Reopen below tries again.
     if (m_device != -1)
     {
-      bool changed = false;
+      bool ready = false;
+      orbis_mmc::Sense sense;
       if (m_pass >= 0)
       {
-        orbis_mmc::Sense sense;
-        m_ready = OrbisDiscDrive::Ready(m_pass, &sense);
-        changed = !m_ready && sense.valid && sense.key == 6; // UNIT ATTENTION: the disc changed (or the drive reset)
+        ready = OrbisDiscDrive::Ready(m_pass, &sense);
       }
       else
       {
         off_t bytes = 0;
-        m_ready = ioctl(m_device, DIOCGMEDIASIZE, &bytes) == 0 && bytes > 0;
+        ready = ioctl(m_device, DIOCGMEDIASIZE, &bytes) == 0 && bytes > 0;
+        sense = {true, 2, 0x3A, 0}; // (no medium)
       }
-      if (changed || !m_ready)
+      const orbis_disc::ReadyPolicy::Verdict verdict = m_ready_policy->Answer(ready, sense.valid, sense.key, sense.asc);
+      if (verdict.out)
       {
         // PCSX2 sees the tray open now; the next answer (500 ms on) reads the disc that's in then.
         if (m_sectors)
         {
-          std::printf("[disc] %s: %s\n", m_filename.c_str(), changed ? "the drive reports a disc change" : "the disc is out (or not ready)");
+          std::printf("[disc] %s: %s (%s)\n", m_filename.c_str(), verdict.changed ? "the drive reports a disc change" : "the disc is out (or not ready)",
+            sense.valid ? orbis_mmc::SenseText(sense).c_str() : "the command did not get through");
           std::fflush(stdout);
         }
         m_ready = false;
         m_sectors = 0;
         m_layer_break = 0;
         m_media_type = 0;
+        m_fast = false;
+        m_ahead->Reset();
+        s_last_read.Clear();
         return false;
       }
+      if (verdict.doubt)
+      {
+        // Not ready, but not "no disc" nor a disc change: once is not an eject. The next question is 250 ms on.
+        static std::atomic<int> s_doubts{0};
+        if (s_doubts.fetch_add(1) < 20)
+        {
+          if (verdict.own_ua) // (the first answer after our speed command: the drive reported the speed change late, not a new disc)
+            std::printf("[disc] %s: the drive reported a UNIT ATTENTION (%s) at the first question after the speed command: taken for the speed change, "
+                        "asking again in %d ms\n", m_filename.c_str(), orbis_mmc::SenseText(sense).c_str(), static_cast<int>(orbis_disc::ReadyPolicy::kRetryMs));
+          else
+            std::printf("[disc] %s: the drive answered not ready (%s): asking again in %d ms before taking the disc for out\n", m_filename.c_str(),
+              sense.valid ? orbis_mmc::SenseText(sense).c_str() : "the command did not get through", static_cast<int>(orbis_disc::ReadyPolicy::kRetryMs));
+          std::fflush(stdout);
+        }
+        return m_ready && m_sectors != 0;
+      }
+      m_ready = true;
       if (m_sectors)
         return true;
       // a disc is in that hasn't been read yet: Reopen below
@@ -402,8 +519,52 @@ bool IOCtlSrc::DiscReady()
   const bool ok = Reopen(nullptr);
   std::lock_guard<std::mutex> lock(m_lock);
   m_ready = ok;
-  m_ready_checked_ms = NowMs();
+  m_ready_policy->Reopened(NowMs());
   return ok && m_sectors != 0;
+}
+
+// 2.11: the drive's part of the CDVD thread's line every 10 s (CDVDdiscThread.cpp). try_lock: the line is not worth waiting for a read in flight.
+size_t IOCtlSrc::DriveStats(char* out, size_t size) const
+{
+  if (!out || size == 0)
+    return 0;
+  orbis_disc::ReadAhead::Stats now_stats;
+  bool fast = false;
+  bool enabled = false;
+  {
+    std::unique_lock<std::mutex> lock(m_lock, std::try_to_lock);
+    if (!lock.owns_lock())
+      return 0;
+    now_stats = m_ahead->GetStats();
+    enabled = m_ahead->Enabled();
+    fast = m_fast;
+  }
+  // (the counters count from the start of the drive object: the line shows what changed since the last one)
+  static orbis_disc::ReadAhead::Stats before;
+  if (now_stats.calls < before.calls)
+    before = orbis_disc::ReadAhead::Stats();
+  const unsigned long long windows = now_stats.window_reads - before.window_reads;
+  const unsigned long long failed = now_stats.window_failures - before.window_failures;
+  const unsigned long long hits = now_stats.hits - before.hits;
+  const unsigned long long direct = now_stats.direct_reads - before.direct_reads;
+  const unsigned long long mib = (now_stats.sectors_from_drive - before.sectors_from_drive) / 512;
+  before = now_stats;
+  const s64 last = s_last_read.Get();
+  char seen[40];
+  if (last < 0)
+    std::snprintf(seen, sizeof(seen), "never");
+  else
+    std::snprintf(seen, sizeof(seen), "%lld ms ago", static_cast<long long>(NowMs() - last));
+  const int n = std::snprintf(out, size, "read-ahead %s: windows %llu%s, hits %llu, plain reads %llu, %llu MiB from the drive | speed %s | drive read last: %s",
+    enabled ? "on" : "off", windows, failed ? (" (" + std::to_string(failed) + " failed)").c_str() : "", hits, direct, mib,
+    fast ? "3.2x" : "the drive's own (2.0x on the PS5's)", seen);
+  return n < 0 ? 0 : (static_cast<size_t>(n) < size ? static_cast<size_t>(n) : size - 1);
+}
+
+// 2.11: for CDVDdiscThread.cpp (weak there: absent in the PC tests of the thread).
+size_t OrbisDiscDriveStats(char* out, size_t size)
+{
+  return src ? src->DriveStats(out, size) : 0;
 }
 
 std::vector<std::string> GetOpticalDriveList()

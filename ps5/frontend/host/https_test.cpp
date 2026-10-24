@@ -517,6 +517,29 @@ static void Real()
 	std::printf("real: done\n");
 }
 
+// 2.11: "get <url>..." fetches each address with the app's own client (whole answers, redirects followed) and says the status, size, the first
+// bytes and the time: the check that a host (LaunchBox's image servers) works with our TLS and HTTP before the app relies on it.
+static void GetUrls(int argc, char** argv)
+{
+	if (const char* p = std::getenv("https_proxy"))
+		UseProxy(p);
+	HttpsClient c(HostPlatform());
+	std::string err;
+	CHECK(c.Init(err));
+	for (int i = 2; i < argc; i++)
+	{
+		const auto t0 = std::chrono::steady_clock::now();
+		Fetch f = Get(c, argv[i], false, 0, 0, 0, 60000);
+		const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+		char magic[24] = {};
+		for (size_t k = 0; k < 8 && k < f.body.size(); k++)
+			std::snprintf(magic + k * 2, 3, "%02x", static_cast<unsigned char>(f.body[k]));
+		std::printf("  %s -> %d, %zu bytes, %.2f s, starts %s%s%s\n", argv[i], f.status, f.body.size(), s, magic, f.error.empty() ? "" : " | ", f.error.c_str());
+		CHECK(f.status == 200 && !f.body.empty());
+	}
+	std::printf("get: done\n");
+}
+
 int main(int argc, char** argv)
 {
 	const std::string mode = argc > 1 ? argv[1] : "";
@@ -526,9 +549,11 @@ int main(int argc, char** argv)
 		Local(argv[2]);
 	else if (mode == "real")
 		Real();
+	else if (mode == "get" && argc > 2)
+		GetUrls(argc, argv);
 	else
 	{
-		std::printf("usage: https_test units | local <servers.json> | real\n");
+		std::printf("usage: https_test units | local <servers.json> | real | get <url>...\n");
 		return 2;
 	}
 	std::printf(g_failures ? "%d FAILED\n" : "all passed\n", g_failures);
