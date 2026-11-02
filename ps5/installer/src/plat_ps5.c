@@ -3,11 +3,19 @@
  * Every system call here has a known signature:
  *   - sceKernelSendNotificationRequest: as in the payload SDK's notify samples, with the request laid out
  *     like OnionHEN's debug toast (the helper's "PS5SX2 Helper Loaded!");
- *   - sysctl(CTL_KERN, KERN_ARND), kill(pid, 0), signal(): FreeBSD's own, from the SDK headers.
+ *   - sysctl(CTL_KERN, KERN_ARND), kill(pid, 0), signal(): FreeBSD's own, from the SDK headers;
+ *   - 1.4: sceLncUtilGetAppIdOfRunningBigApp, sceLncUtilGetAppTitleId, sceLncUtilLaunchApp (libSceSystemService) and
+ *     sceUserServiceGetForegroundUser (libSceUserService), loaded with dlopen at run time as the PS5SX3 Installer does
+ *     (its plat_ps5.c, where they run on consoles since TB10): starting the app that way is what its tile does. Never
+ *     fork or LoadExec (they panicked the kernel in the disc daemons' live tests).
  */
 #include "plat.h"
 
+#include "config.h"
+
+#include <dlfcn.h>
 #include <errno.h>
+#include <stdio.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <stddef.h>
@@ -41,6 +49,11 @@ _Static_assert(sizeof(notify_request_t) == 0xC30, "notification request must be 
 _Static_assert(offsetof(notify_request_t, message) == 0x2D, "message at 0x2D");
 
 int sceKernelSendNotificationRequest(int32_t device, void *request, size_t size, int32_t blocking);
+/* fix181: the system state event flags (as relaunch/relaunch.c reads them) */
+typedef intptr_t plat_evf_t;
+int sceKernelOpenEventFlag(plat_evf_t *ef, const char *name);
+int sceKernelPollEventFlag(plat_evf_t ef, uint64_t bit_pattern, unsigned int wait_mode, uint64_t *result_pattern);
+int sceKernelCloseEventFlag(plat_evf_t ef);
 
 const char *plat_root(void) { return ""; }
 
@@ -101,6 +114,99 @@ int plat_pid_alive(pid_t pid) {
   if (errno == ESRCH)
     return 0;
   return -1;
+}
+
+/* ---- 1.4: the shell: which app runs, and starting PS5SX2 ---- */
+
+typedef struct {
+  uint32_t size;
+  int32_t user_id;
+  uint32_t app_opt;
+  uint64_t crash_report;
+  uint64_t check_flag;
+} lnc_app_param_t;
+
+typedef uint32_t (*get_big_app_t)(void);
+typedef int (*get_title_t)(uint32_t, char *);
+typedef int (*launch_app_t)(const char *, const char **, lnc_app_param_t *);
+typedef int (*user_init_t)(void *);
+typedef int (*user_fg_t)(int *);
+
+static get_big_app_t p_big_app;
+static get_title_t p_title;
+static launch_app_t p_launch;
+static user_fg_t p_fg_user;
+static int g_lnc_loaded;
+
+static void load_lnc(void) {
+  if (g_lnc_loaded)
+    return;
+  g_lnc_loaded = 1;
+  void *h = dlopen("libSceSystemService.sprx", RTLD_NOW | RTLD_GLOBAL);
+  if (h) {
+    p_big_app = (get_big_app_t)dlsym(h, "sceLncUtilGetAppIdOfRunningBigApp");
+    p_title = (get_title_t)dlsym(h, "sceLncUtilGetAppTitleId");
+    p_launch = (launch_app_t)dlsym(h, "sceLncUtilLaunchApp");
+  }
+  void *u = dlopen("libSceUserService.sprx", RTLD_NOW | RTLD_GLOBAL);
+  if (u) {
+    user_init_t init = (user_init_t)dlsym(u, "sceUserServiceInitialize");
+    p_fg_user = (user_fg_t)dlsym(u, "sceUserServiceGetForegroundUser");
+    if (init)
+      (void)init(NULL); /* (already initialized in a process that used it before: harmless) */
+  }
+}
+
+int plat_shutting_down(void) {
+  int quiet = 0;
+  plat_evf_t info = -1, status = -1;
+  if (sceKernelOpenEventFlag(&info, "SceSystemStateMgrInfo") >= 0) {
+    uint64_t pat = 0;
+    if (sceKernelPollEventFlag(info, UINT64_MAX, 2u /* OR */, &pat) == 0) {
+      const unsigned st = (unsigned)(pat & 0xffffu);
+      quiet = st == 100u || st == 300u || st == 500u;
+    }
+    sceKernelCloseEventFlag(info);
+  }
+  if (sceKernelOpenEventFlag(&status, "SceSystemStateMgrStatus") >= 0) {
+    uint64_t pat = 0;
+    if (sceKernelPollEventFlag(status, UINT64_MAX, 2u /* OR */, &pat) == 0 && (pat & 0x0000000000200000ULL))
+      quiet = 1;
+    sceKernelCloseEventFlag(status);
+  }
+  return quiet;
+}
+
+int plat_app_running(void) {
+  load_lnc();
+  if (!p_big_app || !p_title)
+    return -1;
+  const uint32_t id = p_big_app();
+  if (id == 0 || id == 0xffffffffu)
+    return 0;
+  char title[32];
+  memset(title, 0, sizeof(title));
+  if (p_title(id, title) != 0)
+    return -1;
+  return strncmp(title, TITLE_ID, 9) == 0 ? 1 : 0;
+}
+
+int plat_launch_app(char *why, size_t why_size) {
+  load_lnc();
+  if (!p_launch) {
+    snprintf(why, why_size, "sceLncUtilLaunchApp isn't available");
+    return -1;
+  }
+  int user = -1;
+  if (p_fg_user)
+    (void)p_fg_user(&user);
+  lnc_app_param_t prm;
+  memset(&prm, 0, sizeof(prm));
+  prm.size = sizeof(prm);
+  prm.user_id = user;
+  const int rc = p_launch(TITLE_ID, NULL, &prm);
+  snprintf(why, why_size, "sceLncUtilLaunchApp(" TITLE_ID ", user %d) = 0x%08x", user, (unsigned)rc);
+  return rc < 0 ? -1 : 0;
 }
 
 const char *plat_test_env(const char *name) {

@@ -6,6 +6,7 @@
 #include "fe_app.h"
 #include "fe_i18n.h"
 #include "fe_roots.h" // 2026-10-16: kScanSubfoldersKey (the picker's game count)
+#include "fe_settings.h" // bioscheck: EditSettingsFile (the BIOS question writes PS5SX2/OpenBios)
 
 #include <algorithm>
 #include <cctype>
@@ -236,12 +237,38 @@ bool App::Init(Renderer* renderer, const Fonts* fonts, std::vector<GameInfo> gam
 	// vk-285-134: main-boot.cpp looked for the BIOS just before the shelf; what it found is shown until a pick looks again.
 	m_bios_problem = m_cfg.bios_problem ? m_cfg.bios_problem() : std::string();
 	m_bios_missing = !m_bios_problem.empty();
+	m_bios_open_in_use = !m_bios_missing && m_cfg.bios_open_in_use && m_cfg.bios_open_in_use();
+	// bioscheck: a tile's or a disc's start was refused for want of a BIOS before the shelf came up: the question comes up for it at once.
+	if (!m_cfg.bios_pending_launch.empty())
+	{
+		m_bios_missing = true;
+		OpenBiosChoice(BiosWait::Outside, m_cfg.bios_pending_launch);
+	}
 	return true;
+}
+
+void App::SetGames(std::vector<GameInfo> games, int preselect)
+{
+	const size_t all = games.size();
+	const size_t hidden = static_cast<size_t>(std::count_if(games.begin(), games.end(), [](const GameInfo& g) { return g.hidden; }));
+	// The entries already on the shelf (a disc drive's, a copy's: indices below 0) stay; the games join them as Init's list would be.
+	const int keep = m_moved && !m_games.empty() ? m_index[static_cast<size_t>(m_selected)] : preselect;
+	for (size_t i = 0; i < games.size(); i++)
+		m_shelved.push_back({std::move(games[i]), Slot(), static_cast<int>(i)});
+	ApplyHidden(keep);
+	m_scroll = static_cast<float>(m_selected);
+	m_scroll_vel = 0;
+	m_select_time = m_time;
+	if (m_covers && !m_games.empty() && m_index[static_cast<size_t>(m_selected)] >= 0)
+		m_covers->SetSelected(m_index[static_cast<size_t>(m_selected)]);
+	std::printf("[frontend] the scan is done: %zu games on the shelf%s\n", m_games.size(),
+		hidden > 0 ? (" (" + std::to_string(hidden) + " of " + std::to_string(all) + " hidden)").c_str() : "");
+	std::fflush(stdout);
 }
 
 // vk-285-134 (AI-assisted): a game (or the PS2 system menu) starts only with a BIOS. Looked for again at each pick, as a BIOS
 // may have been copied over meanwhile (the settings page, FTP); without one the pick stays on the shelf and the line says why.
-bool App::BiosReady()
+bool App::BiosReady(BiosWait wait, const std::string& path)
 {
 	if (!m_cfg.bios_present)
 		return true;
@@ -249,15 +276,226 @@ bool App::BiosReady()
 	{
 		m_bios_missing = false;
 		m_bios_problem.clear();
+		m_bios_open_in_use = m_cfg.bios_open_in_use && m_cfg.bios_open_in_use();
 		return true;
 	}
 	m_bios_missing = true;
+	m_bios_open_in_use = false;
 	m_bios_problem = m_cfg.bios_problem ? m_cfg.bios_problem() : std::string();
 	m_bios_refused = m_time;
 	std::printf("[frontend] no PS2 BIOS: the game stays on the shelf (%s)\n", m_bios_problem.c_str());
 	std::fflush(stdout);
 	Sound(Sfx::Edge, 0.0f);
+	if (wait != BiosWait::None) // bioscheck: and asks what to do
+		OpenBiosChoice(wait, path);
 	return false;
+}
+
+// bioscheck (2026-10-29, AI-assisted): the BIOS question. A pick (or the system menu, or a start from outside the shelf) refused for want of a
+// BIOS asks: the open-source BIOS PS5SX2 ships (OpenPS2BIOS, experimental), which is remembered (gs.ini PS5SX2/OpenBios) and starts what
+// waited at once, or the player's own BIOS in the BIOS folder (a BIOS of their own always wins over the open one).
+void App::OpenBiosChoice(BiosWait wait, const std::string& path)
+{
+	m_bios_ask = true;
+	m_bios_sel = 0;
+	m_bios_wait = wait;
+	m_bios_wait_path = path;
+	m_held = 0;
+	std::printf("[frontend] BIOS question: %s%s%s (the open BIOS %s)\n",
+		wait == BiosWait::Pick ? "a pick" : wait == BiosWait::SystemMenu ? "the PS2 system menu" : "a start from outside the shelf",
+		path.empty() ? "" : ": ", path.c_str(), m_cfg.open_bios_bundled ? "offered" : "not in this build");
+	std::fflush(stdout);
+}
+
+bool App::OfferOutsideLaunch(const std::string& path)
+{
+	if (!m_bios_missing && (!m_cfg.bios_present || m_cfg.bios_present()))
+		return true;
+	if (m_bios_missing && m_cfg.bios_present && m_cfg.bios_present()) // a BIOS came meanwhile
+	{
+		m_bios_missing = false;
+		m_bios_problem.clear();
+		m_bios_open_in_use = m_cfg.bios_open_in_use && m_cfg.bios_open_in_use();
+		return true;
+	}
+	m_bios_missing = true;
+	if (path != m_bios_outside_asked && !m_bios_ask && !m_launching)
+	{
+		m_bios_outside_asked = path;
+		m_bios_refused = m_time;
+		Sound(Sfx::Edge, 0.0f);
+		OpenBiosChoice(BiosWait::Outside, path);
+	}
+	return false;
+}
+
+std::string App::TakeApprovedLaunch()
+{
+	std::string r;
+	r.swap(m_approved_launch);
+	return r;
+}
+
+bool App::UseOpenBios()
+{
+	std::string what, error;
+	if (m_cfg.options.gs_ini.empty() ||
+		!settings::EditSettingsFile(m_cfg.options.gs_ini, "", {{settings::Change::Set, "PS5SX2/OpenBios", "true"}}, what, error))
+	{
+		std::printf("[frontend] BIOS question: the open BIOS couldn't be chosen (%s)\n", error.c_str());
+		std::fflush(stdout);
+		return false;
+	}
+	if (m_cfg.options.log)
+		m_cfg.options.log("shelf: gs.ini: the BIOS question: the open-source BIOS: " + (what.empty() ? std::string("no change") : what));
+	if (!m_cfg.bios_present || !m_cfg.bios_present())
+		return false;
+	m_bios_missing = false;
+	m_bios_problem.clear();
+	m_bios_open_in_use = m_cfg.bios_open_in_use && m_cfg.bios_open_in_use();
+	return true;
+}
+
+void App::RefreshBios()
+{
+	if (!m_cfg.bios_present)
+		return;
+	const bool ok = m_cfg.bios_present();
+	m_bios_missing = !ok;
+	m_bios_problem = ok ? std::string() : (m_cfg.bios_problem ? m_cfg.bios_problem() : std::string());
+	m_bios_open_in_use = ok && m_cfg.bios_open_in_use && m_cfg.bios_open_in_use();
+}
+
+void App::UpdateBiosChoice(const Input& in)
+{
+	const int cards = m_cfg.open_bios_bundled ? 2 : 1;
+	if (cards == 2 && ((in.left && !m_prev.left) || (in.right && !m_prev.right)))
+	{
+		m_bios_sel = 1 - m_bios_sel;
+		Sound(Sfx::Move, in.left ? -0.2f : 0.2f);
+		return;
+	}
+	if (in.circle && !m_prev.circle)
+	{
+		std::printf("[frontend] BIOS question: closed\n");
+		std::fflush(stdout);
+		m_bios_ask = false;
+		m_bios_wait = BiosWait::None;
+		Sound(Sfx::Edge, 0.0f);
+		return;
+	}
+	if (!(in.cross && !m_prev.cross))
+		return;
+	const bool open = cards == 2 && m_bios_sel == 0;
+	if (!open)
+	{
+		std::printf("[frontend] BIOS question: your own BIOS (in %s)\n", m_cfg.bios_dir.c_str());
+		std::fflush(stdout);
+		char line[320];
+		std::snprintf(line, sizeof(line), Tr(Str::BiosAddOwnLine1), m_cfg.bios_dir.c_str());
+		m_refused_text = std::string(line) + ", " + Tr(Str::BiosAddOwnLine2);
+		m_refused_time = m_time;
+		m_bios_refused = m_time;
+		m_bios_ask = false;
+		m_bios_wait = BiosWait::None;
+		Sound(Sfx::Move, 0.0f);
+		return;
+	}
+	if (!UseOpenBios())
+	{
+		m_refused_text = Tr(Str::BiosOpenFailed);
+		m_refused_time = m_time;
+		m_bios_ask = false;
+		m_bios_wait = BiosWait::None;
+		Sound(Sfx::Edge, 0.0f);
+		return;
+	}
+	std::printf("[frontend] BIOS question: the open-source BIOS (OpenPS2BIOS, experimental): remembered; %s starts\n",
+		m_bios_wait == BiosWait::Outside ? m_bios_wait_path.c_str() : m_bios_wait == BiosWait::SystemMenu ? "the PS2 system menu" : "the pick");
+	std::fflush(stdout);
+	m_bios_ask = false;
+	const BiosWait wait = m_bios_wait;
+	m_bios_wait = BiosWait::None;
+	if (wait == BiosWait::Outside)
+	{
+		m_approved_launch = m_bios_wait_path;
+		m_done = true;
+		Sound(Sfx::Launch, 0.0f);
+		return;
+	}
+	if (wait == BiosWait::None)
+	{
+		Sound(Sfx::Move, 0.0f);
+		return;
+	}
+	if (m_cfg.game_achievements.cancel)
+		m_cfg.game_achievements.cancel();
+	m_system_menu = wait == BiosWait::SystemMenu;
+	m_launching = true;
+	m_launch_time = m_time;
+	Sound(Sfx::Launch, 0.0f);
+}
+
+void App::BuildBiosChoice(std::vector<UiVertex>& ui, float W, float H, float k, uint32_t accent)
+{
+	const float e = Smoothstep(0.0f, 1.0f, m_bios_anim);
+	const size_t begin = ui.size();
+	const uint32_t hi = Rgba(1, 1, 1), mid = Rgba(0.76f, 0.74f, 0.86f), lo = Rgba(0.56f, 0.54f, 0.68f);
+	const uint32_t ink = Rgba(0.07f, 0.06f, 0.16f), inkmid = Rgba(0.30f, 0.28f, 0.44f);
+	Fonts::AddRoundedRect(ui, 0, 0, W, H, 0.0f, Rgba(0.01f, 0.01f, 0.03f, 0.76f));
+
+	// The panel, as the disc question's (BuildDiscAsk): a shadow, a rim, the body, an amber line along its top (the BIOS line's colour).
+	const float pw = 1560 * k, ph = 700 * k, px = (W - pw) * 0.5f, py = (H - ph) * 0.5f - 20 * k;
+	const float pad = 84 * k, cx = px + pad, inner = pw - 2 * pad;
+	Fonts::AddRoundedRect(ui, px - 8 * k, py + 14 * k, pw + 16 * k, ph + 16 * k, 52 * k, Rgba(0, 0, 0, 0.38f));
+	Fonts::AddRoundedRect(ui, px - 2 * k, py - 2 * k, pw + 4 * k, ph + 4 * k, 46 * k, Rgba(1, 1, 1, 0.14f));
+	Fonts::AddRoundedRect(ui, px, py, pw, ph, 44 * k, Rgba(0.045f, 0.050f, 0.105f, 0.985f));
+	Fonts::AddRoundedRect(ui, px + 120 * k, py, pw - 240 * k, 6 * k, 3 * k, Rgba(0.95f, 0.62f, 0.22f));
+
+	m_fonts->AddText(ui, Fit(*m_fonts, Tr(Str::BiosChoiceTitle), 60 * k, inner).c_str(), cx, py + 120 * k, 60 * k, hi, 0.55f);
+	m_fonts->AddText(ui, Fit(*m_fonts, Tr(Str::BiosChoiceIntro), 30 * k, inner).c_str(), cx, py + 184 * k, 30 * k, mid, 0.2f);
+	Fonts::AddRoundedRect(ui, cx, py + 222 * k, inner, 2 * k, 0, Rgba(1, 1, 1, 0.10f));
+
+	const bool two = m_cfg.open_bios_bundled;
+	const float gap = 36 * k, cw = two ? (inner - gap) * 0.5f : inner, ch = 240 * k, cy = py + 270 * k;
+	auto card = [&](float x0, const std::string& title, const std::string& line1, const std::string& line2, bool focused) {
+		if (focused)
+		{
+			Fonts::AddRoundedRect(ui, x0 - 8 * k, cy - 8 * k, cw + 16 * k, ch + 16 * k, 46 * k, Rgba(1, 1, 1, 0.16f));
+			Fonts::AddRoundedRect(ui, x0 - 4 * k, cy - 4 * k, cw + 8 * k, ch + 8 * k, 42 * k, accent);
+			Fonts::AddRoundedRect(ui, x0, cy, cw, ch, 38 * k, Rgba(1, 1, 1, 0.96f));
+		}
+		else
+			Fonts::AddRoundedRect(ui, x0, cy, cw, ch, 38 * k, Rgba(1, 1, 1, 0.07f));
+		const uint32_t t = focused ? ink : hi, c = focused ? inkmid : mid;
+		const float tw = cw - 48 * k;
+		m_fonts->AddText(ui, Fit(*m_fonts, title, 44 * k, tw).c_str(), x0 + cw * 0.5f, cy + 88 * k, 44 * k, t, 0.55f, Fonts::Center);
+		m_fonts->AddText(ui, Fit(*m_fonts, line1, 29 * k, tw).c_str(), x0 + cw * 0.5f, cy + 148 * k, 29 * k, c, 0.15f, Fonts::Center);
+		m_fonts->AddText(ui, Fit(*m_fonts, line2, 29 * k, tw).c_str(), x0 + cw * 0.5f, cy + 190 * k, 29 * k, c, 0.15f, Fonts::Center);
+	};
+	char own[320];
+	std::snprintf(own, sizeof(own), Tr(Str::BiosAddOwnLine1), m_cfg.bios_dir.c_str());
+	if (two)
+	{
+		card(cx, Tr(Str::BiosUseOpen), Tr(Str::BiosUseOpenLine1), Tr(Str::BiosUseOpenLine2), m_bios_sel == 0);
+		card(cx + cw + gap, Tr(Str::BiosAddOwn), own, Tr(Str::BiosAddOwnLine2), m_bios_sel == 1);
+	}
+	else
+		card(cx, Tr(Str::BiosAddOwn), own, Tr(Str::BiosAddOwnLine2), true);
+
+	float hx = cx;
+	auto hint = [&](const char* key, const char* what) {
+		const float kpx = 24 * k, kw = m_fonts->Measure(key, kpx) + 36 * k, kh = 46 * k, hy = py + ph - 100 * k;
+		Fonts::AddRoundedRect(ui, hx, hy, kw, kh, kh * 0.5f, Rgba(1, 1, 1, 0.14f));
+		m_fonts->AddText(ui, key, hx + kw * 0.5f, hy + kh * 0.5f + 9 * k, kpx, hi, 0.45f, Fonts::Center);
+		hx += kw + 14 * k;
+		hx += m_fonts->AddText(ui, what, hx, hy + kh * 0.5f + 9 * k, kpx, lo, 0.20f) + 40 * k;
+	};
+	if (two)
+		hint("Left / Right", Tr(Str::BiosHintChoose));
+	hint("Cross", Tr(Str::BiosHintConfirm));
+	hint("Circle", Tr(Str::HintBack));
+	FadeRange(ui, begin, ui.size(), e);
 }
 
 
@@ -325,6 +563,7 @@ bool App::Step(int dir)
 		return false;
 	m_last_dir = dir > 0 ? 1 : -1; // 2.11: the backs ahead are fetched on this side first
 	m_selected = next;
+	m_moved = true; // fix180
 	m_flip_latched = false; // 2.11: a case turned over goes back when the shelf moves
 	m_select_time = m_time;
 	if (m_covers && m_index[static_cast<size_t>(m_selected)] >= 0) // live-22: the dump entry (kDumpIndex) isn't the service's
@@ -728,6 +967,7 @@ void App::InsertDumpEntry(const std::string& serial, const std::string& title, i
 	GameInfo g;
 	g.path = "@disc-dump"; // a sentinel path: this entry is never launched
 	g.serial = serial;
+	g.stem = DiscStem(serial); // gamedb (2026-10-30): the copy's name, so its sheet is the copy's and the disc's
 	g.title = disp;
 	Slot s;
 	CoverImage ph, sp;
@@ -770,6 +1010,7 @@ void App::RemoveDumpEntry()
 {
 	const int pos = DumpPos();
 	m_dump_on = false; // (the disc art is let go by PollDriveDisc once no entry wants it)
+	m_dump_mbps = 0.0; m_dump_eta = 0; m_dump_speed.clear(); // 179
 	if (pos < 0)
 	return;
 	Slot& s = m_slots[static_cast<size_t>(pos)];
@@ -802,6 +1043,9 @@ void App::PollDiscDump()
 	std::string serial, title;
 	int pct = -1;
 	bool active = false;
+	double mbps = 0.0; // 179
+	int eta = 0;       // 179 (seconds)
+	char speed[32] = {0}; // 179 ("8x"/"3.2x"/"-")
 	struct stat st;
 	// A file last written in the last 20 s: a live copy (every ~1% write refreshes its mtime). An older one is a copy that
 	// crashed; it is treated as finished so the entry doesn't linger.
@@ -820,6 +1064,9 @@ void App::PollDiscDump()
 						line[--len] = 0;
 					title = line;
 				}
+				char l3[160] = {0};
+				if (std::fgets(l3, sizeof(l3), f)) // 179: optional "rate=<MB/s> eta=<s> speed=<tag>"
+					std::sscanf(l3, "rate=%lf eta=%d speed=%31s", &mbps, &eta, speed);
 				active = true;
 			}
 			std::fclose(f);
@@ -836,9 +1083,19 @@ void App::PollDiscDump()
 		}
 		else
 		m_dump_pct = pct;
+		// 179: the live speed/time-left/drive-speed shown on the dump entry (Build)
+		m_dump_mbps = mbps;
+		m_dump_eta = eta;
+		m_dump_speed = (speed[0] && std::strcmp(speed, "-") != 0) ? speed : std::string();
 	}
 	else if (m_dump_on)
 		RemoveDumpEntry();
+}
+
+// gamedb (2026-10-30): the settings file stem of a disc's entries (AppConfig::disc_settings_stem), "" when unknown.
+std::string App::DiscStem(const std::string& serial) const
+{
+	return m_cfg.disc_settings_stem && !serial.empty() ? m_cfg.disc_settings_stem(serial) : std::string();
 }
 
 int App::DrivePos() const
@@ -854,6 +1111,7 @@ void App::InsertDriveEntry(const std::string& serial, const std::string& title)
 GameInfo g;
 g.path = "@disc-drive"; // a sentinel path: this entry is never launched
 g.serial = serial;
+g.stem = DiscStem(serial); // gamedb (2026-10-30): its sheet writes the file a start from the drive reads
 g.title = title.empty() ? std::string("PS2 disc") : title;
 Slot s;
 CoverImage ph, sp;
@@ -885,6 +1143,15 @@ m_drive_serial = serial;
 m_drive_title = m_games[0].title;
 EnsureDiscArt(serial);
 std::printf("[frontend] disc in the drive: %s (%s) is the first entry on the shelf\n", m_drive_title.c_str(), serial.c_str());
+// fix180: the game played last was this disc from the drive, and the shelf has not been moved since it opened: the disc's entry is picked
+if (!m_moved && !m_cfg.preselect_disc_serial.empty() && serial == m_cfg.preselect_disc_serial)
+{
+m_selected = 0;
+m_scroll = 0.0f;
+m_scroll_vel = 0;
+m_select_time = m_time;
+std::printf("[frontend] disc in the drive: it was played last, so it is picked\n");
+}
 std::fflush(stdout);
 }
 
@@ -947,12 +1214,14 @@ RemoveDriveEntry();
 void App::Update(double dt, const Input& in)
 {
 	m_time += dt;
+	UpdateQuitTick(); // 180: PS5SX2 closes a moment after the installer started
 	m_account.Poll(m_cfg.achievements);
 	PollGameAchievements();
 	const float fdt = static_cast<float>(std::min(dt, 0.1));
 	m_dump_spin += fdt; // live-22: the dump disc's rotation, advanced whether or not a dump is on
 	PollDiscAsk();
 	m_ask_anim += ((m_ask_on ? 1.0f : 0.0f) - m_ask_anim) * (1.0f - std::exp(-fdt * 16.0f));
+	m_bios_anim += ((m_bios_ask ? 1.0f : 0.0f) - m_bios_anim) * (1.0f - std::exp(-fdt * 16.0f)); // bioscheck
 
 	// 2.11: the search: what the settings page's box says, the PS5's keyboard while it is up, and the fades.
 	if (m_cfg.search_remote)
@@ -1002,6 +1271,11 @@ void App::Update(double dt, const Input& in)
 			m_launch_time = m_time;
 		if (m_time - m_launch_time > 0.6 && !m_game_achievements.busy)
 			m_done = true;
+	}
+	else if (m_bios_ask) // bioscheck: the BIOS question
+	{
+		UpdateBiosChoice(in);
+		m_prev = in;
 	}
 	else if (m_ask_on)
 	{
@@ -1116,7 +1390,7 @@ void App::Update(double dt, const Input& in)
 					std::fflush(stdout);
 					Sound(Sfx::Edge, 0.0f);
 				}
-				else if (BiosReady()) // vk-285-134
+				else if (BiosReady(BiosWait::Pick)) // vk-285-134; bioscheck: the BIOS question when there is none
 				{
 					if (m_cfg.game_achievements.cancel)
 						m_cfg.game_achievements.cancel();
@@ -1150,7 +1424,8 @@ void App::Update(double dt, const Input& in)
 			// vk-285-114: Square opens the selected game's options sheet (the settings for all games when there is no game).
 			else if (!m_qr_big && in.square && !m_prev.square && m_sheet_anim < 0.05f)
 			{
-			OpenSheet(m_games.empty() || m_index[static_cast<size_t>(m_selected)] < 0); // 2.11: a disc entry has no sheet of its own: the all-games one
+			// 2.11: a disc entry had no sheet of its own: the all-games one; gamedb (2026-10-30): it has, when it knows its settings file
+			OpenSheet(m_games.empty() || m_games[static_cast<size_t>(m_selected)].stem.empty());
 				m_chord_square_time = m_time; // pr9n: L1 right after makes it the account chord
 				Sound(Sfx::Move, 0.3f);
 			}
@@ -1448,6 +1723,7 @@ void App::Build(FrameDesc& f, const std::string& clock)
 	}
 	BuildTexturePackActivity(ui, margin, (m_cfg.achievements.state ? 350.0f : 290.0f) * k, k, accent); // 2026-10-05
 	BuildBiosLine(ui, W, k); // vk-285-134
+	BuildGameDbLine(ui, W, k); // gamedb (2026-10-30)
 
 	// The settings page's QR tile, bottom right (vk-285-50). The code is dark on a light tile, as
 	// cameras expect; neighbouring dark modules are merged into runs and grown by a pixel so the
@@ -1490,6 +1766,14 @@ void App::Build(FrameDesc& f, const std::string& clock)
 	FadeRange(ui, qr_begin, ui.size(), 1.0f - sheet_e); // vk-285-114: under the options sheet
 
 	const size_t title_begin = ui.size();
+	int scan_done = 0, scan_total = 0;
+	if (n > 0 && m_cfg.scan_progress && m_cfg.scan_progress(scan_done, scan_total))
+	{
+		// chdscan: a disc drive's entry came before the games: the scan's line goes above the shelf
+		char line[160];
+		std::snprintf(line, sizeof(line), Tr(Str::ShelfScanning), scan_done, scan_total);
+		m_fonts->AddText(ui, line, W * 0.5f, H * 0.12f, 44.0f * k, dim, 0.2f, Fonts::Center);
+	}
 	if (n > 0)
 	{
 		const GameInfo& g = m_games[static_cast<size_t>(m_selected)];
@@ -1511,8 +1795,29 @@ void App::Build(FrameDesc& f, const std::string& clock)
 		};
 		add(g.serial);
 		add(Region(g.region)); // vk-285-110: the region names in the PS5's language
-		if (m_index[static_cast<size_t>(m_selected)] == kDumpIndex) // live-22: the disc being copied, not a sized image
-			add("Copying " + std::to_string(m_dump_pct) + "%");
+		if (m_index[static_cast<size_t>(m_selected)] == kDumpIndex) // live-22 / 179: the disc being copied, with the live speed and the time left
+		{
+			char cp[48];
+			std::snprintf(cp, sizeof(cp), Tr(Str::CopyDumpPct), m_dump_pct);
+			add(cp);
+			if (m_dump_mbps > 0.05)
+			{
+				char r[32];
+				std::snprintf(r, sizeof(r), "%.1f MB/s", m_dump_mbps);
+				add(r);
+			}
+			if (m_dump_eta > 0)
+			{
+				char e[48];
+				if (m_dump_eta < 60)
+					std::snprintf(e, sizeof(e), "%s", Tr(Str::CopyEtaLessMin));
+				else
+					std::snprintf(e, sizeof(e), Tr(Str::CopyEtaMin), (m_dump_eta + 59) / 60);
+				add(e);
+			}
+			if (!m_dump_speed.empty())
+				add(m_dump_speed); // 179: the drive speed taken (8x / 3.2x)
+		}
 			else if (m_index[static_cast<size_t>(m_selected)] == kDriveIndex) // 2.11 (review): no size
 			add("In the drive");
 			else
@@ -1540,7 +1845,15 @@ void App::Build(FrameDesc& f, const std::string& clock)
 	}
 	else
 		{
-			if (m_search.applied.empty())
+			int scan_done = 0, scan_total = 0;
+			if (m_cfg.scan_progress && m_cfg.scan_progress(scan_done, scan_total))
+			{
+				// chdscan: the games come when the images not seen before have been read
+				char line[160];
+				std::snprintf(line, sizeof(line), Tr(Str::ShelfScanning), scan_done, scan_total);
+				m_fonts->AddText(ui, line, W * 0.5f, H * 0.5f, 64.0f * k, white, 0.4f, Fonts::Center);
+			}
+			else if (m_search.applied.empty())
 			{
 				// 2026-10-16: with games folders set, the empty shelf names the first of them, not /data/PCSX2/games (a language file
 				// without that path in its line is shown as it is)
@@ -1787,6 +2100,8 @@ void App::Build(FrameDesc& f, const std::string& clock)
 		BuildAccount(ui, W, H, k, accent);
 	if (m_ask_anim > 0.001f)
 		BuildDiscAsk(ui, W, H, k, accent);
+	if (m_bios_anim > 0.001f)
+		BuildBiosChoice(ui, W, H, k, accent); // bioscheck
 	BuildSearch(ui, W, H, k, accent); // 2.11: the search line and its keyboard, over everything but the disc question
 	f.ui_images = m_achievement_images; // 2.11: the texture changes among the UI vertices (badges, the disc being copied)
 }
@@ -1887,15 +2202,21 @@ namespace
 void App::OpenSheet(bool global)
 {
 	const GameInfo* g = (!global && !m_games.empty()) ? &m_games[static_cast<size_t>(m_selected)] : nullptr;
+	// gamedb (2026-10-30): an entry with no settings file name (a disc whose name isn't known) has no sheet of its own: L1 from the all-games
+	// sheet opened one that wrote settings/.ini, which no start reads (#bugs: a disc game ignored its own settings).
+	if (g && g->stem.empty())
+		g = nullptr;
 	m_sheet_global = g == nullptr;
 	if (m_sheet_global && m_cfg.game_achievements.cancel)
 		m_cfg.game_achievements.cancel();
 	m_sheet.SetTexturePackRow(static_cast<bool>(m_cfg.texture_packs)); // 2026-10-05
 	m_sheet.SetOnlinePatchRow(static_cast<bool>(m_cfg.online_patches)); // 2026-10-08
 	m_sheet.SetSystemMenuRow(m_cfg.system_menu);                        // 2026-10-08
+	m_sheet.SetUpdateRows(static_cast<bool>(m_cfg.updates) && m_cfg.own_tile_game.empty()); // 180: not in a game tile's copy (it updates the main app)
 	m_sheet.SetFolderRows(!m_cfg.folder_places.empty());                // vk-285-135
 	m_tile_row = HomeTileEligible(g);                                   // 2.12: the Home screen tile row (a game with a plain image file; the flag turns it on)
 	m_sheet.SetHomeTileRow(m_tile_row);
+	m_sheet.SetHideRow(!g || m_index[static_cast<size_t>(m_selected)] >= 0); // gamedb (2026-10-30): not on a disc entry's sheet
 	m_picker.open = false;
 	OptionsPaths paths = m_cfg.options;
 	if (!g || IsElfName(g->file.c_str())) // 2026-10-08: an ELF's Disc image row lists the shelf's disc images; vk-285-139: the Cheat disc row
@@ -2011,7 +2332,11 @@ void App::CloseSheet()
 	if (m_cfg.game_achievements.cancel)
 		m_cfg.game_achievements.cancel();
 	if (m_sheet.saved() > 0)
+	{
 		RefreshBadges();
+		if (m_sheet_global)
+			RefreshBios(); // bioscheck: PS5SX2/OpenBios may have changed
+	}
 	std::printf("[options] sheet closed (%d change(s) saved)\n", m_sheet.saved());
 	std::fflush(stdout);
 }
@@ -2220,7 +2545,7 @@ void App::UpdateSheet(double dt, const Input& in)
 			if (m_sheet.TakeSystemMenu())
 			{
 				CloseSheet();
-				if (BiosReady()) // vk-285-134: the PS2's own menu is the BIOS
+				if (BiosReady(BiosWait::SystemMenu)) // vk-285-134: the PS2's own menu is the BIOS (bioscheck: the question when there is none)
 				{
 					m_system_menu = true;
 					m_launching = true;
@@ -2229,6 +2554,15 @@ void App::UpdateSheet(double dt, const Input& in)
 				}
 			}
 		}
+		return;
+	}
+
+	// 180: the PS5SX2 group: System update (Cross looks; Cross twice installs a newer release) and Session logs (Cross, Left or Right switch it).
+	if (row.kind == OptionsSheet::Kind::SystemUpdate || row.kind == OptionsSheet::Kind::LogUpload)
+	{
+		const bool horizontal = (in.left && !m_prev.left) || (in.right && !m_prev.right);
+		if (pressed(in.cross, m_prev.cross) || (horizontal && row.kind == OptionsSheet::Kind::LogUpload))
+			UpdateRowPress(row, now);
 		return;
 	}
 
@@ -2293,11 +2627,155 @@ std::string App::OnlinePatchValue() const
 	return {};
 }
 
+// ---- 180: the sheet's PS5SX2 group: System update and Session logs (AI-assisted; see fe_update.h) -------------------
+// The rows' words come from fe_i18n (English until a table has them).
+
+namespace
+{
+std::string Say(Str id, const std::string& arg)
+{
+	char buf[1024];
+	std::snprintf(buf, sizeof(buf), Tr(id), arg.c_str());
+	return buf;
+}
+
+std::string ReleaseName(const ReleaseInfo& r)
+{
+	return r.title.empty() || r.title == r.tag ? r.tag : r.title + " (" + r.tag + ")";
+}
+} // namespace
+
+void App::UpdateRowPress(const OptionsSheet::Row& row, double now)
+{
+	if (!m_cfg.updates)
+		return;
+	auto status = [&](const std::string& text) {
+		m_sheet_status = text;
+		m_sheet_status_time = now;
+	};
+	if (row.kind == OptionsSheet::Kind::LogUpload)
+	{
+		const bool on = !m_cfg.updates.log_upload();
+		const bool ok = m_cfg.updates.set_log_upload(on);
+		status(ok ? std::string(Tr(on ? Str::LogsOn : Str::LogsOff)) : std::string("Couldn't change /data/PS5SX2-Installer/no-log-upload"));
+		std::printf("[options] session logs: %s%s\n", on ? "on" : "off", ok ? "" : " (failed)");
+		std::fflush(stdout);
+		Sound(ok ? Sfx::Move : Sfx::Edge, 0.3f);
+		return;
+	}
+	using S = UpdateStatus::State;
+	const UpdateStatus s = m_cfg.updates.status();
+	switch (s.state)
+	{
+		case S::Available:
+		case S::Interrupted:
+		case S::StartFailed: // the installer didn't start: Cross twice tries again
+			if (m_time > m_update_armed_until)
+			{
+				m_update_armed_until = m_time + 4.0;
+				status(Tr(Str::UpdatePressAgain));
+				Sound(Sfx::Move, 0.3f);
+				return;
+			}
+			m_update_armed_until = -1;
+			std::printf("[options] system update: install asked (%s, latest %s)\n", UpdateStateName(s.state), s.latest.tag.c_str());
+			std::fflush(stdout);
+			if (m_cfg.updates.install())
+			{
+				status(Tr(Str::UpdateStarted));
+				Sound(Sfx::Launch, 0.0f);
+			}
+			else
+			{
+				status(Say(Str::UpdateStartFailed, m_cfg.updates.status().error));
+				Sound(Sfx::Edge, 0.3f);
+			}
+			return;
+		case S::Checking:
+		case S::Starting:
+		case S::Started:
+			Sound(Sfx::Edge, 0.3f);
+			return;
+		default:
+			break;
+	}
+	m_update_armed_until = -1;
+	const bool started = m_cfg.updates.check(false);
+	std::printf("[options] system update: look %s\n", started ? "asked" : "already running");
+	std::fflush(stdout);
+	Sound(started ? Sfx::Move : Sfx::Edge, 0.3f); // the row's value says "Checking..." and then the answer
+}
+
+std::string App::UpdateRowValue(const OptionsSheet::Row& row) const
+{
+	if (!m_cfg.updates)
+		return {};
+	if (row.kind == OptionsSheet::Kind::LogUpload)
+		return Tr(m_cfg.updates.log_upload() ? Str::LogsOn : Str::LogsOff);
+	using S = UpdateStatus::State;
+	const UpdateStatus s = m_cfg.updates.status();
+	const bool armed = m_time <= m_update_armed_until;
+	switch (s.state)
+	{
+		case S::Idle: return Tr(Str::UpdateCheck);
+		case S::Checking: return Tr(Str::UpdateChecking);
+		case S::Current: return Say(Str::UpdateCurrent, s.latest.title.empty() ? s.latest.tag : s.latest.title);
+		case S::Newer: return Say(Str::UpdateNewer, s.latest.title.empty() ? s.latest.tag : s.latest.title);
+		case S::Available: return armed ? std::string(Tr(Str::UpdatePressAgain)) : Say(Str::UpdateAvailable, ReleaseName(s.latest));
+		case S::Failed: return Say(Str::UpdateFailed, s.error);
+		case S::Interrupted: return armed ? std::string(Tr(Str::UpdatePressAgain)) : std::string(Tr(Str::UpdateInterrupted));
+		case S::Starting: return Tr(Str::UpdateStarting);
+		case S::Started: return Tr(Str::UpdateStarted);
+		case S::StartFailed: return armed ? std::string(Tr(Str::UpdatePressAgain)) : Say(Str::UpdateStartFailed, s.error);
+	}
+	return {};
+}
+
+std::string App::UpdateRowHelp(const OptionsSheet::Row& row) const
+{
+	if (!m_cfg.updates)
+		return {};
+	if (row.kind == OptionsSheet::Kind::LogUpload)
+		return Tr(Str::LogsHelp);
+	using S = UpdateStatus::State;
+	const UpdateStatus s = m_cfg.updates.status();
+	switch (s.state)
+	{
+		case S::Available:
+		case S::StartFailed:
+			return s.latest.tag.empty() ? std::string(Tr(Str::UpdateHelpInterrupted)) : Say(Str::UpdateHelpAvailable, ReleaseName(s.latest));
+		case S::Interrupted: return Tr(Str::UpdateHelpInterrupted);
+		case S::Starting:
+		case S::Started: return Tr(Str::UpdateHelpStarted);
+		default: return Tr(Str::UpdateHelp);
+	}
+}
+
+void App::UpdateQuitTick()
+{
+	if (!m_cfg.updates || m_update_quit_done)
+		return;
+	if (m_update_quit_at < 0)
+	{
+		if (m_cfg.updates.status().state == UpdateStatus::State::Started)
+			m_update_quit_at = m_time + 3.0; // the notification is read; the installer waits for this process anyway
+		return;
+	}
+	if (m_time >= m_update_quit_at)
+	{
+		m_update_quit_done = true;
+		std::printf("[frontend] system update: the installer runs, PS5SX2 closes now\n");
+		std::fflush(stdout);
+		if (m_cfg.updates.quit)
+			m_cfg.updates.quit();
+	}
+}
+
 // ---- 2.12: the sheet's "Home screen tile" row (AI-assisted; see fe_gametile.h) ---------------------------------------
 // swordpdf: "add an option to add a game from the shelf to the xmb (square - and then option on) it should utilize the existing mounting scheme we have, we
 // should also be able to delete it, again, from the shelf". The row asks the PS5SX2 Disc Helper (one small file per press, in tiles_dir) to make a copy of this
 // app under a title ID of its own that starts this game from the home screen, and shows what the helper says about it. English like the rest of the sheet.
-// Nothing is read or written unless AppConfig::tiles_dir is set (the flag file flags/gametiles), and then only with the row shown or an ask pending.
+// Nothing is read or written unless AppConfig::tiles_dir is set (on by default; the flag file flags/gametile_off clears it), and then only with the row shown or an ask pending.
 
 int App::TileFocused() const
 {
@@ -2646,19 +3124,42 @@ std::string App::TexturePackHelp(const TexturePackStatus& s, int pick, const std
 // found instead under it. It lights up for a moment when a pick was refused.
 void App::BuildBiosLine(std::vector<UiVertex>& ui, float W, float k)
 {
+	if (!m_bios_missing && m_bios_open_in_use) // bioscheck: the open BIOS is named while games start with it
+	{
+		char note[160];
+		std::snprintf(note, sizeof(note), Tr(Str::BiosInUse), "OpenPS2BIOS (experimental)");
+		m_fonts->AddText(ui, note, W * 0.5f, 250.0f * k, 28.0f * k, Rgba(0.95f, 0.78f, 0.52f, 0.85f), 0.2f, Fonts::Center);
+		return;
+	}
 	if (!m_bios_missing)
 		return;
 	const float since = static_cast<float>(m_time - m_bios_refused);
 	const float flash = since >= 0.0f && since < 1.6f ? 1.0f - since / 1.6f : 0.0f;
-	const float w = 2000.0f * k, x = W * 0.5f - w * 0.5f, y = 222.0f * k, h = m_bios_problem.empty() ? 96.0f * k : 150.0f * k;
+	const float w = 2000.0f * k, x = W * 0.5f - w * 0.5f, y = 222.0f * k, h = m_bios_problem.empty() && !m_cfg.open_bios_bundled ? 96.0f * k : 150.0f * k;
 	Fonts::AddRoundedRect(ui, x, y, w, h, 24.0f * k, Rgba(0.42f + 0.25f * flash, 0.20f + 0.08f * flash, 0.04f, 0.88f));
 	char head[320];
 	std::snprintf(head, sizeof(head), Tr(Str::ShelfNoBios), m_cfg.bios_dir.c_str());
 	const float hpx = 40.0f * k, dpx = 32.0f * k;
 	m_fonts->AddText(ui, Fit(*m_fonts, head, hpx, w - 60.0f * k).c_str(), W * 0.5f, y + 60.0f * k, hpx, Rgba(1, 1, 1), 0.4f, Fonts::Center);
-	if (!m_bios_problem.empty())
-		m_fonts->AddText(ui, Fit(*m_fonts, m_bios_problem, dpx, w - 60.0f * k).c_str(), W * 0.5f, y + 116.0f * k, dpx,
+	// bioscheck: with the open BIOS in the build, the line says a pick asks what to do (rather than what was found instead)
+	const std::string second = m_cfg.open_bios_bundled ? std::string(Tr(Str::ShelfNoBiosChoice)) : m_bios_problem;
+	if (!second.empty())
+		m_fonts->AddText(ui, Fit(*m_fonts, second, dpx, w - 60.0f * k).c_str(), W * 0.5f, y + 116.0f * k, dpx,
 			Rgba(1.0f, 0.86f, 0.62f), 0.2f, Fonts::Center);
+}
+
+// gamedb (2026-10-30, AI-assisted): resources/GameIndex.yaml is missing or unusable: one line under where the BIOS line goes (below it when
+// that is up), so the player knows the folder is incomplete and that the installer repairs it. Games still get their fixes (the eboot's copy).
+void App::BuildGameDbLine(std::vector<UiVertex>& ui, float W, float k)
+{
+	m_gamedb_note_shown = !m_cfg.gamedb_missing.empty();
+	if (!m_gamedb_note_shown)
+		return;
+	char note[400];
+	std::snprintf(note, sizeof(note), Tr(Str::ShelfNoGameDb), m_cfg.gamedb_missing.c_str());
+	const float y = m_bios_missing ? 200.0f : m_bios_open_in_use ? 296.0f : 250.0f; // with the BIOS box up, just above it (under it is the case)
+	const float px = 28.0f * k;
+	m_fonts->AddText(ui, Fit(*m_fonts, note, px, 2000.0f * k).c_str(), W * 0.5f, y * k, px, Rgba(0.95f, 0.78f, 0.52f, 0.85f), 0.2f, Fonts::Center);
 }
 
 void App::BuildTexturePackActivity(std::vector<UiVertex>& ui, float x, float y, float k, uint32_t accent)
@@ -3003,6 +3504,9 @@ void App::BuildSheet(std::vector<UiVertex>& ui, float W, float H, float k, uint3
 		const bool tile_row = r.kind == OptionsSheet::Kind::HomeTile; // 2.12: the helper's word for the game's tile (Off, Adding..., On, ...)
 		if (tile_row)
 			value = HomeTileValue();
+		const bool update_row = r.kind == OptionsSheet::Kind::SystemUpdate; // 180: no arrows (Cross looks and installs)
+		if (update_row || r.kind == OptionsSheet::Kind::LogUpload)
+			value = UpdateRowValue(r);
 		// 2026-10-05: the HD texture pack row shows the pack, the download's progress or the installed pack.
 		const bool pack_row = r.kind == OptionsSheet::Kind::TexturePack && m_cfg.texture_packs && !m_games.empty();
 		TexturePackStatus pack;
@@ -3024,7 +3528,7 @@ void App::BuildSheet(std::vector<UiVertex>& ui, float W, float H, float k, uint3
 		                        r.kind == OptionsSheet::Kind::TexturesFolder || r.kind == OptionsSheet::Kind::NfsShares;
 		if (folder_row && focused)
 			value += "  \xE2\x80\xBA";
-		const bool arrows = focused && !action && pick_arrows && !folder_row && !tile_row;
+		const bool arrows = focused && !action && pick_arrows && !folder_row && !tile_row && !update_row;
 
 		const float value_room = bw * (pack_row ? 0.68f : 0.46f); // 2026-10-05: the pack row's label is short, its value long
 		// vk-285-116: a label or a value that starts with a button's symbol ("<glyph>  Cross", the Controls tab): the symbol
@@ -3108,6 +3612,8 @@ void App::BuildSheet(std::vector<UiVertex>& ui, float W, float H, float k, uint3
 		}
 		if (focus_row.kind == OptionsSheet::Kind::HomeTile) // 2.12
 			help = HomeTileHelp();
+		if (focus_row.kind == OptionsSheet::Kind::SystemUpdate || focus_row.kind == OptionsSheet::Kind::LogUpload) // 180
+			help = UpdateRowHelp(focus_row);
 		float hy = list_bottom + 110 * k;
 		for (const std::string& line : Wrap(*m_fonts, help, 32 * k, inner, 4))
 		{
@@ -3760,7 +4266,7 @@ void App::PollDiscAsk()
 		return;
 	std::string title, serial;
 	const bool pending = m_cfg.disc_ask_poll(title, serial);
-	if (pending && !m_ask_on && !m_launching)
+	if (pending && !m_ask_on && !m_launching && !m_bios_ask)
 	{
 		m_ask_on = true;
 		m_ask_title = title;

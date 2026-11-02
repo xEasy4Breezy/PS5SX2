@@ -344,12 +344,13 @@ SHIM_SRCS := ./orbis-shims/ProsperoInput.cpp ./orbis-shims/ProsperoCDVD.cpp \
   ./orbis-shims/ProsperoHenJailbreak.cpp \
   ./orbis-shims/ps5_shaderc.cpp ./orbis-shims/orbis_vk.cpp ./orbis-shims/orbis_eeprof.cpp \
   ./orbis-shims/game_select.cpp ./orbis-shims/orbis_paths.cpp ./orbis-shims/orbis_memprobe.cpp \
-  ./orbis-shims/ProsperoKbdMouse.cpp ./orbis-shims/ProsperoNotify.cpp ./orbis-shims/ProsperoImeRelay.cpp ./orbis-shims/ProsperoRelaunch.cpp ./orbis-shims/ProsperoUsbPad.cpp ./orbis-shims/ProsperoMic.cpp ./orbis-shims/ProsperoDiscDump.cpp ./orbis-shims/ProsperoDiscSpeed.cpp \
+  ./orbis-shims/ProsperoKbdMouse.cpp ./orbis-shims/ProsperoNotify.cpp ./orbis-shims/ProsperoImeRelay.cpp ./orbis-shims/ProsperoTexWriter.cpp ./orbis-shims/ProsperoRelaunch.cpp ./orbis-shims/ProsperoUsbPad.cpp ./orbis-shims/ProsperoMic.cpp ./orbis-shims/ProsperoDiscDump.cpp ./orbis-shims/ProsperoDiscSpeed.cpp \
   ./orbis-shims/ProsperoHTTPDownloader.cpp ./orbis-shims/ProsperoHTTPConsole.cpp ./orbis-shims/ProsperoAchievements.cpp \
   ./orbis-shims/ProsperoAchievementBrowser.cpp \
-  ./orbis-shims/orbis_gs_shaders.cpp \
+  ./orbis-shims/orbis_gs_shaders.cpp ./orbis-shims/orbis_gamedb.cpp \
   ./orbis-shims/ps5_framegen.cpp ./orbis-shims/OrbisVideoOutMode.cpp \
-  ./orbis-shims/OrbisNfs.cpp ./orbis-shims/OrbisDiscDrive.cpp ./orbis-shims/OrbisIOCtlSrc.cpp
+  ./orbis-shims/OrbisNfs.cpp ./orbis-shims/OrbisDiscDrive.cpp ./orbis-shims/OrbisIOCtlSrc.cpp ./orbis-shims/OrbisHelperAutoload.cpp \
+  ./orbis-shims/OrbisInstallerStart.cpp
 
 SHIM_ASM := ./orbis-shims/ProsperoTLS.S
 
@@ -359,12 +360,13 @@ FE_DIR := ../frontend
 FE_SRCS := $(FE_DIR)/fe_app.cpp $(FE_DIR)/fe_covers.cpp $(FE_DIR)/fe_games.cpp \
   $(FE_DIR)/fe_renderer.cpp $(FE_DIR)/fe_sound.cpp $(FE_DIR)/fe_text.cpp $(FE_DIR)/fe_vk.cpp $(FE_DIR)/fe_ps5.cpp \
   $(FE_DIR)/fe_web.cpp $(FE_DIR)/fe_i18n.cpp $(FE_DIR)/fe_settings.cpp $(FE_DIR)/fe_options.cpp \
-  $(FE_DIR)/fe_texpacks.cpp $(FE_DIR)/fe_https.cpp $(FE_DIR)/fe_https_ps5.cpp \
-  $(FE_DIR)/fe_patchdl.cpp $(FE_DIR)/fe_bios.cpp
+  $(FE_DIR)/fe_texpacks.cpp $(FE_DIR)/fe_texwrite.cpp $(FE_DIR)/fe_https.cpp $(FE_DIR)/fe_https_ps5.cpp \
+  $(FE_DIR)/fe_patchdl.cpp $(FE_DIR)/fe_bios.cpp $(FE_DIR)/fe_update.cpp
 # vk-285-50: Project Nayuki's QR Code generator (MIT, C) for the shelf's QR tile, and the files
 # fe_ps5.cpp embeds from frontend/assets (the settings page, its icons, Font Awesome's brands font).
 FE_CSRCS := $(FE_DIR)/third_party/qrcodegen/qrcodegen.c $(FE_DIR)/fe_sevenzip.c
-FE_ASSETS := $(wildcard $(FE_DIR)/assets/web/*) $(wildcard $(FE_DIR)/assets/fonts/*.otf) $(FE_DIR)/assets/presets.ini $(FE_DIR)/assets/hd-pack-sources.json $(FE_DIR)/assets/launchbox-covers.txt
+FE_ASSETS := $(wildcard $(FE_DIR)/assets/web/*) $(wildcard $(FE_DIR)/assets/fonts/*.otf) $(FE_DIR)/assets/presets.ini $(FE_DIR)/assets/hd-pack-sources.json $(FE_DIR)/assets/launchbox-covers.txt \
+  $(FE_DIR)/assets/openps2bios/OpenPS2BIOS-0.5.bin $(FE_DIR)/assets/openps2bios/LICENSE
 FE_HDRS := $(wildcard $(FE_DIR)/*.h) $(FE_DIR)/fe_shaders.inc $(FE_DIR)/third_party/qrcodegen/qrcodegen.h $(FE_ASSETS)
 
 SRCS := $(SRCS) $(PCSX2)/pcsx2/USB/usb-mic/usb-mic.cpp \
@@ -523,6 +525,13 @@ $(OBJDIR)/shim/orbis-shims/orbis_gs_shaders.o: ./orbis-shims/orbis_gs_shaders.cp
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -DORBIS_GS_SHADER_DIR=\"$(abspath $(PCSX2)/bin/resources/shaders)\" -c $< -o $@
 
+# gamedb (2026-10-30, AI-assisted): PCSX2's game database, embedded from bin/resources/GameIndex.yaml (.incbin), for a console whose
+# resources folder lacks it (include-orbis/OrbisGameDb.h). Listed so an edited database rebuilds the object.
+ORBIS_GAMEDB_YAML := $(abspath $(PCSX2)/bin/resources/GameIndex.yaml)
+$(OBJDIR)/shim/orbis-shims/orbis_gamedb.o: ./orbis-shims/orbis_gamedb.cpp ./include-orbis/OrbisGameDb.h $(ORBIS_GAMEDB_YAML)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -DORBIS_GAMEDB_FILE=\"$(ORBIS_GAMEDB_YAML)\" -c $< -o $@
+
 # 2026-10-05 (AI-assisted): the notification relay payload (notify-relay/notify_relay.c), built with the payload SDK's
 # own link (it imports libSceNotification) and embedded in ProsperoNotify.o (.incbin): PS5SX2's process can't load
 # libSceNotification on 11.40/12.00, so rich toasts go through the console's ELF loader (see ProsperoNotify.cpp).
@@ -547,12 +556,25 @@ $(OBJDIR)/shim/orbis-shims/ProsperoImeRelay.o: ./orbis-shims/ProsperoImeRelay.cp
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -DORBIS_IME_RELAY_ELF=\"$(abspath $(IME_RELAY_ELF))\" -c $< -o $@
 
+# 2026-10-29 (AI-assisted): the HD texture packs' writer payload (tex-writer/tex_writer.c), the same way, embedded in ProsperoTexWriter.o: a process
+# of its own writes the packs' downloads and pack files, because the console holds a title's own writes to ~2 MiB/s after its first ~1.3 GiB
+# (frontend/fe_texwrite.h). Plain libc (sockets, openat, pwrite): no -l flags. Check `readelf -h` for a non-zero entry point (the llvm-18 view,
+# reference-eboot-build-pipeline).
+TEX_WRITER_ELF := $(OBJDIR)/tex-writer/tex_writer.elf
+$(TEX_WRITER_ELF): ./tex-writer/tex_writer.c $(FE_DIR)/fe_texwrite_proto.h
+	@mkdir -p $(dir $@)
+	$(CC) -Wall -Werror -O2 -I$(FE_DIR) -o $@ $<
+	$(PS5_PAYLOAD_SDK)/bin/prospero-strip $@
+$(OBJDIR)/shim/orbis-shims/ProsperoTexWriter.o: ./orbis-shims/ProsperoTexWriter.cpp $(TEX_WRITER_ELF) $(FE_DIR)/fe_texwrite.h
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -DORBIS_TEX_WRITER_ELF=\"$(abspath $(TEX_WRITER_ELF))\" -c $< -o $@
+
 # 2.11 (AI-assisted): the relaunch payload (relaunch/relaunch.c), the same way: "back to the menu" (L1 + R1 + Touch) closes the app
 # the plain way (LoadExec("exit")) and this payload, started through the console's ELF loader before the close, starts the main app
 # again afterwards (see ProsperoRelaunch.cpp, orbis-shims/OrbisLeavePlan.h). No -l flags: it looks its system calls up by name (dlsym).
 # An ELF with no entry point has no C runtime: build it with the llvm-18 view (reference-eboot-build-pipeline) and check `readelf -h`.
 RELAUNCH_ELF := $(OBJDIR)/relaunch/relaunch.elf
-$(RELAUNCH_ELF): ./relaunch/relaunch.c
+$(RELAUNCH_ELF): ./relaunch/relaunch.c ./relaunch/relaunch_guard.h
 	@mkdir -p $(dir $@)
 	$(CC) -Wall -Werror -O2 -o $@ $<
 	$(PS5_PAYLOAD_SDK)/bin/prospero-strip $@
@@ -598,3 +620,10 @@ clean:
 	rm -rf $(OBJDIR) objects.txt
 
 .PHONY: all clean
+
+# fix181 (AI-assisted): OPENBIOS_EMBED=0 leaves OpenPS2BIOS (4 MB) out of the eboot; the package then needs PPSA99203/openps2bios/OpenPS2BIOS-0.5.bin and
+# LICENSE (fe_ps5.cpp reads them on first use). For the console test of the slow "back to the menu" exec (180's eboot is 4.4 MB bigger than 179's).
+OPENBIOS_EMBED ?= 1
+ifeq ($(OPENBIOS_EMBED),0)
+$(OBJDIR)/frontend/fe_ps5.o: CXXFLAGS += -DFE_OPEN_BIOS_FILE
+endif

@@ -20,11 +20,19 @@
 #include "fe_https.h"
 #include "fe_texpacks.h"
 #include "fe_patchdl.h" // 2026-10-08
+#include "fe_update.h"  // 180: System update and Session logs
+#include "ps5/coreorbis/orbis-shims/OrbisInstallerLaunch.h" // 180: OrbisStartUpdateInstaller
+#include "OrbisExit.h" // 180: OrbisExitApp, once the installer runs
 #include "fe_vk.h"
 #include "fe_web.h"
 #include "ps5/coreorbis/orbis-shims/ProsperoNotify.h" // 2026-10-05: the texture packs' popup
 #include "OrbisPaths.h" // live-22: OrbisLogPath for the disc-dump progress file the shelf shows
+#include "OrbisGameDb.h" // gamedb (2026-10-30): the eboot's GameIndex.yaml behind resources/
+#include "fe_discsettings.h" // gamedb (2026-10-30): a disc's settings file
+#include "ps5/coreorbis/orbis-shims/ProsperoDiscDump.h" // gamedb (2026-10-30): OrbisDiscSettingsStem
+#include "ps5/coreorbis/orbis-shims/OrbisDiscDrive.h" // gamedb (2026-10-30): SafeSerial
 #include "ps5/coreorbis/orbis-shims/ProsperoImeRelay.h" // 2.11: the keyboard through the ELF loader's payload (experiment, flags/imerelay)
+#include "ps5/coreorbis/orbis-shims/ProsperoTexWriter.h" // 2026-10-29: the texture packs' writer process
 #ifdef PS5SX2_ACHIEVEMENTS
 #include "ps5/coreorbis/orbis-shims/ProsperoAchievements.h"
 #include "pcsx2/Achievements.h"
@@ -167,6 +175,64 @@ FE_INCBIN_ASSET(fe_presets, "presets.ini");
 FE_INCBIN_ASSET(fe_hd_sources, "hd-pack-sources.json");
 // 2.11: LaunchBox's art by PS2 serial (fe_launchbox.h; made by tools/make_launchbox_covers.py).
 FE_INCBIN_ASSET(fe_launchbox, "launchbox-covers.txt");
+// bioscheck (2026-10-29): OpenPS2BIOS 0.5, the open-source BIOS PS5SX2 ships (Tamariba Devs, MIT), and its licence.
+// fix181: FE_OPEN_BIOS_FILE (make OPENBIOS_EMBED=0): not in the eboot but a file in the app's folder (PPSA99203/openps2bios/), read on first use. A
+// console test for the slow "back to the menu" exec: since 180 the eboot is 44.3 MB (the 4 MB BIOS embedded) against 39.9 MB on 177/179, and the exec of
+// the app's own eboot went from about 1 s (177: median 0.98 s, 303 exits) to 3.5 s or never (180/181).
+#ifndef FE_OPEN_BIOS_FILE
+FE_INCBIN_ASSET(fe_open_bios, "openps2bios/OpenPS2BIOS-0.5.bin");
+FE_INCBIN_ASSET(fe_open_bios_licence, "openps2bios/LICENSE");
+extern "C" const uint8_t fe_open_bios[], fe_open_bios_end[], fe_open_bios_licence[], fe_open_bios_licence_end[];
+#endif
+
+bool orbis_frontend_open_bios_image(const unsigned char** data, size_t* size, const unsigned char** licence, size_t* licence_size)
+{
+#ifdef FE_OPEN_BIOS_FILE
+	static std::vector<uint8_t> s_bios, s_licence;
+	static bool s_looked = false;
+	if (!s_looked)
+	{
+		s_looked = true;
+		static const char* const kDirs[] = {"/data/homebrew/PPSA99203/openps2bios", "/app0/openps2bios"};
+		auto read_all = [](const std::string& path, std::vector<uint8_t>& out, size_t max) {
+			out.clear();
+			FILE* f = std::fopen(path.c_str(), "rb");
+			if (!f)
+				return false;
+			uint8_t buf[65536];
+			size_t n;
+			while ((n = std::fread(buf, 1, sizeof(buf), f)) > 0 && out.size() <= max)
+				out.insert(out.end(), buf, buf + n);
+			std::fclose(f);
+			return !out.empty() && out.size() <= max;
+		};
+		for (const char* dir : kDirs)
+		{
+			if (read_all(std::string(dir) + "/OpenPS2BIOS-0.5.bin", s_bios, 4u << 20) && s_bios.size() == (4u << 20))
+			{
+				read_all(std::string(dir) + "/LICENSE", s_licence, 64u << 10);
+				std::printf("[bios] OpenPS2BIOS read from %s (not in the eboot: OPENBIOS_EMBED=0)\n", dir);
+				break;
+			}
+			s_bios.clear();
+		}
+		if (s_bios.empty())
+			std::printf("[bios] OpenPS2BIOS: not in the eboot (OPENBIOS_EMBED=0) and no openps2bios/OpenPS2BIOS-0.5.bin in the app's folder\n");
+		std::fflush(stdout);
+	}
+	*data = s_bios.data();
+	*size = s_bios.size();
+	*licence = s_licence.data();
+	*licence_size = s_licence.size();
+	return *size > 0;
+#else
+	*data = fe_open_bios;
+	*size = static_cast<size_t>(fe_open_bios_end - fe_open_bios);
+	*licence = fe_open_bios_licence;
+	*licence_size = static_cast<size_t>(fe_open_bios_licence_end - fe_open_bios_licence);
+	return *size > 0;
+#endif
+}
 extern "C" const uint8_t fe_font_brands[], fe_font_brands_end[], fe_web_page[], fe_web_page_end[], fe_web_discord[],
 	fe_web_discord_end[], fe_web_x[], fe_web_x_end[], fe_presets[], fe_presets_end[], fe_hd_sources[], fe_hd_sources_end[], fe_launchbox[],
 	fe_launchbox_end[];
@@ -536,6 +602,7 @@ struct TexHttp
 TexHttp g_texhttp;
 TexHttp g_patchhttp("pcsx2-patches", "patches"); // 2026-10-08: the online patches' own client (fe_patchdl.h)
 TexHttp g_coverhttp("pcsx2-covers", "covers");   // 2026-10-10: the shelf's cover downloads (CoverGet)
+TexHttp g_updhttp("pcsx2-update", "update");     // 180: the System update row's look at GitHub (fe_update.h)
 
 // 2026-10-10 (AI-assisted): the shelf's cover downloads, after the jailbreak, over our own HTTPS. libSceHttp2 fails there
 // (0x8095F00C; texnet6 fetched raw.githubusercontent.com with this client on the console), so the shelf's first download
@@ -1623,12 +1690,26 @@ extern "C" void orbis_event_log(const char* line)
 		g_event_busy.store(false, std::memory_order_release);
 }
 
+namespace
+{
+// gamedb (2026-10-30, AI-assisted): the game database for the shelf and the page: resources/GameIndex.yaml, else the eboot's own copy
+// (OrbisGameDb.h), so a console without the resources folder still gets the games' names and their hardware fixes rows.
+void UseGameDb(const OrbisFrontendPaths& paths)
+{
+	const char* data = nullptr;
+	size_t size = 0;
+	OrbisBuiltinGameDb(&data, &size);
+	SetGameDbFallback(data, size);
+	SetGameDbFile(paths.gamedb_file);
+}
+} // namespace
+
 bool orbis_web_start(const OrbisFrontendPaths& paths, const char* build_tag)
 {
 	if (g_web)
 		return true;
 	SetSerialCacheFile(paths.serial_cache); // vk-285-108
-	SetGameDbFile(paths.gamedb_file);       // vk-285-113
+	UseGameDb(paths);                       // vk-285-113; gamedb (2026-10-30): with the eboot's copy behind the file
 	SetShareRoots(paths.share_roots);       // vk-285-156
 	WebConfig cfg;
 	cfg.game_dirs = ScanRoots(paths); // 2026-10-16: the same folders as the shelf (games/, the top folder, the drives; or only the folders set)
@@ -1647,9 +1728,9 @@ bool orbis_web_start(const OrbisFrontendPaths& paths, const char* build_tag)
 	cfg.logs_dir = paths.logs_dir;
 	cfg.top_dir = paths.top_dir;
 	cfg.memcards_dir = paths.memcards_dir; // vk-285-113
-	// 2.12: a game's tile on the PS5 home screen (the page's row; the PS5SX2 Disc Helper makes it): OFF unless the flag file flags/gametiles is there (the helper
-	// has the same switch), and flags/nogametiles wins.
-	cfg.tiles_dir = OrbisFlag("gametiles") && !OrbisFlag("nogametiles") ? paths.top_dir + "/tiles" : std::string();
+	// 2.12 / 179: a game's tile on the PS5 home screen (the page's row; the PS5SX2 Disc Helper makes it): ON by default (no flag file needed), the
+	// helper has the same default; the flag file flags/gametile_off switches it off in both and wins.
+	cfg.tiles_dir = !OrbisFlag("gametile_off") ? paths.top_dir + "/tiles" : std::string();
 	cfg.own_tile_game = orbis_own_tile_game();
 	cfg.report_header = paths.report_header;
 	cfg.test_build = paths.test_build;
@@ -1740,12 +1821,37 @@ int orbis_frontend_prefetch_covers(const OrbisFrontendPaths& paths, double budge
 		return 0;
 	const double t0 = Now();
 	SetSerialCacheFile(paths.serial_cache); // vk-285-108
-	SetGameDbFile(paths.gamedb_file);       // vk-285-113
+	UseGameDb(paths);                       // vk-285-113; gamedb (2026-10-30): with the eboot's copy behind the file
+	SetShareRoots(paths.share_roots);       // chdscan: OnNetworkShare below
 	std::vector<GameInfo> games = ScanGames(ScanRoots(paths), paths.scan_subfolders); // test build 1: USB drives, when visible here
+	// chdscan (AI-assisted): this all runs before the shelf, on a black screen. A PS5 Pro tester's 390 games on a USB drive: 30.4 s of
+	// cover downloads before the shelf at each start until the covers were all there (77 and 96 a start; 2026-10-30), and a first start
+	// read every new image here. The shelf fetches the covers of games on USB drives and NFS shares itself, in the background
+	// (CoverConfig::download_usb_only; downloads after the jailbreak work since 2026-10-10: 23 of 25 in the reports looked at), so those
+	// are left to it (flags/prefetchusb: fetched here too, as before), and the images not read before are read here for at most 2 s (the
+	// shelf reads the rest while it shows how far it got).
+	const bool usb_here = OrbisFlag("prefetchusb");
+	int left_to_shelf = 0, unread = 0;
 	for (GameInfo& g : games)
-		g.serial = ReadSerial(g); // 2.02: through the serial cache, keyed by what ScanGames already has
+	{
+		if (!usb_here && (OnUsb(g.path) || OnNetworkShare(g.path)))
+		{
+			left_to_shelf++;
+			continue;
+		}
+		std::string known;
+		if (KnownSerial(g, known))
+			g.serial = known;
+		else if (Now() - t0 < 2.0)
+			g.serial = ReadSerial(g); // 2.02: through the serial cache, keyed by what ScanGames already has
+		else
+			unread++;
+	}
 	// Test build 1: the USB games seen after the jailbreak last time (the drives may not be visible here).
-	const int listed = AddUsbListGames(paths.usb_list, games, RootsSignature(paths));
+	const int listed = usb_here ? AddUsbListGames(paths.usb_list, games, RootsSignature(paths)) : 0;
+	if (left_to_shelf > 0 || unread > 0)
+		std::printf("[frontend] prefetch: %d game(s) on USB drives or NFS shares left to the shelf's own downloads, %d image(s) not read in "
+					"time (the shelf reads them)\n", left_to_shelf, unread);
 	CoverConfig cc;
 	cc.manual_dir = paths.covers_dir;
 	cc.cache_dir = paths.cache_dir;
@@ -1776,6 +1882,10 @@ int orbis_frontend_prefetch_covers(const OrbisFrontendPaths& paths, double budge
 static std::mutex g_launch_lock;
 static std::string g_launch_request; // under g_launch_lock
 static bool g_shelf_up = false;      // under g_launch_lock
+// bioscheck: the shelf has no BIOS (App::BiosMissing, each frame): a launch asked from outside is not taken but kept here for the shelf's
+// BIOS question (the disc watcher then leaves the disc alone, or asks again for a finished copy). Under g_launch_lock.
+static bool g_shelf_no_bios = false;
+static std::string g_bios_refused_request;
 // 2.04: the question about a disc just put in (orbis_frontend_ask_disc), under g_launch_lock.
 static std::string g_ask_title, g_ask_serial;
 static bool g_ask_pending = false; // asked and not answered
@@ -1794,6 +1904,11 @@ bool orbis_frontend_request_launch(const std::string& path)
 	std::lock_guard<std::mutex> lock(g_launch_lock);
 	if (!g_shelf_up)
 		return false;
+	if (g_shelf_no_bios) // bioscheck
+	{
+		g_bios_refused_request = path;
+		return false;
+	}
 	g_launch_request = path;
 	return true;
 }
@@ -1870,6 +1985,129 @@ static void SetShelfUp(bool up)
 		}
 		}
 
+// chdscan (AI-assisted): the shelf's game list made ready: each image's serial (the cache files, else the image), its title from the game
+// database, its badges, whether it can be read; logged as before; sorted. On a thread of its own when images not seen before are to be
+// read (Start with `unread` > 0), so the shelf can come up meanwhile (AppConfig::scan_progress, App::SetGames). The destructor waits for it.
+class ShelfScan
+{
+public:
+	ShelfScan(const OrbisFrontendPaths& paths, double t0)
+		: m_paths(paths)
+		, m_t0(t0)
+	{
+	}
+	~ShelfScan()
+	{
+		if (m_thread_started)
+			pthread_join(m_thread, nullptr);
+	}
+
+	void Start(std::vector<GameInfo> games, int unread)
+	{
+		m_games = std::move(games);
+		m_total = unread;
+		if (unread == 0)
+		{
+			Run();
+			return;
+		}
+		pthread_attr_t attr;
+		pthread_attr_init(&attr);
+		pthread_attr_setstacksize(&attr, 1024 * 1024); // libchdr's codecs, as the cover service's threads
+		m_thread_started = pthread_create(&m_thread, &attr, &ShelfScan::ThreadMain, this) == 0;
+		pthread_attr_destroy(&attr);
+		if (!m_thread_started)
+			Run();
+	}
+
+	bool Done() const { return m_done.load(std::memory_order_acquire); }
+
+	// Up to `ms` (forever when negative); true when the scan is done.
+	bool Wait(int ms)
+	{
+		for (int waited = 0; !Done() && (ms < 0 || waited < ms); waited += 5)
+			usleep(5000);
+		return Done();
+	}
+
+	// The images read so far of those not seen before; false once the scan is done.
+	bool Progress(int& done, int& total) const
+	{
+		done = m_read.load(std::memory_order_relaxed);
+		total = m_total;
+		return !Done();
+	}
+
+	// The list, once Done().
+	std::vector<GameInfo> Take()
+	{
+		if (m_thread_started)
+		{
+			pthread_join(m_thread, nullptr);
+			m_thread_started = false;
+		}
+		return std::move(m_games);
+	}
+
+private:
+	static void* ThreadMain(void* self)
+	{
+		static_cast<ShelfScan*>(self)->Run();
+		return nullptr;
+	}
+
+	void Run()
+	{
+		const OrbisFrontendPaths& paths = m_paths;
+		int on_usb = 0, on_nfs = 0;
+		for (GameInfo& g : m_games)
+		{
+			std::string what;
+			if (!KnownSerial(g, g.serial, &what))
+			{
+				g.serial = ReadSerial(g, &what); // 2.02: through the serial cache, keyed by what ScanGames already has
+				m_read.fetch_add(1, std::memory_order_relaxed);
+			}
+			// vk-285-113: a CHD (or an ISO) named after its file shows the game's name from the game database.
+			const std::string file_title = g.title;
+			const bool renamed = ApplyGameDbTitle(g);
+			ReadBadges(g, paths.settings_dir, paths.gs_ini, paths.patches_dir);
+			on_usb += OnUsb(g.path) ? 1 : 0;
+			on_nfs += OnNetworkShare(g.path) ? 1 : 0;
+			if (renamed)
+				std::printf("[frontend] %s: titled \"%s\" (the file name gave \"%s\")\n", g.file.c_str(), g.title.c_str(), file_title.c_str());
+			// Test build 1: the size too (a disc image of an odd size is often a bad dump), and the folder.
+			std::printf("[frontend] %s | %s | %s | %llu bytes | %s\n", g.file.c_str(), g.serial.empty() ? "no serial" : g.serial.c_str(),
+				g.title.c_str(), static_cast<unsigned long long>(g.bytes), g.path.substr(0, g.path.rfind('/')).c_str());
+			// vk-285-109: a CHD without a serial says what it is (chdscan: from the cache file when it was read before).
+			if (g.serial.empty())
+			{
+				if (!what.empty())
+					std::printf("[frontend]   chd: %s\n", what.c_str());
+				// vk-285-134: libchdr's "invalid file/data" (or a version it doesn't read) is a damaged image; a CHD that needs
+				// its parent isn't (PCSX2 finds the parent itself).
+				const std::string cant = "libchdr can't open it: ";
+				if (what.rfind(cant, 0) == 0 && what.find("parent") == std::string::npos)
+					g.damaged = what.substr(cant.size());
+			}
+		}
+		SortGames(m_games); // vk-285-113: by the titles the game database may have changed
+		std::printf("[frontend] %zu disc image(s), %d on USB, %d on NFS shares, scanned in %.0f ms (%d image(s) read, the rest from the cache files)\n",
+			m_games.size(), on_usb, on_nfs, (Now() - m_t0) * 1000.0, m_read.load());
+		std::fflush(stdout);
+		m_done.store(true, std::memory_order_release);
+	}
+
+	const OrbisFrontendPaths& m_paths;
+	const double m_t0;
+	std::vector<GameInfo> m_games;
+	int m_total = 0;
+	std::atomic<int> m_read{0};
+	std::atomic<bool> m_done{false};
+	pthread_t m_thread{};
+	bool m_thread_started = false;
+};
+
 std::string orbis_frontend_run(const OrbisFrontendPaths& paths, const char* build_tag, bool* ran)
 {
 	*ran = false;
@@ -1880,49 +2118,45 @@ std::string orbis_frontend_run(const OrbisFrontendPaths& paths, const char* buil
 		std::fflush(stdout);
 	};
 	SetSerialCacheFile(paths.serial_cache); // vk-285-108
-	SetGameDbFile(paths.gamedb_file);       // vk-285-113
+	UseGameDb(paths);                       // vk-285-113; gamedb (2026-10-30): with the eboot's copy behind the file
 	SetShareRoots(paths.share_roots);       // vk-285-156
 	std::vector<GameInfo> games = ScanGames(ScanRoots(paths), paths.scan_subfolders); // test build 1: USB drives; 2026-10-16: or only the folders set
-	int on_usb = 0, on_nfs = 0;
-	for (GameInfo& g : games)
+	// chdscan (AI-assisted): the images the cache files know (all of them on most starts) take no time; any others are read on a thread
+	// (ShelfScan) while the display comes up, and when that takes longer the shelf comes up without its games and counts them in.
+	ShelfScan scan(paths, t0);
+	int unread = 0;
+	for (const GameInfo& g : games)
 	{
-		g.serial = ReadSerial(g); // 2.02: through the serial cache, keyed by what ScanGames already has
-		// vk-285-113: a CHD (or an ISO) named after its file shows the game's name from the game database.
-		const std::string file_title = g.title;
-		const bool renamed = ApplyGameDbTitle(g);
-		ReadBadges(g, paths.settings_dir, paths.gs_ini, paths.patches_dir);
-		on_usb += OnUsb(g.path) ? 1 : 0;
-		on_nfs += OnNetworkShare(g.path) ? 1 : 0;
-		if (renamed)
-			std::printf("[frontend] %s: titled \"%s\" (the file name gave \"%s\")\n", g.file.c_str(), g.title.c_str(), file_title.c_str());
-		// Test build 1: the size too (a disc image of an odd size is often a bad dump), and the folder.
-		std::printf("[frontend] %s | %s | %s | %llu bytes | %s\n", g.file.c_str(), g.serial.empty() ? "no serial" : g.serial.c_str(),
-			g.title.c_str(), static_cast<unsigned long long>(g.bytes), g.path.substr(0, g.path.rfind('/')).c_str());
-		// vk-285-109: a CHD without a serial says what it is.
-		if (g.serial.empty())
-		{
-			const std::string what = DescribeImage(g.path);
-			if (!what.empty())
-				std::printf("[frontend]   chd: %s\n", what.c_str());
-			// vk-285-134: libchdr's "invalid file/data" (or a version it doesn't read) is a damaged image; a CHD that needs
-			// its parent isn't (PCSX2 finds the parent itself).
-			const std::string cant = "libchdr can't open it: ";
-			if (what.rfind(cant, 0) == 0 && what.find("parent") == std::string::npos)
-				g.damaged = what.substr(cant.size());
-		}
+		std::string serial;
+		unread += KnownSerial(g, serial) ? 0 : 1;
 	}
-	SortGames(games); // vk-285-113: by the titles the game database may have changed
-	std::printf("[frontend] %zu disc image(s), %d on USB, %d on NFS shares, scanned in %.0f ms\n", games.size(), on_usb, on_nfs,
-		(Now() - t0) * 1000.0);
-	std::fflush(stdout);
-	phase("games scanned");
-	WriteUsbList(paths.usb_list, games, RootsSignature(paths));
+	scan.Start(std::move(games), unread);
+	if (unread == 0)
+		scan.Wait(-1); // (no thread: the list is ready)
+	else
+	{
+		std::printf("[frontend] %d image(s) not seen before: read while the shelf comes up\n", unread);
+		std::fflush(stdout);
+	}
 	// Keep the shelf available without games too, for settings and account sign-in.
 	const std::string last = ReadLastGame(paths.top_dir);
+	// fix180: "disc:<serial>" (main-boot.cpp writes it for a game started from a drive): a copy of that disc on the shelf is picked now; the drive's own
+	// entry, which the watcher reports a few seconds later, is picked when it comes (AppConfig::preselect_disc_serial)
+	const std::string last_disc = last.compare(0, 5, "disc:") == 0 ? last.substr(5) : std::string();
+	auto finish_scan = [&](std::vector<GameInfo>& out) {
+		out = scan.Take();
+		phase("games scanned");
+		WriteUsbList(paths.usb_list, out, RootsSignature(paths));
+		int pick = 0;
+		for (size_t i = 0; i < out.size(); i++)
+			if (last_disc.empty() ? out[i].file == last : (!out[i].serial.empty() && out[i].serial == last_disc))
+				pick = static_cast<int>(i);
+		return pick;
+	};
 	int preselect = 0;
-	for (size_t i = 0; i < games.size(); i++)
-		if (games[i].file == last)
-			preselect = static_cast<int>(i);
+	bool scanning = !scan.Done();
+	if (!scanning)
+		preselect = finish_scan(games);
 	// vk-285-69: one game opens the shelf too, not the game straight away: the shelf's QR code is how
 	// testers reach the settings page and its Download logs (swordpdf, 2026-09-26).
 
@@ -2010,7 +2244,14 @@ std::string orbis_frontend_run(const OrbisFrontendPaths& paths, const char* buil
 				std::fclose(f);
 			}
 	}
-	covers->Start(games, fonts, cc, CoverGet); // 2026-10-10: was libSceHttp2 (g_http), which fails after the jailbreak
+	// chdscan: the scan's last moments are waited for here (the display took ~150-250 ms of them); longer, and the shelf comes up with it running
+	if (scanning && scan.Wait(700))
+	{
+		scanning = false;
+		preselect = finish_scan(games);
+	}
+	if (!scanning)
+		covers->Start(games, fonts, cc, CoverGet); // 2026-10-10: was libSceHttp2 (g_http), which fails after the jailbreak; chdscan: or once the scan is done
 
 	phase("cover service started");
 	// The key sounds (vk-285-47). Without an audio port the shelf is simply quiet.
@@ -2048,6 +2289,7 @@ std::string orbis_frontend_run(const OrbisFrontendPaths& paths, const char* buil
 	acfg.build_label = paths.build_label;
 	acfg.test_note = paths.test_note; // vk-285-105
 	acfg.preselect = preselect;
+	acfg.preselect_disc_serial = last_disc; // fix180
 	acfg.sound = mixer;
 	// vk-285-114: the options sheet (Square) edits the files the settings page does, and logs as it does.
 	acfg.options.settings_dir = paths.settings_dir;
@@ -2125,6 +2367,13 @@ std::string orbis_frontend_run(const OrbisFrontendPaths& paths, const char* buil
 			OrbisNotifyRich(Tr(ok ? Str::HdTexturesReady : Str::HdTexturesFailed), sub.c_str(), "");
 		};
 		tp.now = [] { return Now(); };
+		// 2026-10-29: the packs' downloads and pack files written by a process of its own (fe_texwrite.h): the console holds the title's own writes to
+		// ~2 MiB/s after its first ~1.3 GiB. Flag texpack_titlewrites: written by the app, as before. The payload says what it did in logs/texwrite.log.
+		if (OrbisTexWriterBuilt())
+		{
+			tp.launch_writer = [](const std::string& request, std::string& why) { return OrbisTexWriterLaunch(request, why); };
+			tp.writer_log = OrbisLogPath("texwrite.log");
+		}
 		const std::string textures = paths.textures_dir;
 		texpacks = new TexturePackManager(tp, textures, textures + "/.ps5sx2-downloads", paths.texture_pack_list);
 		// 2.11: Drive's packs (built into the app) and the player's own list beside the other files in /data/PCSX2
@@ -2164,8 +2413,8 @@ std::string orbis_frontend_run(const OrbisFrontendPaths& paths, const char* buil
 		acfg.options.cheats_dir = paths.cheats_dir;
 	}
 	acfg.system_menu = true; // 2026-10-08: the sheet for all games offers the PS2 system menu (main-boot.cpp boots it)
-	// 2.12: the Home screen tile row (see orbis_web_start): only with the flag file flags/gametiles. The cover goes to the helper for the tile's art.
-	acfg.tiles_dir = OrbisFlag("gametiles") && !OrbisFlag("nogametiles") ? paths.top_dir + "/tiles" : std::string();
+	// 2.12 / 179: the Home screen tile row (see orbis_web_start): ON by default; the flag file flags/gametile_off switches it off. The cover goes to the helper for the tile's art.
+	acfg.tiles_dir = !OrbisFlag("gametile_off") ? paths.top_dir + "/tiles" : std::string();
 	acfg.own_tile_game = orbis_own_tile_game();
 	if (!acfg.tiles_dir.empty())
 	{
@@ -2175,8 +2424,67 @@ std::string orbis_frontend_run(const OrbisFrontendPaths& paths, const char* buil
 			const std::string best = finder.Best(g).path;
 			return gametile::CoverFileOk(best) ? best : std::string();
 		};
-		std::printf("[tiles] game tiles: on (flags/gametiles); the helper and the shelf talk through %s\n", acfg.tiles_dir.c_str());
+		std::printf("[tiles] game tiles: on by default (flag gametile_off removes them); the helper and the shelf talk through %s\n", acfg.tiles_dir.c_str());
 		std::fflush(stdout);
+	}
+	// 180 (AI-assisted; the owner: an in-app updater like PS5SX3's, and nothing to load by hand but ShadowMount and kstuff): the sheet for all games'
+	// PS5SX2 group (fe_update.h). System update looks at the latest GitHub release over its own HTTPS client and, asked twice, sends the installer the
+	// app ships (OrbisInstallerStart.cpp) and closes; Session logs writes the installer's no-log-upload switch. Not in a game tile's copy: the
+	// installer updates the main app. One look when the shelf opens (flags/noupdatecheck: none); a newer release is told in a notification.
+	Updater* updater = nullptr;
+	if (acfg.own_tile_game.empty())
+	{
+		static const char* const kWork = "/data/PS5SX2-Installer";
+		const std::string tag = build_tag ? build_tag : "";
+		UpdatePlatform up;
+		up.get_text = [](const std::string& url, std::string& body, std::string& error) {
+			body.clear();
+			const int st = g_updhttp.Get(url, false, 0, 0, [&body](const void* d, size_t n) {
+				if (body.size() + n > (4u << 20))
+					return false;
+				body.append(static_cast<const char*>(d), n);
+				return true;
+			});
+			if (st < 0)
+				error = st == HttpsClient::kConnect ? "no connection: is the console online?" : st == HttpsClient::kAborted ? "stopped" :
+					"the transfer broke";
+			return st;
+		};
+		up.start_installer = [tag](const std::string& expect, std::string& detail) {
+			return static_cast<int>(OrbisStartUpdateInstaller(tag, expect, detail));
+		};
+		up.exists = [](const std::string& path) {
+			struct stat st;
+			return stat(path.c_str(), &st) == 0;
+		};
+		up.set_file = [](const std::string& path, bool on) {
+			if (!on)
+				return unlink(path.c_str()) == 0 || errno == ENOENT;
+			mkdir(kWork, 0777); // the installer makes it at its first run; a console that never ran one has none
+			const int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_NOFOLLOW, 0666);
+			if (fd < 0)
+				return false;
+			close(fd);
+			return true;
+		};
+		up.notify = [](const std::string& release) {
+			char text[512];
+			std::snprintf(text, sizeof(text), Tr(Str::NotifyUpdateAvailable), release.c_str());
+			OrbisNotifyPlain(text);
+		};
+		up.log = [](const std::string& line) {
+			std::printf("[update] %s\n", line.c_str());
+			std::fflush(stdout);
+		};
+		up.quit = [] { OrbisExitApp(0); };
+		up.thread_start = [] { TexturePackThreadStart("update check"); };
+		updater = new Updater(up, tag, kWork);
+		acfg.updates = updater->Service();
+		if (!OrbisFlag("noupdatecheck"))
+			updater->Check(true);
+		else
+			std::printf("[update] no look at start (flag noupdatecheck)\n");
+		// Session logs are on by default and no notice says so (owner, 2026-10-29); the Session logs row is the way out.
 	}
 	// 2.11: the shelf's search and the settings page's search box
 	acfg.search_remote = [](std::string& text) { return g_web && g_web->TakeSearchFromPage(text); };
@@ -2195,7 +2503,13 @@ std::string orbis_frontend_run(const OrbisFrontendPaths& paths, const char* buil
 	acfg.bios_present = paths.bios_check; // vk-285-134
 	acfg.bios_problem = paths.bios_problem;
 	acfg.bios_dir = paths.bios_dir;
+	acfg.gamedb_missing = paths.gamedb_missing; // gamedb (2026-10-30)
+	acfg.open_bios_bundled = paths.open_bios_bundled; // bioscheck
+	acfg.bios_open_in_use = paths.bios_open_in_use;
+	acfg.bios_pending_launch = paths.bios_pending_launch;
 	acfg.games_folder_note = paths.games_folder_note; // 2026-10-16: the empty shelf names the folder you set
+	if (scanning)
+		acfg.scan_progress = [&scan](int& done, int& total) { return scan.Progress(done, total); }; // chdscan
 	// live-22 (AI-assisted): while a PS2 disc is being copied (orbis-shims/ProsperoDiscDump.cpp), the shelf shows a
 	// spinning-disc entry with the live percentage, read from this file (the same path the dumper writes).
 	acfg.disc_dump_progress = OrbisLogPath("disc-dump-progress.txt");
@@ -2221,6 +2535,13 @@ std::string orbis_frontend_run(const OrbisFrontendPaths& paths, const char* buil
 	title = g_drive_title;
 	serial = g_drive_serial;
 	return true;
+	};
+	// gamedb (2026-10-30, AI-assisted): the disc entries' sheet writes the file a start from the drive reads (main-boot.cpp, the same rule).
+	acfg.disc_settings_stem = [settings_dir = paths.settings_dir](const std::string& serial) {
+		if (!OrbisDiscDrive::SafeSerial(serial))
+			return std::string();
+		return DiscSettingsStem(serial, OrbisDiscSettingsStem(serial),
+			[&](const std::string& stem) { return access((settings_dir + "/" + stem + ".ini").c_str(), F_OK) == 0; });
 	};
 	acfg.drive_disc_reask = [] {
 	std::lock_guard<std::mutex> lock(g_launch_lock);
@@ -2249,11 +2570,37 @@ std::string orbis_frontend_run(const OrbisFrontendPaths& paths, const char* buil
 	double worst = 0;
 	bool first_shown = false;
 	std::string launch_path; // vk-285-144: a disc's game, asked for from outside
+	auto set_no_bios = [&app] { // bioscheck
+		std::lock_guard<std::mutex> lock(g_launch_lock);
+		g_shelf_no_bios = app.BiosMissing();
+	};
+	set_no_bios();
 	SetShelfUp(ok);
 	while (ok && !app.Done())
 	{
 		const double now = Now();
 		launch_path = TakeLaunchRequest();
+		// bioscheck: a launch from outside the shelf starts only with a BIOS (App::OfferOutsideLaunch looks again); without one the
+		// shelf's BIOS question comes up for it, and picking the open BIOS lets it go (App::TakeApprovedLaunch, after the loop).
+		std::string refused;
+		{
+			std::lock_guard<std::mutex> lock(g_launch_lock);
+			refused.swap(g_bios_refused_request);
+		}
+		if (launch_path.empty() && !refused.empty())
+		{
+			std::printf("[frontend] launch asked for from outside the shelf with no BIOS: %s\n", refused.c_str());
+			std::fflush(stdout);
+			if (app.OfferOutsideLaunch(refused))
+				launch_path = refused; // a BIOS came meanwhile
+		}
+		else if (!launch_path.empty() && !app.OfferOutsideLaunch(launch_path))
+		{
+			std::printf("[frontend] launch asked for from outside the shelf: %s: no BIOS, the shelf asks first\n", launch_path.c_str());
+			std::fflush(stdout);
+			launch_path.clear();
+		}
+		set_no_bios();
 		if (!launch_path.empty())
 		{
 			std::printf("[frontend] launch asked for from outside the shelf: %s\n", launch_path.c_str());
@@ -2286,6 +2633,14 @@ std::string orbis_frontend_run(const OrbisFrontendPaths& paths, const char* buil
 			in.circle = pd.buttons & kPadCircle;
 			in.l2 = (pd.buttons & kPadL2) || pd.l2 > 160; // vk-285-116
 			in.r2 = (pd.buttons & kPadR2) || pd.r2 > 160;
+		}
+		if (scanning && scan.Done())
+		{
+			// chdscan: the games come
+			scanning = false;
+			preselect = finish_scan(games);
+			covers->Start(games, fonts, cc, CoverGet);
+			app.SetGames(games, preselect);
 		}
 		app.Update(dt, in);
 		app.Build(frame, Clock());
@@ -2370,6 +2725,8 @@ std::string orbis_frontend_run(const OrbisFrontendPaths& paths, const char* buil
 	}
 
 	SetShelfUp(false);
+	if (launch_path.empty())
+		launch_path = app.TakeApprovedLaunch(); // bioscheck: an outside start the BIOS question let go (the open BIOS was picked)
 	const int chosen = app.Chosen();
 	const bool picked = ok && (app.Done() || !launch_path.empty());
 	const bool system_menu = app.SystemMenuChosen(); // 2026-10-08
@@ -2402,6 +2759,25 @@ std::string orbis_frontend_run(const OrbisFrontendPaths& paths, const char* buil
 		}
 		else
 			std::printf("[frontend] an online patch request is still stopping; leaving it to end on its own\n");
+	}
+	// 180: the update look stops with the shelf. The installer started from the row waits for this process: a game picked in the
+	// moment before the close does not start (the installer would give up after 90 s and the update would not happen).
+	if (updater)
+	{
+		if (updater->Status().state == UpdateStatus::State::Started)
+		{
+			std::printf("[frontend] system update: the installer runs, PS5SX2 closes now (not starting the pick)\n");
+			std::fflush(stdout);
+			OrbisExitApp(0);
+		}
+		g_updhttp.Abort();
+		if (updater->Stop(1500))
+		{
+			delete updater;
+			g_updhttp.Term();
+		}
+		else
+			std::printf("[frontend] the update look is still stopping; leaving it to end on its own\n");
 	}
 	const bool stopped = covers->Stop(1500);
 	renderer.Shutdown();

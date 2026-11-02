@@ -122,6 +122,52 @@ enum class Str : int
 	ShelfNoBios,        // vk-285-134: "No PS2 BIOS found: games can't start. Copy your BIOS file ... to %s" (the shelf's line)
 	NotifyTileGameMissing, // 2.12: "PS5SX2: the game of this home screen tile was not found (%s). Is its drive connected? The shelf opens instead." (%s: the file's name)
 	NotifyTileGameInvalid, // 2.12: "PS5SX2: this home screen tile doesn't name a game PS5SX2 can start. The shelf opens instead."
+	CopyDumpPct,        // 179: "Copying %d%%" (the disc-copy entry on the shelf)
+	CopyEtaMin,         // 179: "%d min left" (time left for the disc copy)
+	CopyEtaLessMin,     // 179: "under a minute left"
+	// 180 (AI-assisted): the sheet for all games' PS5SX2 group: System update and Session logs (fe_update.h). English only so far: the
+	// other tables fall back to it (a lang/<code>.txt can translate them).
+	UpdateHeader,          // "PS5SX2" (the group's title)
+	UpdateRow,             // "System update"
+	UpdateCheck,           // "Check for updates"
+	UpdateChecking,        // "Checking..."
+	UpdateCurrent,         // "Up to date (%s)" (%s: the release's name)
+	UpdateNewer,           // "Newer than the release (%s)"
+	UpdateAvailable,       // "%s: install" (%s: the release's name)
+	UpdatePressAgain,      // "Press again to install"
+	UpdateFailed,          // "Couldn't check: %s" (%s: why, in English)
+	UpdateInterrupted,     // "An update was cut off: repair"
+	UpdateStarting,        // "Starting the installer..."
+	UpdateStarted,         // "Closing to update..."
+	UpdateStartFailed,     // "Couldn't start the installer: %s"
+	UpdateHelp,            // what the row does
+	UpdateHelpAvailable,   // "Cross twice: ... %s ..." (%s: the release's name and tag)
+	UpdateHelpInterrupted, // a cut-off install: what Cross does
+	UpdateHelpStarted,     // the installer runs: what happens next
+	NotifyUpdateAvailable, // "PS5SX2: %s is out. ..." (the look at the shelf's start)
+	LogsRow,               // "Session logs"
+	LogsOn,                // "Sent"
+	LogsOff,               // "Off"
+	LogsHelp,              // what the row does
+	// bioscheck (2026-10-29, AI-assisted): the BIOS question before a start, and the open-source BIOS PS5SX2 ships (English only for now).
+	BiosChoiceTitle, // "No PS2 BIOS found": the BIOS question's headline
+	BiosChoiceIntro, // "Games need a PS2 BIOS to start. Sony's BIOS can't come with PS5SX2: yours comes from your own PS2.": the line under it
+	BiosUseOpen, // "Use the open-source BIOS": the first card
+	BiosUseOpenLine1, // "OpenPS2BIOS, experimental:": its first line
+	BiosUseOpenLine2, // "some games don't work yet.": its second line
+	BiosAddOwn, // "Add your own BIOS": the second card
+	BiosAddOwnLine1, // "Put it in %s": its first line (%s: the BIOS folder)
+	BiosAddOwnLine2, // "then pick the game again.": its second line
+	BiosHintChoose, // "choose": Left / Right: choose
+	BiosHintConfirm, // "confirm": Cross: confirm
+	BiosInUse, // "BIOS: %s": the shelf's note while the open BIOS is the one games use (%s: OpenPS2BIOS (experimental))
+	ShelfNoBiosChoice, // "Pick a game to choose: the open-source BIOS, or your own.": the shelf's BIOS line, when the open BIOS is offered
+	BiosOpenFailed, // "The open-source BIOS couldn't be set up (see boot.log).": the choice failed
+	NotifyNoBiosChoice, // "PS5SX2: no PS2 BIOS found, so the game didn't start. The menu offers the open-source BIOS, or put your own in %s.": a start without the shelf (a tile, a disc) refused (%s: the BIOS folder)
+	NotifyOpenBiosCantStart, // "PS5SX2: OpenPS2BIOS (experimental) can't start PS1 discs, audio CDs or DVD videos. Put your own PS2 BIOS in %s to play this one.": (%s: the BIOS folder)
+	ShelfScanning, // chdscan (AI-assisted): "Looking at new games  %d / %d": the shelf while the images not seen before are read (English only for now)
+	// gamedb (2026-10-30): "Game database missing (%s): this app's own copy is used. The PS5SX2 Installer repairs it." (%s: the file)
+	ShelfNoGameDb,
 	Count
 };
 

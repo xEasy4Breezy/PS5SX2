@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "fe_options.h"
+#include "fe_i18n.h" // 180: the PS5SX2 group's labels
 #include "fe_roots.h" // 2026-10-16: the Folders switches' keys (kScanUsbKey, kScanSubfoldersKey)
 #include "fe_text.h" // vk-285-116: the buttons' symbols (icon::)
 
@@ -348,6 +349,10 @@ const std::vector<OptionGroup>& OptionGroups()
 					"On: each games folder is listed together with the folders inside it, one level down. Off: only the disc images directly in "
 					"the folder itself. Read when PS5SX2 starts.",
 					true),
+				// bioscheck (2026-10-29, AI-assisted): the open-source BIOS PS5SX2 ships (orbis-shims/OrbisOpenBios.h), chosen on the shelf's
+				// BIOS question or here, and turned off here again.
+				Toggle("PS5SX2/OpenBios", "OpenPS2BIOS (experimental)", "false", "Open BIOS %",
+					"On: with no PS2 BIOS of your own, games start with OpenPS2BIOS, the open-source BIOS PS5SX2 ships (experimental: some games don't work yet; PS1 discs, audio CDs and DVD videos can't start). A BIOS of your own in /data/PCSX2/bios always comes first. Off: games need your own BIOS. Read at each start."),
 			},
 			kTabSettings, false, true},
 		// vk-285-137 (AI-assisted; swordpdf: "add an option to hide games from the shelf"): a game off the shelf (its own file
@@ -635,6 +640,8 @@ void OptionsSheet::BuildRows()
 			continue;
 		if (g.title == "Folders" && settings && m_global && m_folder_rows)
 			continue; // 2026-10-16: its rows came with the folder rows above
+		if (g.title == "Shelf" && !m_global && !m_hide_row)
+			continue; // gamedb (2026-10-30): a disc entry's sheet
 		add(Kind::Header, g.title);
 		// vk-285-139: the cheat disc itself, on the sheet for all games, before its switch.
 		if (g.title == "Discs" && m_global)
@@ -664,6 +671,14 @@ void OptionsSheet::BuildRows()
 	{
 		add(Kind::Header, "PS2");
 		add(Kind::SystemMenu, "PS2 system menu");
+	}
+	// 180 (AI-assisted; the owner: an in-app updater like PS5SX3's): PS5SX2 itself, its updates and its session logs (the app draws and
+	// runs both rows: fe_update.h).
+	if (settings && m_global && m_update_rows)
+	{
+		add(Kind::Header, Tr(Str::UpdateHeader));
+		add(Kind::SystemUpdate, Tr(Str::UpdateRow));
+		add(Kind::LogUpload, Tr(Str::LogsRow));
 	}
 	// 2026-10-08: the "Get patches and cheats" row heads the game's patches (shown with none yet), then its cheats.
 	const bool online = settings && m_online_patch_row && !m_global && !m_serial.empty();
@@ -801,6 +816,8 @@ std::string OptionsSheet::Value(const Row& r) const
 		case Kind::TexturePack: // the app's (fe_app.cpp, from fe_texpacks.h)
 		case Kind::OnlinePatches: // the app's (fe_app.cpp, from fe_patchdl.h)
 		case Kind::HomeTile: // 2.12: the app's too (fe_app.cpp, from fe_gametile.h)
+		case Kind::SystemUpdate: // 180: the app's (fe_app.cpp, from fe_update.h)
+		case Kind::LogUpload:
 			return {};
 	}
 	return {};

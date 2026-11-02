@@ -4,6 +4,9 @@
 //
 //   build-host.sh && ./fe_host --data <folder> --out <folder> [--size 1920x1080] [--lang <ps5 language id>] [--ime]
 //   [--no-bios "<what was found instead>"] (vk-285-134) [--ime-text "<what the keyboard types>"] (vk-285-135: with --ime)
+//   [--open-bios] (bioscheck: with --no-bios, the build ships the open BIOS: the BIOS question offers it, and once gs.ini says
+//   PS5SX2/OpenBios=true the stand-in finds a BIOS) [--bios-pending <path>] (a tile's or a disc's start refused before the shelf came up)
+//   Steps: "outside <path>" (a start asked of the shelf from outside it: Play from disc, a finished copy; expect outsideok, approved).
 //   [--games <file>] [--build-tag <text>] [--record <out.mp4> [--record-fps 30|60]] (2026-10-08: the showcase video)
 //                               [--script <file>] [step ...]
 // --games: one game a line, "title|region|serial|size in MB" (the shelf's order); its cover is <data>/covers/<serial>.jpg.
@@ -32,6 +35,7 @@
 #include "../fe_app.h"
 #include "../fe_games.h"
 #include "../fe_i18n.h"
+#include "../fe_discsettings.h" // gamedb (2026-10-30)
 
 #include <dirent.h>
 #include <dlfcn.h>
@@ -45,7 +49,9 @@
 #include <atomic>
 #include <cctype>
 #include <cmath>
+#include <cerrno>
 #include <chrono>
+#include <memory>
 #include <ctime>
 #include <mutex>
 #include <thread>
@@ -268,7 +274,15 @@ bool ParseStep(const std::string& line, std::vector<Step>& out)
 	}
 	else if (st.op == "sleep") // 2026-10-05: real seconds, for the texture pack worker
 		s >> st.seconds;
-	else if (st.op == "shot" || st.op == "game")
+	else if (st.op == "expectsheetfile") // gamedb (2026-10-30): "expectsheetfile settings/<stem>.ini": the file the open sheet writes
+	{
+		std::getline(s, st.arg);
+		while (!st.arg.empty() && st.arg.front() == ' ')
+			st.arg.erase(0, 1);
+	}
+	else if (st.op == "shot" || st.op == "game" || st.op == "lastdisc") // fix180: "lastdisc <serial>": the last game played was that disc from the drive
+		s >> st.arg;
+	else if (st.op == "scan") // chdscan: "scan <done>/<total>": the shelf came up while the scan runs, this far; "scan done": the games come (App::SetGames)
 		s >> st.arg;
 	else if (st.op == "dump") // live-22: "dump <pct>" writes the dumper's progress file, "dump off" removes it
 	s >> st.arg;
@@ -293,6 +307,12 @@ bool ParseStep(const std::string& line, std::vector<Step>& out)
 		s >> st.arg;
 	else if (st.op == "stick") // 2.11: "stick <x> <y>": the right stick, held there until the next "stick"
 		s >> st.arg >> st.seconds;
+	else if (st.op == "outside") // bioscheck: "outside <path>": a start asked of the shelf from outside it (the rest of the line, spaces kept)
+	{
+		std::getline(s, st.arg);
+		while (!st.arg.empty() && st.arg.front() == ' ')
+			st.arg.erase(0, 1);
+	}
 	else if (st.op == "remote") // 2.11: "remote <text>": the settings page's search box sets the shelf's search ("remote" alone clears it)
 	{
 		std::getline(s, st.arg);
@@ -691,10 +711,17 @@ int main(int argc, char** argv)
 	std::string web;
 	bool no_bios = false; // vk-285-134
 	std::string no_bios_problem;
+	std::string gamedb_missing; // gamedb (2026-10-30)
+	bool open_bios = false;      // bioscheck
+	std::string bios_pending;    // bioscheck
 	std::string games_file, build_tag = "vk-285-114 (host)", record, record_audio; // 2026-10-08: the showcase video
 	std::string places; // 2026-10-08: --places "Label=/path|Label=/path": the folder picker's places (else the data folder's)
 	bool tiles = false; // 2.12: --tiles: the sheet's Home screen tile row, with the stand-in helper (FakeHelper) in <data>/tiles; --own-tile <path>: this run is a game tile's
 	std::string own_tile;
+	// 180: --updates <tag>: the sheet for all games' PS5SX2 group, with a stand-in for GitHub naming release <tag> ("fail" or "error"
+	// as <tag>: no answer / HTTP 500) and a stand-in installer (--updates-start <rc>: what starting it answers, 0 started).
+	std::string updates;
+	int updates_start = 0;
 	int record_fps = 30;
 	for (int i = 1; i < argc; i++)
 	{
@@ -734,6 +761,12 @@ int main(int argc, char** argv)
 			no_bios = true;
 			no_bios_problem = next();
 		}
+		else if (a == "--open-bios") // bioscheck
+			open_bios = true;
+		else if (a == "--no-gamedb") // gamedb (2026-10-30): resources/GameIndex.yaml is missing (the shelf's note names this file)
+			gamedb_missing = next();
+		else if (a == "--bios-pending") // bioscheck
+			bios_pending = next();
 		else if (a == "--games")
 			games_file = next();
 		else if (a == "--build-tag")
@@ -746,6 +779,10 @@ int main(int argc, char** argv)
 			tiles = true;
 		else if (a == "--own-tile")
 			own_tile = next();
+		else if (a == "--updates")
+			updates = next();
+		else if (a == "--updates-start")
+			updates_start = std::atoi(next().c_str());
 		else if (a == "--record-audio")
 			record_audio = next();
 		else if (a == "--record-fps")
@@ -845,7 +882,14 @@ int main(int argc, char** argv)
 	cc.manual_dir = data + "/covers";
 	cc.cache_dir = data + "/cache-covers";
 	cc.allow_download = false;
-	covers->Start(games, fonts, cc, [](const std::string&, std::vector<uint8_t>&) { return -1; });
+	// chdscan: with a "scan" step the shelf comes up without its games, as fe_ps5.cpp's does while images not seen before are read; the
+	// cover service starts with the games ("scan done").
+	const bool scan_mode = std::any_of(steps.begin(), steps.end(), [](const Step& st) { return st.op == "scan"; });
+	bool scanning = scan_mode;
+	int scan_done = 0, scan_total = 0;
+	const auto no_download = [](const std::string&, std::vector<uint8_t>&) { return -1; };
+	if (!scan_mode)
+		covers->Start(games, fonts, cc, no_download);
 
 	App app;
 	AppConfig acfg;
@@ -1045,6 +1089,49 @@ int main(int argc, char** argv)
 			return gametile::CoverFileOk(c) ? c : std::string();
 		};
 	}
+	// 180: --updates: the PS5SX2 group, over a stand-in GitHub and installer (fe_update.h). The build tag must look like a release's
+	// ("vk-285-180") for the comparison; files go to <data>/installer (its no-log-upload switch).
+	std::unique_ptr<Updater> updater;
+	int upd_started = 0, upd_quit = 0;
+	if (!updates.empty())
+	{
+		MakeDir(data + "/installer");
+		UpdatePlatform up;
+		const std::string tag = updates;
+		up.get_text = [tag](const std::string&, std::string& body, std::string& error) {
+			if (tag == "fail")
+			{
+				error = "no connection: is the console online?";
+				return -1;
+			}
+			if (tag == "error")
+				return 500;
+			const std::string name = "PS5SX2-" + tag + ".zip";
+			body = "{\"tag_name\":\"" + tag + "\",\"name\":\"PS5SX2 9.99\",\"draft\":false,\"assets\":[{\"name\":\"" + name +
+				"\",\"state\":\"uploaded\",\"size\":41000000,\"digest\":\"sha256:" + std::string(64, 'a') +
+				"\",\"browser_download_url\":\"" + kUpdateDownloadPrefix + tag + "/" + name + "\"}]}";
+			return 200;
+		};
+		up.start_installer = [&upd_started, updates_start](const std::string& expect, std::string& detail) {
+			detail = "host stand-in for " + expect;
+			if (updates_start == 0)
+				upd_started++;
+			return updates_start;
+		};
+		up.exists = [](const std::string& p) { return access(p.c_str(), F_OK) == 0; };
+		up.set_file = [](const std::string& p, bool on) {
+			if (!on)
+				return std::remove(p.c_str()) == 0 || errno == ENOENT;
+			FILE* f = std::fopen(p.c_str(), "w");
+			if (f)
+				std::fclose(f);
+			return f != nullptr;
+		};
+		up.log = [](const std::string& line) { std::printf("[update] %s\n", line.c_str()); };
+		up.quit = [&upd_quit] { upd_quit++; };
+		updater = std::make_unique<Updater>(up, build_tag, data + "/installer");
+		acfg.updates = updater->Service();
+	}
 	// 2.11: the settings page's search box (the "remote" step)
 	std::mutex remote_mutex;
 	std::string remote_text;
@@ -1072,12 +1159,32 @@ int main(int argc, char** argv)
 			at = bar + 1;
 		}
 	}
+	// bioscheck: the stand-in for main-boot.cpp's orbis_bios_usable: no BIOS of the player's own; with --open-bios, the open one once
+	// gs.ini's [PS5SX2] says OpenBios = true (the BIOS question writes it, the sheet's switch turns it off).
+	int bios_looks = 0;
+	auto open_chosen = [gs = op.gs_ini]() {
+		std::string text;
+		if (!settings::ReadFile(gs, text))
+			return false;
+		for (const settings::IniLine& l : settings::ParseIni(text))
+			if (settings::CanonKey(l.key) == settings::CanonKey("PS5SX2/OpenBios"))
+				return settings::Lower(settings::Trim(l.value)) == "true";
+		return false;
+	};
 	if (no_bios)
 	{
-		acfg.bios_present = [] { return false; };
-		acfg.bios_problem = [no_bios_problem] { return no_bios_problem; };
+		acfg.bios_present = [&bios_looks, open_bios, open_chosen] {
+			bios_looks++;
+			return open_bios && open_chosen();
+		};
+		acfg.bios_problem = [no_bios_problem, open_bios, open_chosen] { return open_bios && open_chosen() ? std::string() : no_bios_problem; };
 		acfg.bios_dir = "/data/PCSX2/bios";
+		acfg.open_bios_bundled = open_bios;
+		acfg.bios_open_in_use = [open_bios, open_chosen] { return open_bios && open_chosen(); };
+		acfg.bios_pending_launch = bios_pending;
 	}
+	int outside_ok = -1;
+	std::string approved;
 	acfg.refresh_game = [op](GameInfo& g) {
 		g.badges.clear();
 		ReadBadges(g, op.settings_dir, op.gs_ini, op.patches_dir);
@@ -1096,10 +1203,26 @@ int main(int argc, char** argv)
 	return true;
 	};
 	acfg.drive_disc_reask = [&] { reasks++; };
+	if (scan_mode)
+		acfg.scan_progress = [&](int& done, int& total) {
+			done = scan_done;
+			total = scan_total;
+			return scanning;
+		};
+	acfg.gamedb_missing = gamedb_missing; // gamedb (2026-10-30)
+	// gamedb (2026-10-30): the disc entries' settings file, by the console's rule (fe_discsettings.h) with the drive's title as the copy's name
+	acfg.disc_settings_stem = [&, settings_dir = op.settings_dir](const std::string& serial) {
+		if (serial.size() < 5)
+			return std::string(); // a serial unfit for a file name (the console: OrbisDiscDrive::SafeSerial)
+		const std::string by_copy = (serial == drive_serial && !drive_title.empty() ? drive_title : std::string("PS2 disc")) + " (" + serial + ")";
+		return fe::DiscSettingsStem(serial, by_copy, [&](const std::string& stem) { return access((settings_dir + "/" + stem + ".ini").c_str(), F_OK) == 0; });
+	};
 	for (const Step& s : steps)
 		if (s.op == "game")
 			acfg.preselect = std::atoi(s.arg.c_str());
-	if (!app.Init(&renderer, fonts, games, covers, acfg))
+		else if (s.op == "lastdisc")
+			acfg.preselect_disc_serial = s.arg;
+	if (!app.Init(&renderer, fonts, scan_mode ? std::vector<GameInfo>() : games, covers, acfg))
 	{
 		std::fprintf(stderr, "[host] app: %s\n", renderer.error().c_str());
 		return 1;
@@ -1148,6 +1271,7 @@ int main(int argc, char** argv)
 		       key == "backheld" ? app.BackHeld() :
 		       key == "backcount" ? app.BackRealCount() :
 		       key == "heldpeak" ? held_peak :
+		       key == "scanning" ? (scanning ? 1 : 0) : // chdscan: the shelf is waiting for the scan's games
 		       key == "countpeak" ? count_peak :
 		       key == "selected" ? app.Chosen() : key == "account" ? app.AccountOpen() : key == "sheet" ? app.SheetOpen() :
 			                key == "tab"      ? app.SheetTab() :
@@ -1162,6 +1286,10 @@ int main(int argc, char** argv)
 				                				                key == "driveentry" ? app.DriveEntry() : // 2.11: the disc in the drive is listed
 				                				                key == "discart"  ? app.DiscArt() : // 2.11: the disc art arrived
 				                				                key == "reasks"   ? reasks : // 2.11: how often the drive entry was picked
+				                key == "updstate" ? (updater ? static_cast<int>(updater->Status().state) : -1) : // 180: fe_update.h UpdateStatus::State
+				                key == "updstarted" ? upd_started : // 180: installers started
+				                key == "updquit" ? upd_quit :       // 180: the app asked to close
+				                key == "logupload" ? (updater ? (updater->LogUpload() ? 1 : 0) : -1) : // 180: session logs on
 				                key == "tilephase" ? app.TilePhase() : // 2.12: the Home screen tile row's phase (fe_gametile.h; -1: no row on the sheet)
 				                key == "tilerow"   ? app.TileRowShown() : // 2.12: the sheet has the row
 				                key == "tilefocus" ? app.TileFocused() : // 2.12: the focused row is it
@@ -1176,7 +1304,16 @@ int main(int argc, char** argv)
 				                key == "flipangle100" ? static_cast<int>(std::lround(pose(app.FlipAngle()) * 100.0f)) : // 2.11: the same with its side (-100 .. 100)
 				                key == "flippeak100" ? static_cast<int>(std::lround(flip_top * 100.0f)) : // 2.11: the furthest over it got since flipreset, in percent
 				                key == "flipbottom100" ? static_cast<int>(std::lround(flip_low * 100.0f)) : // 2.11: the nearest to the front it got since flipreset
-				                key == "flipspeed100" ? static_cast<int>(std::lround(flip_peak * 100.0f)) : -99;
+				                key == "flipspeed100" ? static_cast<int>(std::lround(flip_peak * 100.0f)) :
+				key == "biosask"   ? (app.BiosChoiceOpen() ? 1 : 0) : // bioscheck: the BIOS question is up
+				key == "biosrow"   ? app.BiosChoiceRow() :            // bioscheck: its focused card (-1: not up)
+				key == "biosmissing" ? (app.BiosMissing() ? 1 : 0) :  // bioscheck
+				key == "gamedbnote" ? (app.GameDbNoteShown() ? 1 : 0) : // gamedb (2026-10-30): the shelf's note about the missing database
+				key == "bioslooks" ? bios_looks :                     // bioscheck: how often the stand-in was asked
+				key == "openchosen" ? (open_chosen() ? 1 : 0) :       // bioscheck: gs.ini PS5SX2/OpenBios=true
+				key == "outsideok" ? outside_ok :                     // bioscheck: the last "outside" step was taken (1), refused (0)
+				key == "approved"  ? (approved += app.TakeApprovedLaunch(), approved.empty() ? 0 : 1) :     // bioscheck: an outside start the BIOS question let go
+				-99;
 	};
 	// Splits "key>=N" into its parts; false when it does not parse.
 	auto split_expect = [&](const std::string& arg, std::string& key, char& cmp, int& want) {
@@ -1297,6 +1434,29 @@ int main(int argc, char** argv)
 				WriteText(dump_progress, "SLUS-00000 " + s.arg + "\nHost Dump Game\n");
 			run(dt); // let the shelf poll it (PollDiscDump is throttled to ~0.5 s)
 		}
+		else if (s.op == "scan") // chdscan
+		{
+			if (s.arg == "done" && scanning)
+			{
+				scanning = false;
+				covers->Start(games, fonts, cc, no_download);
+				app.SetGames(games, acfg.preselect);
+			}
+			else
+				std::sscanf(s.arg.c_str(), "%d/%d", &scan_done, &scan_total);
+			run(dt);
+		}
+		else if (s.op == "expectsheetfile") // gamedb (2026-10-30)
+		{
+			const std::string got = app.SheetOpen() ? app.SheetFileLabel() : std::string("(no sheet)");
+			if (got != s.arg)
+			{
+				std::printf("[host] expect FAILED: the sheet's file is %s, wanted %s\n", got.c_str(), s.arg.c_str());
+				failures++;
+			}
+			else
+				std::printf("[host] expect ok: the sheet's file is %s\n", got.c_str());
+		}
 		else if (s.op == "drive") // 2.11: stand in for the disc watcher's report of the disc in the drive
 		{
 		if (s.arg == "off")
@@ -1307,6 +1467,12 @@ int main(int argc, char** argv)
 		drive_title = s.text;
 		}
 		run(dt);
+		}
+		else if (s.op == "outside") // bioscheck: a start asked of the shelf from outside it, as fe_ps5.cpp's loop asks
+		{
+			outside_ok = app.OfferOutsideLaunch(s.arg) ? 1 : 0;
+			std::printf("[host] outside %s: %s\n", s.arg.c_str(), outside_ok ? "taken" : "not taken (no BIOS)");
+			run(dt);
 		}
 		else if (s.op == "sleep")
 		{

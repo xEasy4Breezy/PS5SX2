@@ -34,10 +34,12 @@
 #include "../frontend/fe_i18n.h" // vk-285-110: the notifications' text
 #include "../frontend/fe_bios.h" // vk-285-134: the BIOS before the shelf
 #include "../frontend/fe_games.h" // vk-285-139: fe::DiscSet
+#include "../frontend/fe_discsettings.h" // gamedb (2026-10-30): a disc's settings file, the same rule as the shelf's
 #include "../frontend/fe_roots.h"    // 2026-10-16: the folders games are listed from (the ones you set only, or the usual places)
 #include "../frontend/fe_options.h"  // 2026-10-16: fe::SplitFolderList (PS5SX2/GameFolders)
 #include "../frontend/fe_gametile.h" // 2.12: a game tile's marker, its launch check and its folder (fe::gametile)
 #include "ps2/BiosTools.h"       // vk-285-134: IsBIOS, IsBIOSAvailable
+#include "orbis-shims/OrbisOpenBios.h" // bioscheck: the BIOS before every start; OpenPS2BIOS, shipped for players without one
 #endif // vk-285-36/38: [vkwait], [shaders]
 extern volatile unsigned long long g_orbis_map_addr;
 #include "vtlb.h"
@@ -55,6 +57,9 @@ extern volatile unsigned long long g_orbis_map_addr;
 #include "common/SettingsWrapper.h" // eerec-285
 #include "debug_overlay.h"
 #include "OrbisPaths.h" // vk-285-33: the /data/PCSX2 folder layout
+#include "OrbisGameDb.h" // gamedb (2026-10-30): GameIndex.yaml in the eboot, for a console without resources/
+#include "OrbisDev9Send.h" // killzone-online (2026-10-30): the ticker's stall line names a DEV9 send that waits
+#include "OrbisStall.h"    // killzone-online (2026-10-30): the stall line itself
 #include "OrbisDriver.h" // vk-285-115: ps5vk or RADV
 #include "SIO/Pad/Pad.h"
 #include "SIO/Pad/PadDualshock2.h"
@@ -72,6 +77,7 @@ extern volatile unsigned long long g_orbis_map_addr;
 #include "orbis-shims/OrbisDiscDrive.h"   // PR #34: PS2 discs played straight from a drive (flag bootdisc)
 #include "orbis-shims/ProsperoRelaunch.h" // 2.11: "back to the menu" closes the app and a payload starts it again (relaunch/relaunch.c)
 #include "orbis-shims/OrbisLeavePlan.h"   // 2.11: how the process is left (relaunch payload, the old exec, or the plain close), as pure logic
+#include "orbis-shims/OrbisDiscTileStart.h" // fix180: a disc tile press: the dump by serial, else the disc, never the question
 #include "orbis-shims/OrbisDiscExec.h"    // 2.11 (dumpxmb): when the disc helper's exec signal is honoured; how old a disc-launch.txt may be
 #include "orbis-shims/OrbisVideoOutMode.h" // 2.11: the app's own 120 Hz output for frame generation (flag fg120)
 #include "SIO/Pad/PadGuitar.h"
@@ -2151,12 +2157,15 @@ static std::string orbis_menu_exec_path()
 
 // The note for the next start: the shelf opens, though the tile's marker (or the bootdisc flag) would start the disc again.
 // 176: "<time> <wall clock ms now> <wall clock ms of the press>" (orbis-shims/OrbisLeavePlan.h ShelfMark): the start that follows tells how long ago both were.
-static void orbis_mark_open_shelf()
+// fix180: and the title the leave starts (orbis_leave::TargetOf), so that only that title's start takes it (orbis_take_open_shelf_mark): a tile pressed after
+// a leave of the main app (whose own exec may not bring it back) starts its game instead of the shelf.
+static void orbis_mark_open_shelf(const char* target)
 {
   if (FILE* f = fopen(OrbisLogPath("open-shelf.txt").c_str(), "wb"))
   {
     const long long now_ms = orbis_wall_ms();
-    fprintf(f, "%lld %lld %lld\n", static_cast<long long>(time(nullptr)), now_ms, now_ms - (orbis_steady_us() - orbis_leave_base_us()) / 1000);
+    fprintf(f, "%lld %lld %lld %s\n", static_cast<long long>(time(nullptr)), now_ms, now_ms - (orbis_steady_us() - orbis_leave_base_us()) / 1000,
+      target && target[0] ? target : orbis_leave::kMainTitle);
     fclose(f);
   }
 }
@@ -2164,8 +2173,26 @@ static void orbis_mark_open_shelf()
 // The note this start took (zeros when it took none or it was an older file without the times), for orbis_leave_press_age_ms().
 static orbis_leave::ShelfMark s_leave_mark;
 
+// fix180: this process's title for the note (orbis_leave::NoteIsFor): PPSA99203 for the main app, the tile's folder name for a disc or game tile ("" when
+// its folder was not found; a game tile then goes by the tile= line of its marker). Asked after the jailbreak (orbis_own_tile_dir looks in /data/homebrew).
+static bool orbis_is_tile_start()
+{
+  return s_tile_marker_seen && !s_tile_marker_drive.empty() && s_tile_marker_drive != "reload";
+}
+static std::string orbis_own_title()
+{
+  if (!orbis_is_tile_start())
+    return orbis_leave::kMainTitle;
+  const std::string tile = orbis_own_tile_dir();
+  if (!tile.empty())
+    return tile.substr(tile.find_last_of('/') + 1);
+  return s_tile_is_game ? s_tile_game_id : std::string();
+}
+
 // Read and removed by the start that follows; true when it was left in the last three minutes. `out` (main() only) gets the note's numbers.
-static bool orbis_take_open_shelf_mark(orbis_leave::ShelfMark* out = nullptr)
+// fix180: with `for_this_start` (main() only), true only when the note is also addressed to this process (orbis_leave::NoteIsFor); a fresh note for another
+// title is said in boot.log and removed all the same (the leave it was written for is over: this start is the user's).
+static bool orbis_take_open_shelf_mark(orbis_leave::ShelfMark* out = nullptr, bool for_this_start = false)
 {
   const std::string path = OrbisLogPath("open-shelf.txt");
   bool fresh = false;
@@ -2178,6 +2205,19 @@ static bool orbis_take_open_shelf_mark(orbis_leave::ShelfMark* out = nullptr)
     if (orbis_leave::ParseShelfMark(text, mark))
     {
       fresh = mark.sec > 0 && time(nullptr) - mark.sec >= 0 && time(nullptr) - mark.sec < 180;
+      if (fresh && for_this_start)
+      {
+        const std::string own = orbis_own_title();
+        if (!orbis_leave::NoteIsFor(mark, own.c_str(), orbis_is_tile_start()))
+        {
+          printf("[boot] a \"back to the menu\" note of %lld s ago is for %s, not for this start (%s): not taken, %s\n",
+            static_cast<long long>(time(nullptr) - mark.sec), mark.target[0] ? mark.target : "the main app (a note without a title)",
+            own.empty() ? "a tile whose folder was not found" : own.c_str(),
+            s_tile_is_game ? "the game tile starts its game" : orbis_is_tile_start() ? "the disc tile starts its disc" : "the start goes on as usual");
+          fflush(stdout);
+          fresh = false;
+        }
+      }
       if (fresh && out)
         *out = mark;
     }
@@ -2287,6 +2327,9 @@ static void orbis_leave_note_ms(const char* what, long long since_us)
   orbis_leave_note(text);
 }
 
+// fix180: a guard payload is up for this leave (orbis_leave::WantGuard): called off when the process stays (the exec refused, back to the game).
+static bool s_leave_guard_up = false;
+
 // The relaunch payload, sent before the saves so its start overlaps them (at most 3 s; the picture is frozen anyway). True when it answered.
 static bool orbis_leave_start_relay(const OrbisLeaveFlags& fl)
 {
@@ -2296,6 +2339,29 @@ static bool orbis_leave_start_relay(const OrbisLeaveFlags& fl)
     // 176: the main app leaves by the exec of its own eboot (menufast) or a flag chooses the old way or the close: no payload
     if (orbis_leave::MainAppExec(want))
       printf("[menu] no relaunch payload: the main app leaves by the exec of its own eboot (%s)\n", fl.menufast ? "flag menufast" : "the default");
+    // fix180: but a GUARD payload, which starts the main app if the exec brings nothing back (180: twice the home screen). It returns false all the
+    // same: the way out stays the exec (orbis_leave::Decide is asked with relay_started = false).
+    s_leave_guard_up = false;
+    if (orbis_leave::WantGuard(want) && OrbisRelaunchBuilt())
+    {
+      std::string closing = orbis_leave::kMainTitle;
+      const std::string tile = orbis_own_tile_dir();
+      if (!tile.empty())
+        closing = tile.substr(tile.find_last_of('/') + 1);
+      else if (s_tile_marker_seen && !s_tile_marker_drive.empty())
+        closing.clear();
+      OrbisRelaunchTiming timing;
+      timing.settle_ms = fl.settle_ms;
+      timing.guard_ms = orbis_leave::kGuardMs;
+      timing.hard_ms = orbis_leave::kGuardHardMs;
+      std::string why;
+      const long long t_guard = orbis_steady_us();
+      s_leave_guard_up = OrbisRelaunchStart(closing.c_str(), orbis_leave::kMainTitle, static_cast<int>(getpid()), why, timing);
+      printf("[menu] guard payload (closing title '%s'; it starts %s if the exec brings nothing back %d ms after this process went): %s\n", closing.c_str(),
+        orbis_leave::kMainTitle, timing.guard_ms, s_leave_guard_up ? "up" : why.c_str());
+      fflush(stdout);
+      orbis_leave_note_ms(s_leave_guard_up ? "guard: up" : "guard: none", t_guard);
+    }
     return false;
   }
   if (!OrbisRelaunchBuilt())
@@ -2333,12 +2399,27 @@ static bool orbis_leave_process(bool relay, const OrbisLeaveFlags& fl)
   in.relay_started = relay;
   in.tile_dir_found = tile_found;
   How how = orbis_leave::Decide(in);
+  // fix181: the switches a tester sets to find what slows the main app's own exec down since 179 (177: the new process 0.98 s after the exit, median of
+  // 291 exits on 92 consoles; 179: 3.1-4.4 s; 180/181: 3.5 s to never). Each is a file in /data/PCSX2/flags; with menufast the main app leaves by its
+  // exec (the guard behind it), so each try shows in the next start's "back to the menu: this start is N ms ... after the exit" line.
+  printf("[menu] exec bisect switches: menufast %d | helper_noautoload %d logger_noautoload %d noupdatecheck %d menu_keepoutput %d nodiscdump %d "
+    "disc_lockeject %d disc_nopread64 %d\n", orbis_flag("menufast"), orbis_flag("helper_noautoload"), orbis_flag("logger_noautoload"),
+    orbis_flag("noupdatecheck"), orbis_flag("menu_keepoutput"), orbis_flag("nodiscdump"), orbis_flag("disc_lockeject"), orbis_flag("disc_nopread64"));
+  const std::string own_tile = tile_found ? tile.substr(tile.find_last_of('/') + 1) : std::string(); // fix180: the note's title for the tile's own eboot
+  orbis_mark_open_shelf(orbis_leave::TargetOf(how, own_tile.c_str()));
   printf("[menu] leaving by %s (payload %d, disc tile %d, its eboot found %d, flags menuexec %d menuclose %d menufast %d menurelaunch %d, main app exec by default %d)\n",
     kHow[static_cast<int>(how)], relay, is_tile, tile_found, fl.menuexec, fl.menuclose, fl.menufast, fl.menurelaunch, orbis_leave::kMainAppExecByDefault);
   orbis_leave_note(kHow[static_cast<int>(how)]);
   const long long t_output = orbis_steady_us();
-  orbis_output_default(); // before the exit, never after: frame generation's 120 Hz output (and the PAL modes) go back to the default first
-  orbis_leave_note_ms("output default restored", t_output); // 176: with frame generation's 120 Hz this is an HDMI mode change
+  // fix181 (bisect of the exec regression, owner: "introduced in like 2.00"; 2.00 added this call before the exec): flag menu_keepoutput skips it (the next
+  // start puts a 120 Hz output back itself, OrbisVideoOutBootCheck)
+  if (!orbis_flag("menu_keepoutput"))
+  {
+    orbis_output_default(); // before the exit, never after: frame generation's 120 Hz output (and the PAL modes) go back to the default first
+    orbis_leave_note_ms("output default restored", t_output); // 176: with frame generation's 120 Hz this is an HDMI mode change
+  }
+  else
+    orbis_leave_note("output default NOT restored (flag menu_keepoutput)");
   orbis_log_drain();      // the lines above reach boot.log before the process can end
   fflush(stdout);
   fflush(stderr);
@@ -2369,6 +2450,8 @@ static bool orbis_leave_process(bool relay, const OrbisLeaveFlags& fl)
   }
   // The old way (a disc tile's own eboot, then the app's; the main app's): "It doesn't come back when it works; allow for one that returns first and ends the process later."
   const std::string path = orbis_menu_exec_path();
+  // fix180: the note names the title this eboot is (the tile's own, else the main app's)
+  orbis_mark_open_shelf(tile_found && path == tile + "/eboot.bin" ? own_tile.c_str() : orbis_leave::kMainTitle);
   printf("[menu] re-executing %s\n", path.c_str());
   orbis_leave_note("exec: eboot issued");
   fflush(stdout);
@@ -2379,10 +2462,20 @@ static bool orbis_leave_process(bool relay, const OrbisLeaveFlags& fl)
   {
     printf("[menu] the tile's own eboot didn't take: PPSA99203's is tried\n"); // 2.11
     fflush(stdout);
+    orbis_mark_open_shelf(orbis_leave::kMainTitle); // fix180
     exec_rc = orbis_exec_for_menu("/data/homebrew/PPSA99203/eboot.bin");
   }
   orbis_leave_note("exec: eboot returned");
-  return orbis_leave::AfterExecReturn(exec_rc) == orbis_leave::AfterExec::KeepWaiting; // accepted, merely outlived the wait: the notes for the next start stay
+  const bool waiting = orbis_leave::AfterExecReturn(exec_rc) == orbis_leave::AfterExec::KeepWaiting; // accepted, merely outlived the wait: the notes stay
+  if (!waiting && s_leave_guard_up)
+  {
+    // fix180: the exec was refused and this process stays (back to the game): the guard must not start the app when the game ends later
+    OrbisRelaunchCancel();
+    s_leave_guard_up = false;
+    printf("[menu] the exec was refused: the guard payload is called off\n");
+    fflush(stdout);
+  }
+  return waiting;
 }
 
 // vk-285-109: our own eboot again, into the shelf, after a start that failed (the VM never ran, so no memory
@@ -2397,7 +2490,7 @@ static void orbis_restart_to_menu()
   const bool relay = orbis_leave_start_relay(fl); // 2.11: the relaunch payload, or the old exec
   orbis_leave_note_ms(relay ? "relay: up" : "relay: none", t_relay);
   orbis_mark_relaunch(); // vk-285-144
-  orbis_mark_open_shelf(); // 2.11
+  // 2.11: open-shelf.txt (fix180: written by orbis_leave_process, with the title its way starts)
   const bool waiting = orbis_leave_process(relay, fl);
   if (!waiting)
     orbis_take_open_shelf_mark(); // still here: the note is not for a later start
@@ -2435,7 +2528,7 @@ static void orbis_back_to_menu()
   // disc speed restore hook (disc work)
   cdvdQuiesce(400); // 2.11 (disc lag round): a game from a disc drive: no new drive read from here on (and none half done when the process goes); nothing is sent to the drive and no lock taken
   orbis_mark_relaunch(); // vk-285-144
-  orbis_mark_open_shelf(); // 2.11: the shelf opens next, not the tile's disc again
+  // 2.11: the shelf opens next, not the tile's disc again (open-shelf.txt; fix180: written by orbis_leave_process, with the title its way starts)
   // It doesn't come back when it works; allow for one that returns first and ends the process later.
   const bool waiting = orbis_leave_process(relay, fl);
   if (!waiting)
@@ -2632,13 +2725,90 @@ static bool orbis_check_bios()
   return false;
 }
 
+// bioscheck (2026-10-29, AI-assisted; owner: "a clear PS2 BIOS check before any game start"; 2.15's logs: 367 no-starts on 128 consoles came
+// from disc starts, 56 of 60 sampled no-starts were "requires a PlayStation 2 BIOS", 52 of them disc starts that never passed the shelf's
+// check). One check before every start (orbis_bios_gate): the player's own BIOS as PCSX2 finds it (orbis_check_bios: the same folders and
+// the same IsBIOS PCSX2's LoadBIOS uses); else OpenPS2BIOS, the open-source BIOS this build carries (Tamariba Devs, MIT;
+// orbis-shims/OrbisOpenBios.h), when the player chose it (gs.ini PS5SX2/OpenBios, set by the shelf's BIOS question or the settings).
+// Its image is written to cache/openps2bios/ (never into the player's bios/), and only the start that uses it points PCSX2 there.
+static bool s_bios_open = false;      // the last look found no BIOS of the player's own and the open one in use
+static std::string s_open_bios_dir;   // where the open BIOS's image was written
+static std::string s_bios_refused;    // a start without the shelf refused for want of a BIOS: the shelf asks about it at once
+static std::string s_own_bios_dir_shown = "/data/PCSX2/bios/"; // the player's BIOS folder, for messages once the open BIOS is in use
+static bool orbis_open_bios_ready()
+{
+  const unsigned char *data = nullptr, *licence = nullptr;
+  size_t size = 0, licence_size = 0;
+  if (!orbis_frontend_open_bios_image(&data, &size, &licence, &licence_size))
+    return false;
+  const std::string dir = OrbisDir("cache") + "/" + OrbisBios::kOpenBiosDir;
+  const std::string path = dir + "/" + OrbisBios::kOpenBiosFile;
+  if (!OrbisBios::WriteIfDifferent(path, data, size))
+  {
+    printf("[bios] %s: %s couldn't be written (errno %d)\n", OrbisBios::kOpenBiosName, path.c_str(), errno);
+    fflush(stdout);
+    return false;
+  }
+  if (licence_size)
+    OrbisBios::WriteIfDifferent(dir + "/LICENSE", licence, licence_size);
+  s_open_bios_dir = dir;
+  return true;
+}
+static OrbisBios::Use orbis_bios_use()
+{
+  const bool own = orbis_check_bios();
+  const bool chosen = !own && orbis_gs_ini_bool(OrbisBios::kOpenBiosKey, false);
+  const OrbisBios::Use use = OrbisBios::Choose(own, chosen, chosen && orbis_open_bios_ready());
+  s_bios_open = use == OrbisBios::Use::Open;
+  if (s_bios_open)
+  {
+    s_bios_problem.clear();
+    printf("[bios] no BIOS of the player's own; %s (chosen: PS5SX2/OpenBios) from %s\n", OrbisBios::kOpenBiosName, s_open_bios_dir.c_str());
+    fflush(stdout);
+  }
+  return use;
+}
+static bool orbis_bios_usable() { return orbis_bios_use() != OrbisBios::Use::None; }
+// The BIOS folder as the messages name it (/data/PCSX2/bios, or the folder the player set).
+static std::string orbis_bios_dir_shown() { return EmuFolders::Bios == "/data/PCSX2" ? "/data/PCSX2/bios" : EmuFolders::Bios; }
+// Every start goes through here before PCSX2 is asked to boot. Not started: the shelf asks (the start waits there as s_bios_refused, when
+// it came from outside the shelf), or, with no shelf to open, a notification says why.
+static OrbisBios::Verdict orbis_bios_gate(OrbisBios::StartFrom from, const std::string& path, bool shelf_can_open)
+{
+  const OrbisBios::Use use = orbis_bios_use();
+  const OrbisBios::Verdict v = OrbisBios::Gate(from, use, shelf_can_open);
+  printf("[bios] start from %s (%s): %s: %s\n", OrbisBios::StartFromName(from), path.c_str(), OrbisBios::UseName(use),
+    v.start ? "it starts" : v.to_shelf ? "not started; the shelf asks what to do" : "not started; the app closes");
+  fflush(stdout);
+  if (v.start)
+    return v;
+  orbis_eventf("no PS2 BIOS: a start from %s was not started (%s)", OrbisBios::StartFromName(from), v.to_shelf ? "the shelf asks" : "closed");
+  if (v.notify)
+  {
+    char msg[640];
+    snprintf(msg, sizeof(msg), fe::Tr(v.to_shelf ? fe::Str::NotifyNoBiosChoice : fe::Str::NotifyNoBios), (orbis_bios_dir_shown() + "/").c_str());
+    sys_notify(msg);
+  }
+  if (v.to_shelf && from != OrbisBios::StartFrom::Shelf && from != OrbisBios::StartFrom::ShelfOutside)
+    s_bios_refused = path;
+  return v;
+}
+
 static OrbisFrontendPaths orbis_frontend_paths(bool allow_download)
 {
   OrbisFrontendPaths fe;
   // vk-285-134: the BIOS, for the shelf's line and its check at each start.
-  fe.bios_check = []() { return orbis_check_bios(); };
-  fe.bios_dir = EmuFolders::Bios == "/data/PCSX2" ? "/data/PCSX2/bios" : EmuFolders::Bios;
+  fe.bios_check = []() { return orbis_bios_usable(); };
+  fe.bios_dir = orbis_bios_dir_shown();
   fe.bios_problem = [](){ return s_bios_problem; };
+  // bioscheck: the open BIOS this build carries, whether games start with it now, and a start refused before the shelf came up.
+  {
+    const unsigned char *data = nullptr, *licence = nullptr;
+    size_t size = 0, licence_size = 0;
+    fe.open_bios_bundled = orbis_frontend_open_bios_image(&data, &size, &licence, &licence_size);
+  }
+  fe.bios_open_in_use = []() { return s_bios_open; };
+  fe.bios_pending_launch = s_bios_refused;
   // Test build 1 (vk-285-55): USB drives, the testing label and the logs download.
   // 2026-10-16: the folders games are listed from, all of them (fe_roots.h; was usb_dirs after games/ and /data/PCSX2).
   fe.game_dirs = s_roots.dirs;
@@ -2651,6 +2821,16 @@ static OrbisFrontendPaths orbis_frontend_paths(bool allow_download)
     fe.share_roots.push_back(s.mount_point);
   fe.serial_cache = OrbisDir("cache") + "/chd-serials.txt"; // vk-285-108
   fe.gamedb_file = OrbisDir("resources") + "/GameIndex.yaml"; // vk-285-113: the games' names, for the shelf and the page
+  {
+    // gamedb (2026-10-30, AI-assisted): no usable resources/GameIndex.yaml (a store package, an eboot copied by hand): games get this
+    // build's own copy (OrbisGameDb.h), and the shelf says the folder is incomplete. OrbisDir answers /data/PCSX2 without the folder.
+    std::string why;
+    if (OrbisGameDbFolderProblem(OrbisDir("resources"), &why))
+    {
+      fe.gamedb_missing = "/data/PCSX2/resources/GameIndex.yaml";
+      printf("[boot] game database: %s: games use this build's own copy; the shelf says so\n", why.c_str());
+    }
+  }
   fe.memcards_dir = OrbisDir("memcards"); // vk-285-113: the settings page's memory card list and creator
   fe.test_build = g_orbis_test_build;
   fe.build_label = orbis_build_label();
@@ -3512,7 +3692,19 @@ int main()
   extern void orbis_log_hen_config();
   orbis_log_hen_config();
   const double t_elev = orbis_mono_seconds();
-  const bool hen_ok = orbis_hen_jailbreak();
+  bool hen_ok = orbis_hen_jailbreak();
+  // 180: nobody answered the request: the PS5SX2 Helper (OnionHEN-based: it answers it) is not running, as when the user loads only
+  // kstuff and ShadowMount(Plus). Send the helper the app ships to the ELF loader on 127.0.0.1:9021 now, from the sandbox, and ask
+  // again (OrbisHelperAutoload.cpp). Not with the flag file helper_noautoload, when it can be read this early.
+  {
+    extern bool OrbisHelperStartBeforeJailbreak();
+    if (!hen_ok && OrbisHelperStartBeforeJailbreak())
+    {
+      usleep(1500 * 1000); // the helper's broker starts watching for requests
+      hen_ok = orbis_hen_jailbreak();
+      orbis_boot_phase("elevation after sending the helper: %s", hen_ok ? "answered" : "still not answered");
+    }
+  }
   if (hen_ok)
     g_jailbreak_ok = 1;
   else
@@ -3524,6 +3716,49 @@ int main()
   orbis_log_flag_access("after the jailbreak");
 #endif
   orbis_boot_log_release("after the jailbreak"); // vk-285-113: boot.log's first lines, when /data wasn't there yet
+  // fix180: a guard of the "back to the menu" that re-executed this process is told it came back (it then starts nothing), and the payload's steps of the
+  // last leave go to boot.log, so a session report shows which way out worked (the exec, the guard's launch, the relay).
+  {
+    const std::string back = OrbisRelaunchConfirmCameBack();
+    if (!back.empty())
+      printf("[menu] %s\n", back.c_str());
+    // fix181: logs/leave.txt's last leave (from its "begin:" line): how far the old process came and how long each step took
+    if (FILE* lf = fopen(OrbisLogPath("leave.txt").c_str(), "rb"))
+    {
+      std::vector<std::string> leave;
+      char lbuf[400];
+      while (fgets(lbuf, sizeof(lbuf), lf))
+      {
+        std::string l = lbuf;
+        while (!l.empty() && (l.back() == '\n' || l.back() == '\r'))
+          l.pop_back();
+        if (l.find(" begin:") != std::string::npos)
+          leave.clear();
+        leave.push_back(l);
+      }
+      fclose(lf);
+      for (size_t i = leave.size() > 20 ? leave.size() - 20 : 0; i < leave.size(); i++)
+        printf("[menu] leave.txt: %s\n", leave[i].c_str());
+    }
+    const std::string last = OrbisRelaunchLastLog();
+    if (!last.empty())
+    {
+      size_t at = 0;
+      while (at < last.size())
+      {
+        const size_t eol = last.find('\n', at);
+        printf("[menu] relaunch.log: %s\n", last.substr(at, (eol == std::string::npos ? last.size() : eol) - at).c_str());
+        at = eol == std::string::npos ? last.size() : eol + 1;
+      }
+    }
+    fflush(stdout);
+  }
+  // 179: load the PS5SX2 Disc Helper ourselves (PS5SX3-style, 127.0.0.1:9021) so the user need not load it by hand
+  // (OrbisHelperAutoload.cpp; the flag file helper_noautoload skips it, and it never replaces a newer or a busy helper).
+  { extern void OrbisHelperAutoStart(); OrbisHelperAutoStart(); }
+  // 180: and the PS5SX2 Installer as the session logger (OrbisInstallerStart.cpp: never an install from here; skipped with the
+  // installer's no-log-upload switch, the flag file logger_noautoload, or when a logger already runs), so the user loads neither ELF.
+  { extern void OrbisLoggerAutoStart(const char*); OrbisLoggerAutoStart(ORBIS_BUILD_TAG); }
 #ifdef ORBIS_VULKAN
   orbis_ensure_data_layout(); // vk-285-115: the release's switch files on a console set up by hand
 #endif
@@ -3745,11 +3980,21 @@ int main()
   orbis_boot_phase("looking at USB drives and NFS shares");
   orbis_scan_usb("after the jailbreak"); // test build 1: games on USB drives
   orbis_boot_phase("USB drives and NFS shares looked at; checking the BIOS");
-  orbis_check_bios(); // vk-285-134: after the drives are seen, before the shelf
+  orbis_bios_usable(); // vk-285-134: after the drives are seen, before the shelf (bioscheck: the open BIOS too, when chosen)
   orbis_boot_phase("BIOS checked");
   orbis_boot_log_release("before the settings page starts"); // vk-285-113: still holding? (the folder can show up late)
   // vk-285-144 (AI-assisted): a PS2 DVD in the drive, copied to games/ and started (orbis-shims/ProsperoDiscDump.cpp).
   OrbisDiscNoteTile(s_tile_marker_seen && !s_tile_marker_drive.empty()); // 2.11 (dumpxmb): a disc tile never honours the disc helper's exec signal
+  {
+    // gamedb (2026-10-30, AI-assisted): the disc watcher and a disc start name a disc after the database (OrbisDiscSettingsStem: its copy's
+    // name and its settings file's); it was set only by the settings page's start, so with nowebui a disc's file was "PS2 disc (<serial>)"
+    // here and "<Title> (<serial>)" on the shelf. Set before either, with the eboot's copy behind resources/.
+    const char* db = nullptr;
+    size_t db_size = 0;
+    OrbisBuiltinGameDb(&db, &db_size);
+    fe::SetGameDbFallback(db, db_size);
+    fe::SetGameDbFile(OrbisDir("resources") + "/GameIndex.yaml");
+  }
   OrbisDiscDumpStart();
   if (!orbis_flag("nowebui"))
     orbis_web_start(orbis_frontend_paths(false), orbis_build_label().c_str());
@@ -3765,7 +4010,7 @@ int main()
   // Nothing is copied from here. The file is read, not deleted: it belongs to the tile.
   // 2.11: a start that follows "back to the menu" (L1 + R1 + touchpad, or a game that failed to start): the shelf opens. Neither the tile's
   // marker nor the bootdisc flag starts the disc in the drive again then. Taken once, and only when it is fresh.
-  const bool open_shelf = orbis_take_open_shelf_mark(&s_leave_mark);
+  const bool open_shelf = orbis_take_open_shelf_mark(&s_leave_mark, true); // fix180: only a note addressed to this title (a tile press after a leave of the main app starts its game)
   if (open_shelf)
   {
     printf("[boot] opened by \"back to the menu\": the shelf opens, the disc in the drive isn't started again%s\n",
@@ -3786,6 +4031,8 @@ int main()
     }
     fflush(stdout);
   }
+  // bioscheck: where a start without the shelf came from (the BIOS gate below, before the shelf).
+  OrbisBios::StartFrom pre_from = OrbisBios::StartFrom::PlainList;
   if (s_game_path.empty() && !open_shelf)
   {
     std::string drive = tile_drive; // read before the jailbreak (above): after it /app0 does not lead to this app's folder
@@ -3812,19 +4059,54 @@ int main()
       else
       {
         const std::string serial = fe::ReadSerial(drive);
-        const std::string copy = serial.empty() ? std::string() : OrbisFindDiscCopy(serial, drive);
-        if (!copy.empty())
+        std::string copy = serial.empty() ? std::string() : OrbisFindDiscCopy(serial, drive);
+        // fix180 (owner): no copy under its own name or at the disc's size: any game of the shelf's folders with the disc's serial (any format, any size;
+        // not a half-finished or damaged one: orbis-shims/OrbisDiscTileStart.h). NFS shares are left out (a large share takes long to read); the serial
+        // cache keeps the scan quick for the rest.
+        if (copy.empty() && !serial.empty())
         {
-          s_game_path = copy;
-          printf("[disc] disc tile: %s holds %s: its copy %s starts\n", drive.c_str(), serial.c_str(), copy.c_str());
+          const double t_scan = orbis_mono_seconds();
+          fe::SetSerialCacheFile(OrbisDir("cache") + "/chd-serials.txt");
+          std::vector<std::string> dirs;
+          for (const std::string& dir : s_roots.dirs)
+          {
+            bool share = false;
+            for (const OrbisNfs::ShareInfo& s : OrbisNfs::Shares())
+              share = share || dir.compare(0, s.mount_point.size(), s.mount_point) == 0;
+            if (!share)
+              dirs.push_back(dir);
+          }
+          std::vector<orbis_disc::TileCandidate> cands;
+          for (const fe::GameInfo& g : fe::ScanGames(dirs, s_roots.scan_subfolders))
+          {
+            orbis_disc::TileCandidate c;
+            c.path = g.path;
+            c.serial = g.serial.empty() ? fe::ReadSerial(g) : g.serial;
+            c.unreadable = !g.damaged.empty();
+            cands.push_back(c);
+          }
+          const auto exists = [](const std::string& p) { struct stat st = {}; return stat(p.c_str(), &st) == 0; };
+          const std::string scanned = orbis_disc::PickTileCopy(cands, serial, exists);
+          printf("[disc] disc tile: %s: no copy by its own name; the shelf's folders (%zu games, %zu folders) %s (%.0f ms)\n", serial.c_str(), cands.size(),
+            dirs.size(), scanned.empty() ? "have no whole dump of it either" : ("have " + scanned).c_str(), (orbis_mono_seconds() - t_scan) * 1000.0);
+          copy = scanned;
         }
-        else if (!serial.empty())
+        switch (orbis_disc::DecideTileStart(serial, copy))
         {
-          s_game_path = drive;
-          printf("[disc] disc tile: %s holds %s: no copy, so it starts from the drive\n", drive.c_str(), serial.c_str());
+          case orbis_disc::TileStart::Copy:
+            s_game_path = copy;
+            pre_from = OrbisBios::StartFrom::DiscTile;
+            printf("[disc] disc tile: %s holds %s: its copy %s starts (a tile press asks nothing)\n", drive.c_str(), serial.c_str(), copy.c_str());
+            break;
+          case orbis_disc::TileStart::Disc:
+            s_game_path = drive;
+            pre_from = OrbisBios::StartFrom::DiscTile;
+            printf("[disc] disc tile: %s holds %s: no copy, so it starts from the drive (a tile press asks nothing)\n", drive.c_str(), serial.c_str());
+            break;
+          case orbis_disc::TileStart::Nothing:
+            printf("[disc] disc tile: %s holds no PS2 game any more: the shelf opens\n", drive.c_str());
+            break;
         }
-        else
-          printf("[disc] disc tile: %s holds no PS2 game any more: the shelf opens\n", drive.c_str());
         orbis_eventf("disc tile: %s %s", drive.c_str(), s_game_path.empty() ? "(nothing to start)" : s_game_path.c_str());
         fflush(stdout);
       }
@@ -3848,6 +4130,7 @@ int main()
     {
       s_game_path = s_tile_game_path;
       s_game_tile_started = true;
+      pre_from = OrbisBios::StartFrom::GameTile;
       printf("[tile] game tile: %s starts\n", s_game_path.c_str());
       orbis_eventf("game tile: %s starts", s_game_path.c_str());
     }
@@ -3902,6 +4185,7 @@ int main()
                   struct stat dst {};
                   if (stat(buf, &dst) == 0) {
                       s_game_path = buf;
+                      pre_from = OrbisBios::StartFrom::DiscLaunch;
                       printf("[boot] disc-launch: starting %s\n", buf);
                       fflush(stdout);
                       // vk-285-160d/e: write the autostart guard so the disc watcher (which starts
@@ -3961,6 +4245,7 @@ int main()
         continue;
       }
       s_game_path = drive;
+      pre_from = OrbisBios::StartFrom::BootDisc;
       const char* shown = OrbisDiscDrive::SafeSerial(serial) ? serial.c_str() : "a PS2 game";
       printf("[disc] bootdisc: %s holds %s; starting it from the drive without the shelf\n", drive.c_str(), shown);
       orbis_eventf("bootdisc: starting the disc in %s (%s) without the shelf", drive.c_str(), shown);
@@ -3972,6 +4257,22 @@ int main()
   // is put back before the shelf draws; flag videoprobe asks the console about its output selectors. A marker file and a flag:
   // nothing happens, and VideoOut is not touched, without them.
   OrbisVideoOutBootCheck();
+  // bioscheck: a start chosen without the shelf (a game or disc tile, the disc helper, bootdisc) needs a BIOS like the shelf's picks. Without one
+  // it doesn't start: the shelf opens and asks (the open-source BIOS, or your own), and picking the open BIOS starts it from there.
+  if (!s_game_path.empty())
+  {
+    const bool shelf_can_open = !orbis_flag("nofrontend") && !orbis_flag("nomenu");
+    const OrbisBios::Verdict bios = orbis_bios_gate(pre_from, s_game_path, shelf_can_open);
+    if (!bios.start)
+    {
+      if (pre_from == OrbisBios::StartFrom::BootDisc)
+        OrbisDiscDumpRelease(s_game_path);
+      s_game_path.clear();
+      s_game_tile_started = false;
+      if (!bios.to_shelf)
+        orbis_exit_quietly(0);
+    }
+  }
   orbis_boot_phase("shelf starting (its game scan and first frame are timed in its own [frontend] lines)");
   if (s_game_path.empty() && !orbis_flag("nofrontend") && !orbis_flag("nomenu"))
     s_game_path = orbis_frontend_run(orbis_frontend_paths(!orbis_flag("nocoverdl")), ORBIS_BUILD_TAG, &frontend_ran);
@@ -4010,7 +4311,55 @@ int main()
   }
   // 2.11 (dumpxmb): a game is chosen (the shelf's pick, disc-launch.txt, a tile, bootdisc, the plain list, the system menu): from here on the disc helper's
   // disc-launch-exec.txt does not kill it by re-executing the app (ProsperoDiscDump.cpp; flag discexec brings the old behaviour back).
+  // bioscheck: the last look, whatever chose the game (the shelf asks on its own; the plain list doesn't). Not started: back to the shelf (it
+  // asks) when the shelf ran, else closed with a notification.
+  {
+    const OrbisBios::Verdict bios = orbis_bios_gate(frontend_ran ? OrbisBios::StartFrom::Shelf : OrbisBios::StartFrom::PlainList, s_game_path, false);
+    if (!bios.start)
+    {
+      if (!bios.notify)
+      {
+        char msg[640];
+        snprintf(msg, sizeof(msg), fe::Tr(fe::Str::NotifyNoBios), (orbis_bios_dir_shown() + "/").c_str());
+        sys_notify(msg);
+      }
+      if (frontend_ran || s_game_tile_started)
+        orbis_restart_to_menu();
+      orbis_exit_quietly(1);
+    }
+    if (s_bios_open)
+    {
+      // The open BIOS: PCSX2 looks in its folder only (FindBiosImage takes it there; the BIOS by region below finds no other).
+      s_own_bios_dir_shown = orbis_bios_dir_shown() + "/";
+      EmuFolders::Bios = s_open_bios_dir;
+      g_orbis_bios_only = true;
+      printf("[bios] this start uses %s: BIOS folder %s\n", OrbisBios::kOpenBiosName, EmuFolders::Bios.c_str());
+      orbis_eventf("BIOS: %s (no BIOS of the player's own; chosen in PS5SX2/OpenBios)", OrbisBios::kOpenBiosName);
+      fflush(stdout);
+    }
+  }
   OrbisDiscNoteGameStarting("main-boot: a game is chosen");
+  // fix180 (tester on 180: back from a disc game the shelf showed the first entry): the shelf picks the game played last (lastgame.txt). A game from a
+  // drive is "disc:<serial>" (the shelf picks a copy of that disc, or the drive's entry when it comes); any other start its file name, as the shelf writes.
+  if (!s_game_path.empty() && s_game_path != kOrbisSystemMenuPath)
+  {
+    std::string last;
+    if (OrbisDiscDrive::IsDrivePath(s_game_path))
+    {
+      const std::string serial = fe::ReadSerial(s_game_path);
+      if (OrbisDiscDrive::SafeSerial(serial))
+        last = "disc:" + serial;
+    }
+    else
+      last = s_game_path.substr(s_game_path.rfind('/') + 1);
+    if (!last.empty())
+      if (FILE* lf = fopen("/data/PCSX2/lastgame.txt", "w"))
+      {
+        fprintf(lf, "%s\n", last.c_str());
+        fclose(lf);
+        printf("[boot] last game for the shelf: %s\n", last.c_str());
+      }
+  }
   // 2026-10-08 (AI-assisted; testers asked for the PS2's own boot and menu): the sheet's "PS2 system menu" (fe_ps5.h
   // kOrbisSystemMenuPath): no disc, so VMManager boots the BIOS into its menu (AutoDetectSource: an empty file name is
   // CDVD_SourceType::NoDisc); gs.ini's settings, no game's file. Needs proper testing on the console.
@@ -4044,10 +4393,9 @@ int main()
       const bool safe = OrbisDiscDrive::SafeSerial(serial);
       if (safe)
       {
-        const std::string by_copy = OrbisDiscSettingsStem(serial);
-        const bool old_file = access(("/data/PCSX2/settings/" + serial + ".ini").c_str(), F_OK) == 0;
-        const bool new_file = access(("/data/PCSX2/settings/" + by_copy + ".ini").c_str(), F_OK) == 0;
-        stem = old_file && !new_file ? serial : by_copy;
+        // gamedb (2026-10-30): the rule is fe::DiscSettingsStem's, which the shelf's disc entry uses for the file its sheet writes.
+        stem = fe::DiscSettingsStem(serial, OrbisDiscSettingsStem(serial),
+          [](const std::string& s) { return access(("/data/PCSX2/settings/" + s + ".ini").c_str(), F_OK) == 0; });
         web_serial = serial;
       }
       else
@@ -4251,6 +4599,8 @@ int main()
           u32 version = 0, region = 0;
           std::string description, zone;
           if (!IsBIOS(fd.FileName.c_str(), version, description, region, zone))
+            continue;
+          if (description == OrbisBios::kOpenBiosName) // bioscheck: OpenPS2BIOS (USA by its ROMVER) is no region's BIOS to switch to
             continue;
           std::string rel = fd.FileName;
           if (rel.compare(0, EmuFolders::Bios.size() + 1, EmuFolders::Bios + "/") == 0)
@@ -4727,6 +5077,30 @@ int main()
   init_done = true;
   printf("[boot] Initialize=%d err=%s\n", (int)res, err.GetDescription().c_str());
   fflush(stdout);
+  // bioscheck: OpenPS2BIOS starts PS2 discs only (its README): a PS1 disc, an audio CD or a DVD video is said so and not run.
+  if (res == VMBootResult::StartupSuccess && s_bios_open && !system_menu && !s_game_path.empty() &&
+      !(s_game_path.size() > 4 && strcasecmp(s_game_path.c_str() + s_game_path.size() - 4, ".elf") == 0))
+  {
+    CDVDDiscType type = CDVDDiscType::Other;
+    cdvdGetDiscInfo(nullptr, nullptr, nullptr, nullptr, nullptr, &type);
+    const OrbisBios::Disc disc = type == CDVDDiscType::PS2Disc ? OrbisBios::Disc::Ps2 : type == CDVDDiscType::PS1Disc ? OrbisBios::Disc::Ps1 :
+                                 cdvd.DiscType == CDVD_TYPE_DVDV ? OrbisBios::Disc::DvdVideo : cdvd.DiscType == CDVD_TYPE_CDDA ? OrbisBios::Disc::AudioCd :
+                                 OrbisBios::Disc::Other;
+    if (!OrbisBios::OpenBiosCanStart(disc))
+    {
+      printf("[bios] %s can't start this disc (%s): not run\n", OrbisBios::kOpenBiosName,
+        disc == OrbisBios::Disc::Ps1 ? "a PS1 disc" : disc == OrbisBios::Disc::DvdVideo ? "a DVD video" : "an audio CD");
+      orbis_eventf("the game didn't start: %s can't start a %s", OrbisBios::kOpenBiosName,
+        disc == OrbisBios::Disc::Ps1 ? "PS1 disc" : disc == OrbisBios::Disc::DvdVideo ? "DVD video" : "audio CD");
+      char msg[640];
+      snprintf(msg, sizeof(msg), fe::Tr(fe::Str::NotifyOpenBiosCantStart), s_own_bios_dir_shown.c_str());
+      sys_notify(msg);
+      fflush(stdout);
+      if (frontend_ran || s_game_tile_started)
+        orbis_restart_to_menu();
+      orbis_exit_quietly(1);
+    }
+  }
   // vk-285-47: the game's name and how it runs, instead of "VM init OK".
   if (res == VMBootResult::StartupSuccess)
   {
@@ -5031,6 +5405,31 @@ int main()
                  static_cast<int>(EmuConfig.GS.HWDownloadMode));
       }
 #endif
+      {
+        // killzone-online (2026-10-30, AI-assisted): the emulation stopped (the EE's cycle count still while the VM runs). Killzone online froze
+        // ~34 s and nothing in the logs said where; now boot.log says it while it lasts (after 2 s, then every 5 s) and settings.log once it
+        // ends, with the EE's and IOP's pc and a DEV9 TCP send that waits (OrbisDev9Send.h), if any.
+        static OrbisStallWatch s_stall;
+        const long long dev9_since = g_orbis_dev9_send_since_us.load(std::memory_order_acquire);
+        OrbisStallSample smp;
+        smp.running = VMManager::GetState() == VMState::Running;
+        smp.ee_cycle = cpuRegs.cycle;
+        smp.ee_pc = cpuRegs.pc;
+        smp.iop_pc = psxRegs.pc;
+        smp.dev9_wait_ms = dev9_since ? (OrbisDev9NowUs() - dev9_since) / 1000 : -1;
+        smp.dev9_port = g_orbis_dev9_send_port.load(std::memory_order_relaxed);
+        smp.dev9_kept = g_orbis_dev9_kept.load(std::memory_order_relaxed);
+        smp.dev9_wait_max_ms = g_orbis_dev9_wait_max_us.exchange(0, std::memory_order_relaxed) / 1000;
+        std::string boot_line, event_line;
+        s_stall.Second(smp, &boot_line, &event_line);
+        if (!boot_line.empty())
+          printf("%s\n", boot_line.c_str());
+        if (!event_line.empty())
+        {
+          printf("[stall] %s\n", event_line.c_str());
+          OrbisDeferredEvent(event_line.c_str());
+        }
+      }
       printf("[boot] t+%ds state=%d eepc=%08x eecy=%llu ioppc=%08x iopcy=%llu rec=%d/%d\n", i + 1,
         (int)VMManager::GetState(), cpuRegs.pc, (unsigned long long)cpuRegs.cycle,
         psxRegs.pc, (unsigned long long)psxRegs.cycle,

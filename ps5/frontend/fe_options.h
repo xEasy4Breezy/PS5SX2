@@ -109,6 +109,8 @@ public:
 		TexturesFolder, // 2026-10-16: where texture packs are read from and HD packs are put (kTexturesDirKey; the folder picker)
 		CheatDisc,   // vk-285-139: the sheet for all games: the cheat disc (kCheatDiscKey, one of the shelf's images)
 		HomeTile,    // 2.12: a game's sheet: its tile on the PS5 home screen (the app asks the helper and draws the value and help: fe_gametile.h)
+		SystemUpdate, // 180: the sheet for all games: look for and install a newer PS5SX2 (the app's: fe_update.h)
+		LogUpload,    // 180: the sheet for all games: the session logs sent or not (the app's: fe_update.h)
 	};
 
 	enum class From
@@ -138,9 +140,13 @@ public:
 	void SetOnlinePatchRow(bool on) { m_online_patch_row = on; }
 	// 2.12: a game's sheet gets the "Home screen tile" row (under Shelf) when the app can ask the helper for it and the game can have a tile.
 	void SetHomeTileRow(bool on) { m_home_tile_row = on; }
+	// gamedb (2026-10-30): a disc entry's sheet (the disc in the drive, a disc being copied) has no Hide from the shelf row: it isn't a file of the list.
+	void SetHideRow(bool on) { m_hide_row = on; }
 	// 2026-10-08: the sheet for all games gets the "PS2 system menu" row when the app can start it. TakeSystemMenu: true
 	// once, after the row was confirmed (Cross twice), for the app to start it.
 	void SetSystemMenuRow(bool on) { m_system_menu_row = on; }
+	// 180: the sheet for all games gets the PS5SX2 group (System update, Session logs) when the app has an updater.
+	void SetUpdateRows(bool on) { m_update_rows = on; }
 	bool TakeSystemMenu()
 	{
 		const bool asked = m_system_menu;
@@ -224,8 +230,10 @@ private:
 	bool m_texture_pack_row = false;
 	bool m_online_patch_row = false; // 2026-10-08
 	bool m_home_tile_row = false;    // 2.12
+	bool m_hide_row = true;          // gamedb (2026-10-30)
 	bool m_system_menu_row = false, m_system_menu = false; // 2026-10-08
 	bool m_folder_rows = false; // vk-285-135
+	bool m_update_rows = false; // 180
 	Kind m_folder_request = Kind::Header;
 	bool m_elf = false; // 2026-10-08: this sheet's game is an ELF (the Disc image row)
 	int m_armed_row = -1;

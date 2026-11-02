@@ -17,6 +17,7 @@
 #include "fe_sound.h"
 #include "fe_texpacks.h"
 #include "fe_text.h"
+#include "fe_update.h"
 
 #include <functional>
 #include <map>
@@ -60,9 +61,23 @@ struct AppConfig
 	std::function<bool()> bios_present;
 	std::function<std::string()> bios_problem;
 	std::string bios_dir;
+	// gamedb (2026-10-30, AI-assisted): resources/GameIndex.yaml is missing or unusable (main-boot.cpp, OrbisGameDb.h): the shelf names
+	// the file under the BIOS line (games still get their fixes from the eboot's copy). Empty: nothing to say.
+	std::string gamedb_missing;
+	// bioscheck (2026-10-29, AI-assisted): a pick refused for want of a BIOS asks what to do (the BIOS question): the open-source BIOS this
+	// build ships (open_bios_bundled; picking it writes gs.ini PS5SX2/OpenBios=true, then bios_present looks again and the pick starts), or
+	// the player's own in bios_dir. bios_open_in_use: games start with the open BIOS now (the shelf names it). bios_pending_launch: a start
+	// from outside the shelf (a game or disc tile, the disc helper, bootdisc) refused for want of a BIOS before the shelf came up: the
+	// question is asked for it at once, and picking the open BIOS starts it (App::TakeApprovedLaunch).
+	bool open_bios_bundled = false;
+	std::function<bool()> bios_open_in_use;
+	std::string bios_pending_launch;
 	// 2026-10-16: the games folder the player set (the first of them) while only those are listed; "" = the usual places. The empty
 	// shelf names it where it says /data/PCSX2/games (a typo or an unplugged drive then explains itself).
 	std::string games_folder_note;
+	// chdscan (AI-assisted): true while the images not seen before are being read (`done` of `total`): the shelf came up without its games
+	// (App::SetGames brings them) and says so where it would say there are none. Unset: no scan.
+	std::function<bool(int& done, int& total)> scan_progress;
 	// vk-285-135 (AI-assisted): the sheet for all games' Folders rows and their picker start from these places (label, path),
 	// those that are folders when it opens (the drives come and go); empty: no Folders rows.
 	std::vector<std::pair<std::string, std::string>> folder_places;
@@ -79,6 +94,14 @@ struct AppConfig
 	// and serial (false when none); drive_disc_reask asks the watcher about it again (the question comes back as disc_ask_poll's).
 	std::function<bool(std::string& title, std::string& serial)> drive_disc_poll;
 	std::function<void()> drive_disc_reask;
+	// gamedb (2026-10-30, AI-assisted; #bugs: a disc game ignored its own settings): the settings file stem of disc `serial` (fe_discsettings.h, the
+	// file a start from the drive reads), for the entries of the disc in the drive and of a disc being copied: their sheet is the disc's own.
+	// Unset or "": those entries open only the all-games sheet.
+	std::function<std::string(const std::string& serial)> disc_settings_stem;
+	// fix180 (tester on 180: "started a game from disc brings you back ... into the shelf to the first game entry"): the last game played was the disc in
+	// the drive (lastgame.txt "disc:<serial>"): when the drive's entry for that serial comes (the watcher reports it a few seconds after the start), it is
+	// picked, unless the player has moved the shelf by then.
+	std::string preselect_disc_serial;
 	// 2.11: the shelf's search, from the settings page on a phone or PC. search_remote gives the text the page set since the last
 	// call (true; "" clears the search); search_report tells the page what the shelf is searching for (it shows it in its box).
 	std::function<bool(std::string& text)> search_remote;
@@ -90,6 +113,8 @@ struct AppConfig
 	std::string tiles_dir;
 	std::string own_tile_game;
 	std::function<std::string(const GameInfo&)> tile_cover;
+	// 180 (AI-assisted): PS5SX2 updating itself and the session-log switch: the sheet for all games' PS5SX2 group (fe_update.h). Unset: no group.
+	UpdateService updates;
 };
 
 class App
@@ -97,6 +122,10 @@ class App
 public:
 	bool Init(Renderer* renderer, const Fonts* fonts, std::vector<GameInfo> games, CoverService* covers, const AppConfig& cfg);
 	void Shutdown();
+
+	// chdscan (AI-assisted): the games, once the scan that Init's empty shelf waited for is done (the cover service was started with the
+	// same list). `preselect` is picked unless the player has moved on the shelf meanwhile (a disc drive's entry may be there).
+	void SetGames(std::vector<GameInfo> games, int preselect);
 
 	// Advances `dt` seconds with the pad's current buttons.
 	void Update(double dt, const Input& in);
@@ -114,6 +143,15 @@ public:
 	int Chosen() const { return m_index.empty() ? m_selected : m_index[static_cast<size_t>(m_selected)]; }
 	// 2026-10-08: true when Done() came from the sheet's "PS2 system menu", not a game.
 	bool SystemMenuChosen() const { return m_system_menu; }
+	// bioscheck: a start asked of the shelf from outside it (Play from disc, a finished copy): true when it may go (there is a BIOS);
+	// false when there is none: the BIOS question comes up for it (once a path), and the request is not taken.
+	bool OfferOutsideLaunch(const std::string& path);
+	// bioscheck: a start from outside the shelf that waited on the BIOS question and may go now (the open BIOS was picked); "" for none.
+	std::string TakeApprovedLaunch();
+	bool BiosMissing() const { return m_bios_missing; }
+	bool GameDbNoteShown() const { return m_gamedb_note_shown; } // gamedb (2026-10-30): the note was drawn on the last frame
+	bool BiosChoiceOpen() const { return m_bios_ask; }
+	int BiosChoiceRow() const { return m_bios_ask ? m_bios_sel : -1; } // 0 the open BIOS, 1 your own (0 is your own without the open BIOS)
 
 	const std::vector<GameInfo>& games() const { return m_games; }
 
@@ -121,6 +159,7 @@ public:
 	bool AccountOpen() const { return m_account.open; }
 	bool SheetOpen() const { return m_sheet_open; }
 	int SheetTab() const { return m_sheet.tab(); }
+	const std::string& SheetFileLabel() const { return m_sheet.file_label(); } // gamedb (2026-10-30): "settings/<stem>.ini" or "gs.ini"
 	bool PickerOpen() const { return m_picker.open; } // vk-285-135
 	int ShelfCount() const { return static_cast<int>(m_games.size()); } // vk-285-137: the games on the shelf
 	// live-22: the disc dump entry's percentage (0-100) while one is on the shelf, else -1 (the host test checks it).
@@ -200,6 +239,11 @@ private:
 	// shelf's line while a pack is on its way.
 	void UpdateTexturePackRow(const Input& in, double now);
 	std::string OnlinePatchValue() const; // 2026-10-08: the "Get patches and cheats" row's value
+	// 180: the PS5SX2 group's rows (fe_update.h): a press on either, what they show and say, and the close after the installer started.
+	void UpdateRowPress(const OptionsSheet::Row& row, double now);
+	std::string UpdateRowValue(const OptionsSheet::Row& row) const;
+	std::string UpdateRowHelp(const OptionsSheet::Row& row) const;
+	void UpdateQuitTick();
 	// 2.12: the sheet's Home screen tile row (fe_gametile.h): whether the shown game can have one, the state looked at (throttled; only with the row shown or an ask
 	// pending), a press (Cross, Left or Right add; Triangle or Cross remove), and what the row shows and says. HomeTileValue and HomeTileHelp read what PollTiles
 	// found: no file access per frame.
@@ -226,6 +270,10 @@ private:
 	bool m_dump_on = false;
 	std::string m_dump_serial, m_dump_title;
 	int m_dump_pct = 0;
+	// 179: the live copy speed shown on the dump entry: smoothed MB/s, seconds left (0 = unknown), and the drive speed taken ("8x"/"3.2x"/"").
+	double m_dump_mbps = 0.0;
+	int m_dump_eta = 0;
+	std::string m_dump_speed;
 	float m_dump_spin = 0;      // the disc's rotation, advanced each frame
 	double m_dump_poll = -10;   // when the status file was last read
 	// 2.11 (swordpdf: "we can also use the circular disc cover for when a game is dumping"): the disc being copied shows its own disc art (LaunchBox, or
@@ -378,6 +426,7 @@ private:
 	double m_note_time = -10;
 
 	int m_selected = 0;
+	bool m_moved = false; // fix180: the player (or a chord) moved the shelf since it opened
 	bool m_system_menu = false; // 2026-10-08: the PS2 system menu was started from the sheet
 	float m_scroll = 0, m_scroll_vel = 0; // the shelf's position (a game index), sprung to m_selected
 	double m_time = 0;
@@ -427,6 +476,10 @@ private:
 	// 2026-10-08: the online patches' state last seen for the sheet's game (a finished fetch reloads the sheet's rows).
 	std::string m_online_seen_serial;
 	OnlinePatchStatus::State m_online_seen = OnlinePatchStatus::State::Idle;
+	// 180: System update: the first Cross on an available release arms (until then), and the time PS5SX2 closes once the installer runs (< 0: not yet).
+	double m_update_armed_until = -1;
+	double m_update_quit_at = -1;
+	bool m_update_quit_done = false;
 	// 2.12: the Home screen tile row: every ask made (also for games whose sheet has closed), the lines of the helper's state.txt, what the sheet's game shows,
 	// and the game it is for (its normalized path, title and serial as the request carries them).
 	gametile::Tracker m_tile;
@@ -441,10 +494,35 @@ private:
 	// vk-285-134: no PS2 BIOS (AppConfig::bios_present said so at start or at the last pick), what was found instead,
 	// and when a pick was refused for it (the line lights up).
 	bool m_bios_missing = false;
+	bool m_gamedb_note_shown = false; // gamedb (2026-10-30)
 	std::string m_bios_problem;
 	double m_bios_refused = -10;
-	bool BiosReady(); // looks again; false (and the line lit) when there's still none
+	// bioscheck: what waits on the BIOS question: a pick of the shelf, the system menu, or a start from outside the shelf.
+	enum class BiosWait
+	{
+		None,
+		Pick,
+		SystemMenu,
+		Outside,
+	};
+	bool BiosReady(BiosWait wait = BiosWait::None, const std::string& path = std::string()); // looks again; false (the line lit, the question up) when there's still none
 	void BuildBiosLine(std::vector<UiVertex>& ui, float W, float k);
+	void BuildGameDbLine(std::vector<UiVertex>& ui, float W, float k); // gamedb (2026-10-30)
+	std::string DiscStem(const std::string& serial) const;           // gamedb (2026-10-30)
+	// bioscheck: the BIOS question (Left/Right choose, Cross confirms, Circle closes it).
+	bool m_bios_ask = false;
+	int m_bios_sel = 0;
+	float m_bios_anim = 0;
+	BiosWait m_bios_wait = BiosWait::None;
+	std::string m_bios_wait_path;      // BiosWait::Outside: the start that waits
+	std::string m_bios_outside_asked;  // the outside start the question last came up for (a request asked again doesn't reopen it)
+	std::string m_approved_launch;     // an outside start the open BIOS let go
+	bool m_bios_open_in_use = false;   // the shelf names the open BIOS
+	void OpenBiosChoice(BiosWait wait, const std::string& path);
+	void UpdateBiosChoice(const Input& in);
+	void BuildBiosChoice(std::vector<UiVertex>& ui, float W, float H, float k, uint32_t accent);
+	bool UseOpenBios(); // gs.ini PS5SX2/OpenBios=true, then looks again
+	void RefreshBios(); // looks again quietly (the sheet closed: the OpenBios switch may have changed)
 	// vk-285-134: a pick refused for its image (GameInfo::damaged): the line under the title says why, for a few seconds.
 	std::string m_refused_text;
 	double m_refused_time = -10;
